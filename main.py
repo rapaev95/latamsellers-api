@@ -294,6 +294,108 @@ async def health():
     return {"status": "ok"}
 
 
+def parse_brl(val) -> float:
+    """Parse BRL value: '1.234,56' or '1234.56' → float."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return 0.0
+    s = str(val).strip()
+    if not s or s in ("nan", "NaN", "None", ""):
+        return 0.0
+    s = s.replace("R$", "").replace("$", "").replace(" ", "")
+    # BRL format: 1.234,56
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def build_vendas_ml_opiu(df: pd.DataFrame) -> dict:
+    """Build mini P&L (OPiU) from Vendas ML DataFrame."""
+    receita_bruta = 0.0
+    tarifa_venda = 0.0
+    receita_envio = 0.0
+    tarifa_envio = 0.0
+    cancelamentos = 0.0
+    total_net = 0.0
+    vendas_count = 0
+    ads_count = 0
+
+    for _, row in df.iterrows():
+        preco = parse_brl(row.get("Preço unitário de venda do anúncio (BRL)", 0))
+        try:
+            u = row.get("Unidades", 0)
+            if pd.isna(u) or u == "":
+                unidades = 0
+            else:
+                unidades = int(float(str(u).strip()))
+        except (ValueError, TypeError):
+            unidades = 0
+
+        receita_bruta += preco * unidades
+        tarifa_venda += parse_brl(row.get("Tarifa de venda e impostos (BRL)", 0))
+        receita_envio += parse_brl(row.get("Receita por envio (BRL)", 0))
+        tarifa_envio += parse_brl(row.get("Tarifas de envio (BRL)", 0))
+        cancelamentos += parse_brl(row.get("Cancelamentos e reembolsos (BRL)", 0))
+        total_net += parse_brl(row.get("Total (BRL)", 0))
+        vendas_count += 1
+        if str(row.get("Venda por publicidade", "")).strip().lower() == "sim":
+            ads_count += 1
+
+    return {
+        "receita_bruta": round(receita_bruta, 2),
+        "tarifa_venda": round(abs(tarifa_venda), 2),
+        "receita_envio": round(receita_envio, 2),
+        "tarifa_envio": round(abs(tarifa_envio), 2),
+        "cancelamentos": round(abs(cancelamentos), 2),
+        "total_net": round(total_net, 2),
+        "vendas_count": vendas_count,
+        "ads_count": ads_count,
+        "ads_pct": round(ads_count / vendas_count * 100, 1) if vendas_count > 0 else 0,
+    }
+
+
+def detect_vendas_period(df: pd.DataFrame) -> str | None:
+    """Detect period from 'Data da venda' column (format: '24 de março de 2026 22:36 hs.')."""
+    import re
+    pt_months = {
+        "janeiro": "Jan", "fevereiro": "Fev", "março": "Mar", "marco": "Mar",
+        "abril": "Abr", "maio": "Mai", "junho": "Jun", "julho": "Jul",
+        "agosto": "Ago", "setembro": "Set", "outubro": "Out",
+        "novembro": "Nov", "dezembro": "Dez",
+    }
+    col = None
+    for c in df.columns:
+        if "data da venda" in c.strip().lower() or "data" in c.strip().lower():
+            col = c
+            break
+    if col is None:
+        return None
+
+    months_found = set()
+    year = None
+    for val in df[col].dropna().astype(str):
+        m = re.match(r'(\d{1,2}) de (\w+) de (\d{4})', val.strip())
+        if m:
+            mon_pt = m.group(2).lower()
+            year = m.group(3)
+            short = pt_months.get(mon_pt)
+            if short:
+                months_found.add(short)
+
+    if not months_found:
+        return None
+
+    order = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
+    sorted_m = sorted(months_found, key=lambda x: order.index(x) if x in order else 99)
+    if len(sorted_m) == 1:
+        return f"{sorted_m[0]} {year}"
+    return f"{sorted_m[0]}–{sorted_m[-1]} {year}"
+
+
 @app.post("/analyze")
 async def analyze_file(file: UploadFile = File(...)):
     """Accept a file upload, detect its type, and return analysis summary."""
@@ -302,15 +404,15 @@ async def analyze_file(file: UploadFile = File(...)):
         filename = file.filename or "unknown"
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
-        # Try to read as CSV
+        # Try to read as CSV (with multiple skiprows for vendas_ml format)
         df = None
         if ext in ("csv", "txt", "tsv", ""):
-            df = try_read_csv(file_bytes)
+            df = try_read_csv(file_bytes, nrows=5)
 
         # Try xlsx
         if df is None and ext in ("xlsx", "xls"):
             try:
-                df = pd.read_excel(io.BytesIO(file_bytes))
+                df = pd.read_excel(io.BytesIO(file_bytes), nrows=5)
             except Exception:
                 pass
 
@@ -323,7 +425,7 @@ async def analyze_file(file: UploadFile = File(...)):
         # Detect source
         source = auto_detect_source(df, filename)
 
-        # Read full file for analysis
+        # Read full file
         df_full = None
         if ext in ("csv", "txt", "tsv", ""):
             df_full = try_read_csv(file_bytes)
@@ -336,11 +438,9 @@ async def analyze_file(file: UploadFile = File(...)):
         if df_full is None:
             df_full = df
 
-        # Build result
         source_info = SOURCE_LABELS.get(source, {"name": source or "Desconhecido", "type": "unknown"})
-        period = detect_period(df_full)
-        top_cats = compute_top_categories(df_full, source or "")
 
+        # Build response based on source type
         result = {
             "filename": filename,
             "source_key": source,
@@ -348,10 +448,23 @@ async def analyze_file(file: UploadFile = File(...)):
             "source_type": source_info["type"],
             "rows": len(df_full),
             "columns": len(df_full.columns),
-            "column_names": list(df_full.columns[:20]),
-            "period": period,
-            "top_categories": top_cats,
         }
+
+        # Special handling for vendas_ml — build OPiU
+        if source == "vendas_ml":
+            opiu = build_vendas_ml_opiu(df_full)
+            result["opiu"] = opiu
+            result["period"] = detect_vendas_period(df_full)
+            result["top_categories"] = [
+                {"category": "Receita Bruta", "value": opiu["receita_bruta"]},
+                {"category": "Tarifa de Venda", "value": opiu["tarifa_venda"]},
+                {"category": "Tarifa de Envio", "value": opiu["tarifa_envio"]},
+                {"category": "Cancelamentos", "value": opiu["cancelamentos"]},
+                {"category": "Total NET", "value": abs(opiu["total_net"])},
+            ]
+        else:
+            result["period"] = detect_period(df_full)
+            result["top_categories"] = compute_top_categories(df_full, source or "")
 
         return result
 
