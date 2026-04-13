@@ -44,18 +44,19 @@ SOURCE_LABELS = {
 
 
 def try_read_csv(file_bytes: bytes, nrows: int | None = None) -> pd.DataFrame | None:
-    for sep in [";", ",", "\t"]:
-        for skip in [0, 1, 2, 3, 4, 5]:
-            try:
-                kw = {"nrows": nrows} if nrows else {}
-                df = pd.read_csv(
-                    io.BytesIO(file_bytes), sep=sep, skiprows=skip,
-                    encoding="utf-8", **kw,
-                )
-                if len(df.columns) > 2:
-                    return df
-            except Exception:
-                continue
+    for enc in ["utf-8-sig", "utf-8", "latin-1"]:
+        for sep in [";", ",", "\t"]:
+            for skip in [0, 5, 1, 2, 3, 4]:
+                try:
+                    kw = {"nrows": nrows} if nrows else {}
+                    df = pd.read_csv(
+                        io.BytesIO(file_bytes), sep=sep, skiprows=skip,
+                        encoding=enc, **kw,
+                    )
+                    if len(df.columns) > 2:
+                        return df
+                except Exception:
+                    continue
     return None
 
 
@@ -324,25 +325,52 @@ def build_vendas_ml_opiu(df: pd.DataFrame) -> dict:
     vendas_count = 0
     ads_count = 0
 
-    for _, row in df.iterrows():
-        preco = parse_brl(row.get("Preço unitário de venda do anúncio (BRL)", 0))
-        try:
-            u = row.get("Unidades", 0)
-            if pd.isna(u) or u == "":
-                unidades = 0
-            else:
-                unidades = int(float(str(u).strip()))
-        except (ValueError, TypeError):
-            unidades = 0
+    # Detect column names (may vary with accents)
+    col_map = {}
+    for c in df.columns:
+        cl = c.strip().lower()
+        if "preço unitário" in cl or "preco unitario" in cl:
+            col_map["preco"] = c
+        if "receita por produtos" in cl:
+            col_map["receita_prod"] = c
+        if "tarifa de venda" in cl:
+            col_map["tarifa_venda"] = c
+        if "receita por envio" in cl:
+            col_map["receita_envio"] = c
+        if "tarifas de envio" in cl:
+            col_map["tarifa_envio"] = c
+        if "cancelamentos" in cl:
+            col_map["cancelamentos"] = c
+        if cl == "total (brl)":
+            col_map["total"] = c
+        if cl == "unidades":
+            col_map["unidades"] = c
+        if "venda por publicidade" in cl:
+            col_map["ads"] = c
 
-        receita_bruta += preco * unidades
-        tarifa_venda += parse_brl(row.get("Tarifa de venda e impostos (BRL)", 0))
-        receita_envio += parse_brl(row.get("Receita por envio (BRL)", 0))
-        tarifa_envio += parse_brl(row.get("Tarifas de envio (BRL)", 0))
-        cancelamentos += parse_brl(row.get("Cancelamentos e reembolsos (BRL)", 0))
-        total_net += parse_brl(row.get("Total (BRL)", 0))
+    for _, row in df.iterrows():
+        # Receita bruta: Preço unitário × Unidades, or Receita por produtos
+        if "preco" in col_map and "unidades" in col_map:
+            preco = parse_brl(row.get(col_map["preco"], 0))
+            try:
+                u = row.get(col_map["unidades"], 0)
+                if pd.isna(u) or u == "":
+                    unidades = 0
+                else:
+                    unidades = int(float(str(u).strip()))
+            except (ValueError, TypeError):
+                unidades = 0
+            receita_bruta += preco * unidades
+        elif "receita_prod" in col_map:
+            receita_bruta += parse_brl(row.get(col_map["receita_prod"], 0))
+        tarifa_venda += parse_brl(row.get(col_map.get("tarifa_venda", "Tarifa de venda e impostos (BRL)"), 0))
+        receita_envio += parse_brl(row.get(col_map.get("receita_envio", "Receita por envio (BRL)"), 0))
+        tarifa_envio += parse_brl(row.get(col_map.get("tarifa_envio", "Tarifas de envio (BRL)"), 0))
+        cancelamentos += parse_brl(row.get(col_map.get("cancelamentos", "Cancelamentos e reembolsos (BRL)"), 0))
+        total_net += parse_brl(row.get(col_map.get("total", "Total (BRL)"), 0))
         vendas_count += 1
-        if str(row.get("Venda por publicidade", "")).strip().lower() == "sim":
+        ads_val = str(row.get(col_map.get("ads", "Venda por publicidade"), "")).strip().lower()
+        if ads_val == "sim":
             ads_count += 1
 
     return {
