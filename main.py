@@ -1,14 +1,17 @@
 """
 LatAm Sellers Finance — File Analysis API
 Accepts uploaded files, auto-detects source type, returns summary.
+Saves results to PostgreSQL.
 """
 from __future__ import annotations
 
 import io
+import json
 import os
 from datetime import datetime
 
 import pandas as pd
+import psycopg2
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -21,6 +24,67 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Database ──
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_db():
+    if not DATABASE_URL:
+        return
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS uploads (
+            id SERIAL PRIMARY KEY,
+            filename TEXT NOT NULL,
+            source_key TEXT,
+            source_name TEXT,
+            source_type TEXT,
+            rows INTEGER,
+            period TEXT,
+            result JSONB,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def save_upload(filename: str, result: dict):
+    if not DATABASE_URL:
+        return
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO uploads (filename, source_key, source_name, source_type, rows, period, result)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (
+                filename,
+                result.get("source_key"),
+                result.get("source_name"),
+                result.get("source_type"),
+                result.get("rows"),
+                result.get("period"),
+                json.dumps(result, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception:
+        pass
+
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
 
 # ── Source labels ──
 SOURCE_LABELS = {
@@ -494,6 +558,9 @@ async def analyze_file(file: UploadFile = File(...)):
             result["period"] = detect_period(df_full)
             result["top_categories"] = compute_top_categories(df_full, source or "")
 
+        # Save to DB
+        save_upload(filename, result)
+
         return result
 
     except Exception as e:
@@ -501,6 +568,55 @@ async def analyze_file(file: UploadFile = File(...)):
             status_code=500,
             content={"error": str(e), "filename": file.filename},
         )
+
+
+@app.get("/uploads")
+async def list_uploads(limit: int = 20):
+    """Return recent upload history from DB."""
+    if not DATABASE_URL:
+        return []
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT id, filename, source_name, source_type, rows, period, created_at
+               FROM uploads ORDER BY created_at DESC LIMIT %s""",
+            (limit,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [
+            {
+                "id": r[0], "filename": r[1], "source_name": r[2],
+                "source_type": r[3], "rows": r[4], "period": r[5],
+                "created_at": r[6].isoformat() if r[6] else None,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/uploads/{upload_id}")
+async def get_upload(upload_id: int):
+    """Return full result of a specific upload."""
+    if not DATABASE_URL:
+        return JSONResponse(status_code=404, content={"error": "No DB"})
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT result, created_at FROM uploads WHERE id = %s", (upload_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "Not found"})
+        result = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+        result["created_at"] = row[1].isoformat() if row[1] else None
+        return result
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 if __name__ == "__main__":
