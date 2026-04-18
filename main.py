@@ -18,12 +18,96 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI(title="LatAm Sellers Finance API")
 
+# CORS — allowlist (was "*"). Required for v2 cookie auth (`allow_credentials=True`
+# is incompatible with wildcard origin). v1 endpoints use the same allowlist.
+# Add new origins via env: CORS_ORIGINS=https://example.com,https://other.com
+import os as _os
+_extra_origins = [o.strip() for o in _os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
+_allowed_origins = list(dict.fromkeys([
+    "http://localhost:3001",
+    "http://localhost:3000",
+    "https://lsprofit.app",
+    "https://www.lsprofit.app",
+    "https://app.lsprofit.app",
+] + _extra_origins))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount v2 router (Finance 2.0)
+from v2.app import router as v2_router  # noqa: E402
+from v2.db import close_pool, create_pool, get_pool  # noqa: E402
+from v2.services import ml_oauth as ml_oauth_svc  # noqa: E402
+from v2.storage import positions_storage  # noqa: E402
+
+app.include_router(v2_router)
+
+# APScheduler for background ML token refresh (every 5h < 6h TTL)
+from apscheduler.schedulers.asyncio import AsyncIOScheduler  # noqa: E402
+import asyncio as _asyncio  # noqa: E402
+import logging as _logging  # noqa: E402
+
+_ml_scheduler: AsyncIOScheduler | None = None
+_ml_log = _logging.getLogger("ml-oauth-scheduler")
+
+
+async def _refresh_ml_tokens_job() -> None:
+    """Wrapper that resolves the pool lazily at fire time."""
+    pool = await get_pool()
+    result = await ml_oauth_svc.refresh_all_expiring_tokens(pool)
+    _ml_log.info(
+        "ML token refresh tick: refreshed=%s failed=%s",
+        result.get("refreshed"), result.get("failed"),
+    )
+
+
+@app.on_event("startup")
+async def _v2_startup() -> None:
+    global _ml_scheduler
+    pool = await create_pool()
+
+    # Ensure ML OAuth tables exist on boot (idempotent).
+    if pool is not None:
+        try:
+            await ml_oauth_svc.ensure_schema(pool)
+        except Exception as err:  # noqa: BLE001
+            _ml_log.exception("ML OAuth schema bootstrap failed: %s", err)
+        try:
+            await positions_storage.ensure_schema(pool)
+        except Exception as err:  # noqa: BLE001
+            _ml_log.exception("Positions schema bootstrap failed: %s", err)
+
+    # Start APScheduler for periodic token refresh.
+    _ml_scheduler = AsyncIOScheduler()
+    _ml_scheduler.add_job(
+        _refresh_ml_tokens_job,
+        "interval",
+        hours=5,
+        id="ml_token_refresh",
+        replace_existing=True,
+    )
+    _ml_scheduler.start()
+    _ml_log.info("ML token refresh scheduler started (every 5h)")
+
+    # Kick once on boot so tokens that expired during downtime get refreshed immediately.
+    _asyncio.create_task(_refresh_ml_tokens_job())
+
+
+@app.on_event("shutdown")
+async def _v2_shutdown() -> None:
+    global _ml_scheduler
+    if _ml_scheduler is not None:
+        try:
+            _ml_scheduler.shutdown(wait=False)
+        except Exception:  # noqa: BLE001
+            pass
+        _ml_scheduler = None
+    await close_pool()
 
 # ── Database ──
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -103,7 +187,7 @@ SOURCE_LABELS = {
     "bybit_history": {"name": "Bybit History", "type": "crypto"},
     "das_simples": {"name": "DAS Simples Nacional", "type": "tax"},
     "nfse_shps": {"name": "NFS-e (SHPS)", "type": "invoice"},
-    "full_express": {"name": "Full Express (Leticia)", "type": "3pl"},
+    "full_express": {"name": "Full Express (3PL)", "type": "3pl"},
 }
 
 
