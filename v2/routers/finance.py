@@ -28,6 +28,7 @@ from v2.schemas.finance import (
     RulesOut, RulesSaveIn, TransactionsOut,
     ClassificationSaveIn, ClassificationSaveOut,
     OnboardingState, ProjectCreateIn, ProjectCreateOut,
+    UploadPreviewOut,
 )
 from v2.storage import uploads_storage
 
@@ -513,14 +514,19 @@ _MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB — comfortable headroom over ~1.5
 async def create_upload(
     file: UploadFile = File(..., description="File to store"),
     source_key: Optional[str] = Form(None, description="Override auto-detect"),
+    password: Optional[str] = Form(None, description="Password for encrypted PDF/Excel"),
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ) -> dict[str, Any]:
     """Store a user file in the `uploads` table with SHA256 dedupe.
 
+    For encrypted PDF/Excel: tries user-supplied `password` + per-user known
+    passwords + hardcoded defaults. Decrypted bytes land in `uploads`.
+    On auth failure returns HTTP 423 with error=password_required.
+
     `source_key` is resolved in this order:
       1. explicit `source_key` form field (client override)
-      2. filename-based auto-detect (`v2/legacy/source_detection.detect_source_from_filename`)
+      2. filename-based auto-detect + column sniff
       3. HTTP 400 if neither produced a valid source_key
     """
     if pool is None:
@@ -528,6 +534,7 @@ async def create_upload(
 
     from v2.legacy.source_detection import detect_source
     from v2.legacy.reports import invalidate_vendas_cache
+    from v2.legacy.unlocker import try_unlock, add_known_password
 
     filename = file.filename or ""
     if not filename:
@@ -541,6 +548,29 @@ async def create_upload(
             status_code=413,
             detail={"error": "file_too_large", "max_bytes": _MAX_UPLOAD_BYTES, "got": len(file_bytes)},
         )
+
+    # ── Try password-unlock for PDF / encrypted XLSX ──
+    # `try_unlock` returns ("not_encrypted", "unlocked", "failed", "unsupported")
+    unlocked_pwd: Optional[str] = None
+    fname_ext = filename.lower().rsplit(".", 1)[-1]
+    if fname_ext in ("pdf", "xlsx", "xls"):
+        decrypted, used_pwd, status = try_unlock(file_bytes, filename, password)
+        if status == "failed":
+            raise HTTPException(
+                status_code=423,  # Locked
+                detail={
+                    "error": "password_required",
+                    "filename": filename,
+                    "hint": "file is encrypted; POST with form field `password` to unlock",
+                },
+            )
+        if status == "unlocked" and decrypted is not None:
+            file_bytes = decrypted
+            unlocked_pwd = used_pwd
+            # Persist the password only if user explicitly passed it — avoid
+            # double-saving the hardcoded defaults.
+            if password and used_pwd == password.strip():
+                add_known_password(password)
 
     detected = False
     resolved_key = (source_key or "").strip() or None
@@ -590,6 +620,7 @@ async def create_upload(
         "detected": detected,
         "size_bytes": len(file_bytes),
         "was_duplicate": was_duplicate,
+        "unlocked": unlocked_pwd is not None,
     }
 
 
@@ -615,6 +646,129 @@ async def delete_upload(
         invalidate_vendas_cache(user.id)
 
     return {"deleted": True}
+
+
+@router.get("/uploads/{upload_id}/preview", response_model=UploadPreviewOut)
+async def preview_upload(
+    upload_id: int,
+    limit: int = Query(20, ge=1, le=200),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Return a lightweight preview of an uploaded file — first N rows, columns,
+    and a source-specific summary (date range, row count, totals).
+
+    Used by the /finance/upload page to let the user sanity-check what landed
+    in the DB before running reports.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    _bind_user(user)
+
+    import io
+    import pandas as pd
+
+    stored = await uploads_storage.get_file(pool, user.id, upload_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="upload_not_found")
+
+    out: dict[str, Any] = {
+        "upload_id": upload_id,
+        "filename": stored.filename,
+        "source_key": stored.source_key,
+        "size_bytes": len(stored.file_bytes),
+        "total_rows": None,
+        "columns": [],
+        "rows": [],
+        "summary": {},
+        "parse_error": None,
+    }
+
+    # Route to the appropriate parser based on source_key
+    df: "pd.DataFrame | None" = None
+    try:
+        if stored.source_key == "vendas_ml":
+            from v2.legacy.reports import _parse_one_vendas_file
+            df = _parse_one_vendas_file(stored.filename, stored.file_bytes)
+        elif stored.source_key in ("extrato_mp", "extrato_nubank", "extrato_c6_brl", "extrato_c6_usd"):
+            from v2.legacy.bank_tx import _read_bank_csv
+            df = _read_bank_csv(stored.source_key, stored.file_bytes)
+        else:
+            # Generic CSV/XLSX sniff
+            fname = stored.filename.lower()
+            if fname.endswith(".csv"):
+                for sep in (";", ","):
+                    for skip in (0, 1, 4, 5):
+                        try:
+                            df_try = pd.read_csv(
+                                io.BytesIO(stored.file_bytes), sep=sep, skiprows=skip,
+                                encoding="utf-8-sig", low_memory=False, nrows=limit + 1,
+                            )
+                            if len(df_try.columns) > 2:
+                                df = df_try
+                                break
+                        except Exception:
+                            continue
+                    if df is not None:
+                        break
+            elif fname.endswith((".xlsx", ".xls")):
+                for skip in (0, 4, 5, 6):
+                    try:
+                        df_try = pd.read_excel(
+                            io.BytesIO(stored.file_bytes), sheet_name=0,
+                            skiprows=skip, nrows=limit + 1,
+                        )
+                        if len(df_try.columns) > 1:
+                            df = df_try
+                            break
+                    except Exception:
+                        continue
+    except Exception as e:
+        out["parse_error"] = f"{type(e).__name__}: {e}"
+        return out
+
+    if df is None or df.empty:
+        out["parse_error"] = "empty_or_unparseable"
+        return out
+
+    out["total_rows"] = int(len(df))
+    out["columns"] = [str(c) for c in df.columns][:40]
+
+    # Convert first N rows to JSON-safe dicts
+    def _clean(v: Any) -> Any:
+        if pd.isna(v):
+            return None
+        if isinstance(v, (int, float, str, bool)):
+            return v
+        return str(v)
+
+    head = df.head(limit)
+    out["rows"] = [
+        {str(k): _clean(v) for k, v in row.items()}
+        for _, row in head.iterrows()
+    ]
+
+    # Source-specific summary
+    summary: dict[str, Any] = {}
+    if stored.source_key == "vendas_ml" and "Data da venda" in df.columns:
+        dates = df["Data da venda"].dropna().astype(str)
+        if len(dates):
+            summary["date_first"] = str(dates.iloc[-1])[:40]
+            summary["date_last"] = str(dates.iloc[0])[:40]
+        if "Receita por produtos (BRL)" in df.columns:
+            summary["bruto_total"] = float(
+                pd.to_numeric(df["Receita por produtos (BRL)"], errors="coerce").sum()
+            )
+        if "Estado" in df.columns:
+            summary["statuses"] = {
+                str(k): int(v) for k, v in df["Estado"].value_counts().head(5).items()
+            }
+    elif stored.source_key.startswith("extrato_"):
+        if "valor" in [c.lower() for c in df.columns] or "entrada" in [c.lower() for c in df.columns]:
+            summary["note"] = "values will be parsed during classification"
+    out["summary"] = summary
+
+    return out
 
 
 # ── Classification + Bank Rules (Phase 5) ───────────────────────────────────

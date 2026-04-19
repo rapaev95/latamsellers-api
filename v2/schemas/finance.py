@@ -231,6 +231,7 @@ class UploadSaveOut(BaseModel):
     detected: bool                   # True = server auto-detected; False = client provided
     size_bytes: int
     was_duplicate: bool              # True = SHA already existed; created_at refreshed
+    unlocked: bool = False           # True = file was encrypted and we decrypted it
 
 
 class SourceCatalogEntry(BaseModel):
@@ -326,3 +327,17 @@ class ProjectCreateOut(BaseModel):
     project_id: str
     created: bool
     total_projects: int
+
+
+# ── Upload Preview ──────────────────────────────────────────────────────────
+
+class UploadPreviewOut(BaseModel):
+    upload_id: int
+    filename: str
+    source_key: str
+    size_bytes: int
+    total_rows: Optional[int] = None
+    columns: list[str] = []
+    rows: list[dict[str, Any]] = []
+    summary: dict[str, Any] = {}       # source-specific aggregates
+    parse_error: Optional[str] = None
