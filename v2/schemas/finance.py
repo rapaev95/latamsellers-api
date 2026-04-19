@@ -300,3 +300,29 @@ class ClassificationSaveIn(BaseModel):
 class ClassificationSaveOut(BaseModel):
     saved: int
     total_overrides: int
+
+
+# ── Onboarding Wizard (Phase 6) ─────────────────────────────────────────────
+
+class OnboardingState(BaseModel):
+    """Per-user wizard state. `data` accumulates form fields across steps."""
+    step: int = 1             # 1..10
+    completed: bool = False
+    data: dict[str, Any] = {}
+
+
+class ProjectCreateIn(BaseModel):
+    """Minimal project create payload — wizard step 2. Catches the 90% case;
+    full project editing stays on /finance/projects."""
+    project_id: str
+    project_type: str = "ecom"           # "ecom" | "service" | "other"
+    description: str = ""
+    sku_prefixes: list[str] = []
+    compensation_mode: str = "profit_share"
+    profit_share_pct: Optional[float] = None
+
+
+class ProjectCreateOut(BaseModel):
+    project_id: str
+    created: bool
+    total_projects: int

@@ -27,6 +27,7 @@ from v2.schemas.finance import (
     UploadsListOut, UploadSaveOut, SourceCatalogOut,
     RulesOut, RulesSaveIn, TransactionsOut,
     ClassificationSaveIn, ClassificationSaveOut,
+    OnboardingState, ProjectCreateIn, ProjectCreateOut,
 )
 from v2.storage import uploads_storage
 
@@ -750,3 +751,85 @@ async def save_transactions(
 
     db_save(_overrides_key(upload_id), current)
     return {"saved": saved, "total_overrides": len(current)}
+
+
+# ── Onboarding Wizard (Phase 6) ─────────────────────────────────────────────
+# Port of Streamlit _admin/onboarding.py. State lives in two user_data keys:
+#   f2_onboarding_step  → {step, completed}
+#   f2_onboarding_data  → dict of form fields accumulated across 10 steps
+
+_ONBOARDING_STEP_KEY = "f2_onboarding_step"
+_ONBOARDING_DATA_KEY = "f2_onboarding_data"
+_TOTAL_STEPS = 10
+
+
+@router.get("/onboarding/state", response_model=OnboardingState)
+def get_onboarding_state(user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
+    """Return current wizard progress + accumulated form data."""
+    _bind_user(user)
+    from v2.legacy.db_storage import db_load
+
+    step_blob = db_load(_ONBOARDING_STEP_KEY) or {}
+    data_blob = db_load(_ONBOARDING_DATA_KEY) or {}
+    step = 1
+    completed = False
+    if isinstance(step_blob, dict):
+        raw_step = step_blob.get("step", 1)
+        try:
+            step = max(1, min(_TOTAL_STEPS, int(raw_step)))
+        except (TypeError, ValueError):
+            step = 1
+        completed = bool(step_blob.get("completed", False))
+    return {
+        "step": step,
+        "completed": completed,
+        "data": data_blob if isinstance(data_blob, dict) else {},
+    }
+
+
+@router.put("/onboarding/state", response_model=OnboardingState)
+def put_onboarding_state(
+    body: OnboardingState,
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Replace wizard progress + data. Called on each step transition / save."""
+    _bind_user(user)
+    from v2.legacy.db_storage import db_save
+    step = max(1, min(_TOTAL_STEPS, int(body.step or 1)))
+    db_save(_ONBOARDING_STEP_KEY, {"step": step, "completed": bool(body.completed)})
+    db_save(_ONBOARDING_DATA_KEY, body.data or {})
+    return {"step": step, "completed": bool(body.completed), "data": body.data or {}}
+
+
+@router.post("/projects", response_model=ProjectCreateOut)
+def create_project(
+    body: ProjectCreateIn,
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Create a new project — thin wrapper over legacy.config.add_project.
+
+    Used by onboarding step 2 and the /finance/projects page. Full edit flow
+    (baseline, aluguel, rental, etc.) lives on the projects page — here we
+    only collect the minimum needed to unblock the wizard.
+    """
+    _bind_user(user)
+    from v2.legacy.config import add_project, load_projects, _invalidate_projects_cache
+
+    pid = (body.project_id or "").strip().upper()
+    if not pid:
+        raise HTTPException(status_code=400, detail="project_id_required")
+    existing = load_projects() or {}
+    is_new = pid not in existing
+
+    add_project(
+        project_id=pid,
+        project_type=body.project_type or "ecom",
+        description=body.description or "",
+        sku_prefixes=body.sku_prefixes or [],
+        compensation_mode=body.compensation_mode or "profit_share",
+        profit_share_pct=body.profit_share_pct,
+    )
+    _invalidate_projects_cache()
+
+    total = len(load_projects() or {})
+    return {"project_id": pid, "created": is_new, "total_projects": total}
