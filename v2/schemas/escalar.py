@@ -77,11 +77,12 @@ class SnoozeOut(BaseModel):
 class PositionCheckOut(BaseModel):
     itemId: str
     keyword: str
-    position: Optional[int] = None  # 1-based, None when not found
+    position: Optional[int] = None  # 1-based organic rank; None when not found or only in ads
     found: bool
     totalResults: int
     pagesScanned: int
     siteId: str = "MLB"
+    adsAbove: Optional[int] = None  # sponsored slots encountered before the organic hit
 
 
 class TrackKeywordIn(BaseModel):

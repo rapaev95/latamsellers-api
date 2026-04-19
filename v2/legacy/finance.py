@@ -206,6 +206,7 @@ def compute_pnl(project: str, period: tuple[date, date], basis: str = "accrual")
     d_gross = d_net = d_tv = 0.0
     r_gross = r_net = r_tv = r_cnc = 0.0
     d_count = 0
+    r_count = 0
     period_start, period_end = period
     if df is not None and not df.empty:
         for _, row in df.iterrows():
@@ -231,15 +232,21 @@ def compute_pnl(project: str, period: tuple[date, date], basis: str = "accrual")
                 r_net += n
                 r_tv += tv
                 r_cnc += cnc
+                r_count += 1
 
-    # Revenue = только delivered (что точно дойдёт)
-    revenue_gross = d_gross
-    revenue_net = d_net
-    vendas_count = d_count
-    # Doplata envios = bruto + tarifa(neg) - net = bruto - |tarifa| - net
+    # Revenue bruto = все отгрузки (delivered + returned), как в помесячной
+    # матрице `build_monthly_pnl_matrix` (row "Receita por produtos (bruto)").
+    # Это стандарт бухгалтерии: bruto = до вычета возвратов. Затем cancel
+    # уменьшает NET. KPI-карточки и матрица показывают одно и то же число.
+    revenue_gross = d_gross + r_gross
+    # NET revenue выводим как bruto − tarifa(обе группы) − envios(delivered) − cancel,
+    # что 1-в-1 совпадает с «= Выручка NET» в матрице.
     envios_dif = max(d_gross + d_tv - d_net, 0.0)
-    tarifa_venda_abs = abs(d_tv)
-    taxas_ml = tarifa_venda_abs + envios_dif
+    tarifa_venda_abs = abs(d_tv) + abs(r_tv)
+    cancel_abs = abs(r_cnc)
+    revenue_net = revenue_gross - tarifa_venda_abs - envios_dif - cancel_abs
+    vendas_count = d_count + r_count
+    taxas_ml = abs(d_tv) + envios_dif  # KPI «taxas» — только по доставленным (как было)
 
     # Returned: убыток от возвратов (returned NET обычно ~0, потери в Cancelamentos)
     returned_loss = abs(r_cnc) + abs(r_tv) - r_gross  # реальный убыток от возвратов

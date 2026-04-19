@@ -13,8 +13,9 @@ import contextvars
 from datetime import date, datetime
 from typing import Any, Callable, Optional, TypeVar
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 
+from v2.db import get_pool
 from v2.deps import CurrentUser, current_user
 from v2.legacy import db_storage as legacy_db
 from v2.legacy import config as legacy_config
@@ -23,11 +24,13 @@ from v2.schemas.finance import (
     SkuMappingOut, SkuBulkSaveIn, SkuBulkSaveOut,
     PnlMatrixOut,
     OrphanPacotesResponse, OrphanSaveIn, OrphanSaveOut,
+    UploadsListOut, UploadSaveOut, SourceCatalogOut,
 )
+from v2.storage import uploads_storage
 
 router = APIRouter(prefix="/finance", tags=["finance"])
 
-_COMPUTE_TIMEOUT_SECONDS = 15  # legacy compute can scan many files; cap response time
+_COMPUTE_TIMEOUT_SECONDS = 30  # legacy compute can scan many files; cap response time
 
 T = TypeVar("T")
 
@@ -119,12 +122,22 @@ def get_reports(
 
     # Lazy imports — only pay the cost when /reports is actually called
     from v2.legacy.finance import compute_pnl, compute_cashflow, compute_balance
+    from v2.legacy.reports import load_vendas_ml_report
 
     out: dict[str, Any] = {
         "project": project,
         "period": {"from": pf.isoformat(), "to": pt.isoformat()},
         "basis": basis,
     }
+
+    # Pre-warm the vendas DataFrame cache in the request context so all three
+    # parallel compute tasks below find it hot. Without this the threads race
+    # to rebuild the 2208-row df simultaneously (DB + pd.read_csv + df.apply)
+    # and the wall time can exceed the shared timeout.
+    try:
+        load_vendas_ml_report()
+    except Exception:
+        pass  # individual computes will re-raise properly
 
     # Three computes run in parallel under a single shared timeout
     results = _run_parallel_with_timeout({
@@ -428,3 +441,174 @@ def save_orphan_pacotes(
     changed = save_orphan_assignments_bulk(body.assignments or {})
     total = len(load_orphan_assignments() or {})
     return {"saved": changed, "total_assignments": total}
+
+
+# ── Uploads (Phase 4 — /finance/upload) ─────────────────────────────────────
+# Thin wrappers around `v2/storage/uploads_storage` — the SHA-dedupe upsert,
+# list-by-source query, and per-row delete are already implemented there.
+
+_ALLOWED_SOURCES = set(legacy_config.DATA_SOURCES.keys())
+
+
+@router.get("/upload-sources", response_model=SourceCatalogOut)
+def list_upload_sources(user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
+    """Catalog of valid `source_key` values with display metadata.
+
+    Used by the upload UI to render the manual-source fallback selector when
+    filename-based auto-detection fails.
+    """
+    _ = user  # auth only — no user-scoped data in this endpoint
+    entries = []
+    for key, meta in legacy_config.DATA_SOURCES.items():
+        entries.append({
+            "key": key,
+            "name": str(meta.get("name", key)),
+            "file_pattern": str(meta.get("file_pattern", "")),
+            "frequency": str(meta.get("frequency", "")),
+            "type": str(meta.get("type", "")),
+            "description": str(meta.get("description", "")),
+        })
+    return {"sources": entries}
+
+
+@router.get("/uploads", response_model=UploadsListOut)
+async def list_uploads(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """List per-user uploads grouped by source_key, newest first within group."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+
+    source_counts = await uploads_storage.list_sources(pool, user.id)
+    groups: list[dict[str, Any]] = []
+    total = 0
+    for source_key, count in sorted(source_counts.items()):
+        files = await uploads_storage.fetch_files_by_source(pool, user.id, source_key)
+        items = [
+            {
+                "id": f.id,
+                "filename": f.filename,
+                "size_bytes": len(f.file_bytes),
+                "created_at": f.created_at.isoformat() if f.created_at else "",
+            }
+            for f in files
+        ]
+        groups.append({
+            "source_key": source_key or "",
+            "count": count,
+            "items": items,
+        })
+        total += count
+    return {"sources": groups, "total_count": total}
+
+
+_MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB — comfortable headroom over ~1.5 MB vendas snapshots
+
+
+@router.post("/uploads", response_model=UploadSaveOut)
+async def create_upload(
+    file: UploadFile = File(..., description="File to store"),
+    source_key: Optional[str] = Form(None, description="Override auto-detect"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Store a user file in the `uploads` table with SHA256 dedupe.
+
+    `source_key` is resolved in this order:
+      1. explicit `source_key` form field (client override)
+      2. filename-based auto-detect (`v2/legacy/source_detection.detect_source_from_filename`)
+      3. HTTP 400 if neither produced a valid source_key
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+
+    from v2.legacy.source_detection import detect_source
+    from v2.legacy.reports import invalidate_vendas_cache
+
+    filename = file.filename or ""
+    if not filename:
+        raise HTTPException(status_code=400, detail="missing_filename")
+
+    file_bytes = await file.read()
+    if len(file_bytes) == 0:
+        raise HTTPException(status_code=400, detail="empty_file")
+    if len(file_bytes) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={"error": "file_too_large", "max_bytes": _MAX_UPLOAD_BYTES, "got": len(file_bytes)},
+        )
+
+    detected = False
+    resolved_key = (source_key or "").strip() or None
+    if resolved_key is None:
+        resolved_key = detect_source(filename, file_bytes)
+        detected = resolved_key is not None
+
+    if resolved_key is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "ambiguous_source",
+                "filename": filename,
+                "hint": "provide `source_key` form field from GET /finance/upload-sources",
+            },
+        )
+    if resolved_key not in _ALLOWED_SOURCES:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "unknown_source_key", "source_key": resolved_key},
+        )
+
+    # Probe whether the SHA256 already exists for this user so we can report
+    # was_duplicate=true (put_file upserts — no way to tell from its return value).
+    pre_count = (await uploads_storage.list_sources(pool, user.id)).get(resolved_key, 0)
+
+    upload_id = await uploads_storage.put_file(
+        pool,
+        user_id=user.id,
+        source_key=resolved_key,
+        filename=filename,
+        file_bytes=file_bytes,
+    )
+
+    post_count = (await uploads_storage.list_sources(pool, user.id)).get(resolved_key, 0)
+    was_duplicate = post_count == pre_count  # no new row → SHA conflict path fired
+
+    # Invalidate per-user vendas DF cache so /reports + /pnl-matrix refresh
+    # without waiting for the 120s TTL (fingerprint already flips on created_at).
+    if resolved_key == "vendas_ml":
+        invalidate_vendas_cache(user.id)
+
+    return {
+        "id": upload_id,
+        "filename": filename,
+        "source_key": resolved_key,
+        "detected": detected,
+        "size_bytes": len(file_bytes),
+        "was_duplicate": was_duplicate,
+    }
+
+
+@router.delete("/uploads/{upload_id}")
+async def delete_upload(
+    upload_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Delete a single upload row owned by the caller."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+
+    from v2.legacy.reports import invalidate_vendas_cache
+
+    # Peek at source_key before delete so we know whether to invalidate vendas cache.
+    target = await uploads_storage.get_file(pool, user.id, upload_id)
+    ok = await uploads_storage.delete_file(pool, user.id, upload_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="upload_not_found")
+
+    if target is not None and target.source_key == "vendas_ml":
+        invalidate_vendas_cache(user.id)
+
+    return {"deleted": True}

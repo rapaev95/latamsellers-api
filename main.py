@@ -5,10 +5,19 @@ Saves results to PostgreSQL.
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
+import sys
 from datetime import datetime
+
+# Playwright (used by v2/services/ml_scraper.py) needs subprocess support
+# from the asyncio loop. On Windows uvicorn defaults to a Selector loop
+# which raises NotImplementedError for subprocess_exec. Switch policy
+# BEFORE uvicorn picks up the loop.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 import pandas as pd
 import psycopg2
@@ -43,6 +52,7 @@ app.add_middleware(
 from v2.app import router as v2_router  # noqa: E402
 from v2.db import close_pool, create_pool, get_pool  # noqa: E402
 from v2.services import ml_oauth as ml_oauth_svc  # noqa: E402
+from v2.services import ml_scraper  # noqa: E402
 from v2.storage import positions_storage  # noqa: E402
 
 app.include_router(v2_router)
@@ -82,6 +92,13 @@ async def _v2_startup() -> None:
         except Exception as err:  # noqa: BLE001
             _ml_log.exception("Positions schema bootstrap failed: %s", err)
 
+    # Spin up the headless Chromium used by /escalar/positions scraper.
+    # Failure here is logged but non-fatal — the scraper self-heals on first use.
+    try:
+        await ml_scraper.init()
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("ml_scraper init failed: %s", err)
+
     # Start APScheduler for periodic token refresh.
     _ml_scheduler = AsyncIOScheduler()
     _ml_scheduler.add_job(
@@ -107,6 +124,10 @@ async def _v2_shutdown() -> None:
         except Exception:  # noqa: BLE001
             pass
         _ml_scheduler = None
+    try:
+        await ml_scraper.close()
+    except Exception:  # noqa: BLE001
+        pass
     await close_pool()
 
 # ── Database ──

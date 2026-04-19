@@ -1495,6 +1495,45 @@ def _load_vendas_from_db_sync(user_id: int) -> "pd.DataFrame | None":
     return df
 
 
+_VENDAS_DF_CACHE: dict = {}  # {(user_id, fingerprint): (timestamp, df)}
+_VENDAS_DF_TTL = 120  # seconds
+
+
+def _vendas_fingerprint_db(user_id: int) -> str | None:
+    """Cheap probe of the newest vendas upload for this user — used as cache key
+    component so the cache auto-invalidates when the user uploads a new file."""
+    import os
+    import psycopg2
+    dsn = os.environ.get("DATABASE_URL") or os.environ.get("DATABASE_PUBLIC_URL")
+    if not dsn:
+        return None
+    try:
+        conn = psycopg2.connect(dsn)
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT id, EXTRACT(EPOCH FROM created_at)::bigint
+               FROM uploads
+               WHERE user_id=%s AND source_key='vendas_ml' AND file_bytes IS NOT NULL
+               ORDER BY created_at DESC LIMIT 1""",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        return f"{row[0]}:{row[1]}" if row else "empty"
+    except Exception:
+        return None
+
+
+def invalidate_vendas_cache(user_id: int | None = None) -> None:
+    """Clear cached DataFrame for one user (or all users if user_id is None)."""
+    if user_id is None:
+        _VENDAS_DF_CACHE.clear()
+        return
+    for k in list(_VENDAS_DF_CACHE.keys()):
+        if k[0] == user_id:
+            _VENDAS_DF_CACHE.pop(k, None)
+
+
 def load_vendas_ml_report() -> "pd.DataFrame | None":
     """Загружает Vendas ML из БД (per-user) ИЛИ из FS (legacy fallback).
 
@@ -1503,9 +1542,28 @@ def load_vendas_ml_report() -> "pd.DataFrame | None":
     один DataFrame с дедупом по `N.º de venda`. Добавляются колонки:
         __bucket  (delivered/returned/in_progress)
         __project (через get_project_by_sku)
+
+    DB-режим держит per-user df-кеш с TTL (инвалидируется по uploads fingerprint).
+    FS-режим не кеширует. Вызывающий код ДОЛЖЕН использовать `.copy()` перед
+    мутацией — кеш возвращает ссылку на общий DataFrame.
     """
     import os
+    import time as _time
     storage_mode = os.environ.get("LS_STORAGE_MODE", "fs").strip().lower()
+
+    # ── Try cache first (DB-mode only) ──
+    if storage_mode == "db":
+        from .db_storage import _current_user_id
+        uid = _current_user_id()
+        if uid is not None:
+            fp = _vendas_fingerprint_db(uid)
+            key = (uid, fp)
+            hit = _VENDAS_DF_CACHE.get(key)
+            if hit is not None:
+                ts, cached_df = hit
+                if _time.time() - ts < _VENDAS_DF_TTL:
+                    return cached_df
+
     df: "pd.DataFrame | None" = None
 
     if storage_mode == "db":
@@ -1595,6 +1653,16 @@ def load_vendas_ml_report() -> "pd.DataFrame | None":
                 oid = str(row.get("N.º de venda", "") or "").strip()
                 if oid in manual:
                     df.at[idx, "__project"] = manual[oid]
+
+    # ── Populate cache (DB-mode only) ──
+    import os as _os
+    import time as _time2
+    if _os.environ.get("LS_STORAGE_MODE", "fs").strip().lower() == "db":
+        from .db_storage import _current_user_id
+        uid = _current_user_id()
+        if uid is not None:
+            fp = _vendas_fingerprint_db(uid)
+            _VENDAS_DF_CACHE[(uid, fp)] = (_time2.time(), df)
 
     return df
 
@@ -1769,7 +1837,7 @@ def load_orphan_assignments() -> dict:
 def save_orphan_assignment(order_id: str, project: str | None) -> None:
     """Назначает (project=str) или удаляет (project=None) проект для orphan pacote."""
     if _storage_is_db():
-        from .db_storage import db_load, db_save
+        from .db_storage import db_load, db_save, _current_user_id
         data = db_load(_ORPHAN_DB_KEY)
         data = dict(data) if isinstance(data, dict) else {}
         if project:
@@ -1777,6 +1845,7 @@ def save_orphan_assignment(order_id: str, project: str | None) -> None:
         else:
             data.pop(str(order_id), None)
         db_save(_ORPHAN_DB_KEY, data)
+        invalidate_vendas_cache(_current_user_id())  # override меняет __project
         return
 
     import json as _json
@@ -1793,7 +1862,7 @@ def save_orphan_assignment(order_id: str, project: str | None) -> None:
 def save_orphan_assignments_bulk(assignments: dict) -> int:
     """Bulk-сохранение {order_id: project|None}. Возвращает число записей, реально изменивших state."""
     if _storage_is_db():
-        from .db_storage import db_load, db_save
+        from .db_storage import db_load, db_save, _current_user_id
         data = db_load(_ORPHAN_DB_KEY)
         data = dict(data) if isinstance(data, dict) else {}
         changed = 0
@@ -1810,6 +1879,7 @@ def save_orphan_assignments_bulk(assignments: dict) -> int:
                     changed += 1
         if changed:
             db_save(_ORPHAN_DB_KEY, data)
+            invalidate_vendas_cache(_current_user_id())
         return changed
 
     changed = 0
@@ -1820,15 +1890,23 @@ def save_orphan_assignments_bulk(assignments: dict) -> int:
 
 
 def list_orphan_pacotes() -> list[dict]:
-    """Возвращает список «Pacote de N produtos» заказов с пустым резолвед-SKU.
-    Порт _admin/report_views.py:1354-1372 (`_get_orphan_pacotes`).
+    """Все «Pacote de N produtos» orphan-заказы (SKU не резолвится), вне зависимости
+    от того, назначен ли уже проект пользователем — чтобы UI мог показать и
+    переназначить существующие записи.
+
+    Порт _admin/report_views.py:1354-1372, но с raw-маской, не по `__project`.
     """
     df = load_vendas_ml_report()
-    if df is None or df.empty or "__project" not in df.columns:
+    if df is None or df.empty:
         return []
-    orphan = df[df["__project"] == "PACOTE_SEM_SKU"]
+    if "Estado" not in df.columns or "__sku_resolved" not in df.columns:
+        return []
+    mask = (
+        df["Estado"].astype(str).str.startswith("Pacote de", na=False)
+        & (df["__sku_resolved"].astype(str).str.strip() == "")
+    )
     rows: list[dict] = []
-    for _, r in orphan.iterrows():
+    for _, r in df[mask].iterrows():
         oid = str(r.get("N.º de venda", "") or "").strip()
         if not oid:
             continue

@@ -36,9 +36,17 @@ async def get_products(
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ):
+    import logging as _lg, time as _time
+    _log = _lg.getLogger("escalar.products")
+    _t0 = _time.perf_counter()
+    _step = lambda name: _log.info("  [%5.2fs] %s", _time.perf_counter() - _t0, name)
+
     days_v = _parse_days(days)
+    _step("after parse_days")
     snoozed = set(await user_storage.get(pool, user.id, SNOOZE_KEY) or [])
+    _step(f"after snoozed load ({len(snoozed)} items)")
     resolver = await projects.load_resolver(pool, user.id)
+    _step("after projects resolver")
 
     vendas_rows = None
     storage_map = None
@@ -46,9 +54,13 @@ async def get_products(
     vendas_filenames = None
     if get_settings().storage_mode == "db" and pool is not None:
         vendas_rows = await db_loader.load_user_vendas(pool, user.id)
+        _step(f"after load_user_vendas ({len(vendas_rows)} rows)")
         storage_map = await db_loader.load_user_armazenagem(pool, user.id)
+        _step(f"after load_user_armazenagem ({len(storage_map)} skus)")
         stock_full_map = await db_loader.load_user_stock_full(pool, user.id)
+        _step(f"after load_user_stock_full ({len(stock_full_map)} skus)")
         vendas_filenames = await db_loader.list_user_vendas_filenames(pool, user.id)
+        _step(f"after list_vendas_filenames ({len(vendas_filenames)} files)")
 
     summary = abc.aggregate(
         days=days_v,
@@ -60,6 +72,7 @@ async def get_products(
         stock_full_map=stock_full_map,
         vendas_filenames=vendas_filenames,
     )
+    _step(f"after abc.aggregate (products={len(summary['products'])})")
     return {
         "products": summary["products"],
         "hasData": len(summary["products"]) > 0,

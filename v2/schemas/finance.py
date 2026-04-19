@@ -202,3 +202,45 @@ class OrphanSaveIn(BaseModel):
 class OrphanSaveOut(BaseModel):
     saved: int
     total_assignments: int
+
+
+# ── Uploads (Phase 4 — /finance/upload) ─────────────────────────────────────
+
+class UploadItem(BaseModel):
+    id: int
+    filename: str
+    size_bytes: int
+    created_at: str                  # ISO-8601 UTC
+
+
+class UploadSourceGroup(BaseModel):
+    source_key: str
+    count: int
+    items: list[UploadItem]
+
+
+class UploadsListOut(BaseModel):
+    sources: list[UploadSourceGroup]
+    total_count: int
+
+
+class UploadSaveOut(BaseModel):
+    id: int
+    filename: str
+    source_key: str                  # resolved key
+    detected: bool                   # True = server auto-detected; False = client provided
+    size_bytes: int
+    was_duplicate: bool              # True = SHA already existed; created_at refreshed
+
+
+class SourceCatalogEntry(BaseModel):
+    key: str
+    name: str = ""
+    file_pattern: str = ""
+    frequency: str = ""              # "monthly" | "daily" | ...
+    type: str = ""                   # "ecom" | "bank" | "tax" | ...
+    description: str = ""
+
+
+class SourceCatalogOut(BaseModel):
+    sources: list[SourceCatalogEntry]

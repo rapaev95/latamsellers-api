@@ -39,20 +39,25 @@ async def check(
 ):
     """One-shot check: search ML for `keyword`, scan up to 1000 results.
 
-    Requires the user's ML OAuth access token — the public search endpoint
-    started rejecting anonymous calls with 403 in 2025.
+    Reads the user's ML bearer from Railway Postgres `ml_user_tokens`
+    (`ml_oauth.get_valid_access_token` auto-refreshes if expiring). No
+    Supabase path. If no token, returns 428 → UI deep-links to /escalar/settings.
     """
     if pool is None:
         raise HTTPException(status_code=503, detail="no_db")
     try:
         bearer, _expires, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user.id)
     except ml_oauth_svc.MLRefreshError as err:
-        # "no_user_tokens" → user hasn't connected ML yet. UI should deep-link
-        # to /escalar/settings (ML OAuth setup).
         raise HTTPException(
             status_code=428,  # Precondition Required — "connect ML first"
             detail=f"ml_oauth_required: {err}",
         )
+
+    # Use the seller_id stored at OAuth-exchange time. Avoids a round-trip to
+    # /users/me (which returns 403 on non-Developer-Partner apps) and any
+    # fragile parsing of the APP_USR token suffix.
+    token_row = await ml_oauth_svc.load_user_tokens(pool, user.id) or {}
+    seller_id = token_row.get("ml_user_id")
 
     try:
         result = await positions_service.check_position(
@@ -61,6 +66,7 @@ async def check(
             site_id=site_id,
             category_id=category_id,
             bearer_token=bearer,
+            seller_id=seller_id,
         )
     except positions_service.PositionCheckError as err:
         raise HTTPException(status_code=502, detail=f"ml_error: {err}")
@@ -83,6 +89,7 @@ async def check(
         totalResults=result.total_results,
         pagesScanned=result.pages_scanned,
         siteId=result.site_id,
+        adsAbove=result.ads_above,
     )
 
 
