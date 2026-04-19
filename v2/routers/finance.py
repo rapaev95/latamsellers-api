@@ -25,6 +25,8 @@ from v2.schemas.finance import (
     PnlMatrixOut,
     OrphanPacotesResponse, OrphanSaveIn, OrphanSaveOut,
     UploadsListOut, UploadSaveOut, SourceCatalogOut,
+    RulesOut, RulesSaveIn, TransactionsOut,
+    ClassificationSaveIn, ClassificationSaveOut,
 )
 from v2.storage import uploads_storage
 
@@ -612,3 +614,139 @@ async def delete_upload(
         invalidate_vendas_cache(user.id)
 
     return {"deleted": True}
+
+
+# ── Classification + Bank Rules (Phase 5) ───────────────────────────────────
+# Thin wrappers around `v2/legacy/config.{load,save}_transaction_rules` + the
+# new `v2/legacy/bank_tx.parse_bank_tx_bytes` CSV sniffer.
+
+_BANK_SOURCES = {"extrato_mp", "extrato_nubank", "extrato_c6_brl", "extrato_c6_usd"}
+
+
+@router.get("/rules", response_model=RulesOut)
+def get_rules(user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
+    """Return the user's transaction-classification rules (user_data key `transaction_rules`)."""
+    _bind_user(user)
+    from v2.legacy.config import load_transaction_rules
+    rules = load_transaction_rules() or []
+    return {"rules": rules, "count": len(rules)}
+
+
+@router.put("/rules", response_model=RulesOut)
+def put_rules(body: RulesSaveIn, user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
+    """Replace the full rules list. Normalization happens inside save_transaction_rules."""
+    _bind_user(user)
+    from v2.legacy.config import save_transaction_rules, load_transaction_rules
+    save_transaction_rules([r.model_dump() for r in body.rules])
+    rules = load_transaction_rules() or []
+    return {"rules": rules, "count": len(rules)}
+
+
+def _overrides_key(upload_id: int) -> str:
+    return f"f2_classifications_{upload_id}"
+
+
+@router.get("/transactions/{upload_id}", response_model=TransactionsOut)
+async def get_transactions(
+    upload_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Parse a stored bank-statement file, apply rules, merge saved overrides.
+
+    Response shape: list of rows with category/project/label + dropdown options.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    _bind_user(user)
+
+    from v2.legacy.bank_tx import parse_bank_tx_bytes, CATEGORY_OPTIONS
+    from v2.legacy.db_storage import db_load
+
+    stored = await uploads_storage.get_file(pool, user.id, upload_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="upload_not_found")
+    if stored.source_key not in _BANK_SOURCES:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "not_a_bank_statement", "source_key": stored.source_key,
+                    "supported": sorted(_BANK_SOURCES)},
+        )
+
+    rows = parse_bank_tx_bytes(stored.source_key, stored.file_bytes)
+
+    # Merge saved overrides (keyed by upload_id, indexed by idx)
+    overrides = db_load(_overrides_key(upload_id)) or {}
+    if not isinstance(overrides, dict):
+        overrides = {}
+    for r in rows:
+        ov = overrides.get(str(r["idx"]))
+        if isinstance(ov, dict):
+            if ov.get("category"):
+                r["category"] = ov["category"]
+                r["confidence"] = "manual"
+                r["auto"] = False
+            if ov.get("project") is not None:
+                r["project"] = ov["project"]
+            if ov.get("label"):
+                r["label"] = ov["label"]
+
+    projects = sorted((legacy_config.load_projects() or {}).keys())
+    return {
+        "upload_id": upload_id,
+        "source_key": stored.source_key,
+        "filename": stored.filename,
+        "rows": rows,
+        "categories": CATEGORY_OPTIONS,
+        "projects": projects,
+        "saved_overrides_count": len(overrides),
+    }
+
+
+@router.post("/transactions/{upload_id}/save", response_model=ClassificationSaveOut)
+async def save_transactions(
+    upload_id: int,
+    body: ClassificationSaveIn,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Persist per-row overrides (category/project/label) for a specific upload.
+
+    Empty overrides (null for all fields) clear the saved entry.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    _bind_user(user)
+
+    from v2.legacy.db_storage import db_load, db_save
+
+    # Ownership check — don't let clients write overrides for uploads they don't own
+    stored = await uploads_storage.get_file(pool, user.id, upload_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="upload_not_found")
+
+    current = db_load(_overrides_key(upload_id)) or {}
+    if not isinstance(current, dict):
+        current = {}
+
+    saved = 0
+    for ov in body.overrides:
+        key = str(ov.idx)
+        entry = current.get(key, {}) if isinstance(current.get(key), dict) else {}
+        has_content = any(v for v in (ov.category, ov.project, ov.label))
+        if not has_content:
+            if key in current:
+                current.pop(key, None)
+                saved += 1
+            continue
+        if ov.category is not None:
+            entry["category"] = ov.category
+        if ov.project is not None:
+            entry["project"] = ov.project
+        if ov.label is not None:
+            entry["label"] = ov.label
+        current[key] = entry
+        saved += 1
+
+    db_save(_overrides_key(upload_id), current)
+    return {"saved": saved, "total_overrides": len(current)}

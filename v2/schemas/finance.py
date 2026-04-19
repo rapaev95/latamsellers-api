@@ -244,3 +244,59 @@ class SourceCatalogEntry(BaseModel):
 
 class SourceCatalogOut(BaseModel):
     sources: list[SourceCatalogEntry]
+
+
+# ── Classification + Bank Rules (Phase 5) ───────────────────────────────────
+
+class TransactionRule(BaseModel):
+    keywords: list[str] = []
+    category: str = "uncategorized"
+    project: Optional[str] = None
+    label: str = ""
+
+
+class RulesOut(BaseModel):
+    rules: list[TransactionRule]
+    count: int
+
+
+class RulesSaveIn(BaseModel):
+    rules: list[TransactionRule]
+
+
+class BankTxRow(BaseModel):
+    idx: int                  # row index in the source DataFrame
+    date: str
+    value_brl: float
+    description: str
+    category: str
+    project: str = ""
+    label: str = ""
+    confidence: str = "none"  # "auto" | "none" | "manual"
+    auto: bool = False
+
+
+class TransactionsOut(BaseModel):
+    upload_id: int
+    source_key: str
+    filename: str
+    rows: list[BankTxRow]
+    categories: list[str]     # enum for UI dropdown
+    projects: list[str]       # user project slugs
+    saved_overrides_count: int = 0
+
+
+class TransactionOverride(BaseModel):
+    idx: int
+    category: Optional[str] = None
+    project: Optional[str] = None
+    label: Optional[str] = None
+
+
+class ClassificationSaveIn(BaseModel):
+    overrides: list[TransactionOverride] = []
+
+
+class ClassificationSaveOut(BaseModel):
+    saved: int
+    total_overrides: int
