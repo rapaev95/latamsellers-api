@@ -1756,55 +1756,53 @@ def load_sku_titles_from_vendas() -> dict[str, str]:
     return out
 
 
+_MANUAL_CF_KINDS = ("partner_contributions", "manual_expenses", "manual_supplier")
+
+
 def add_manual_cashflow_entry(project: str, kind: str, entry: dict) -> bool:
-    """Добавляет entry в projects_db.json[project][kind].
+    """Per-user add: appends entry into user_data.projects[PROJECT][kind] list.
     kind ∈ ('partner_contributions', 'manual_expenses', 'manual_supplier').
     """
-    import json as _json
-    from .config import DATA_DIR
-    db_path = DATA_DIR.parent / "_admin" / "projects_db.json"
-    if not db_path.exists():
+    if kind not in _MANUAL_CF_KINDS:
         return False
-    try:
-        with open(db_path, "r", encoding="utf-8") as f:
-            db = _json.load(f)
-    except Exception:
+    from .config import load_projects, save_projects, _invalidate_projects_cache
+    projects = load_projects() or {}
+    pid = project.upper()
+    if pid not in projects:
         return False
-    if project not in db:
-        return False
-    if kind not in db[project] or not isinstance(db[project].get(kind), list):
-        db[project][kind] = []
-    db[project][kind].append(entry)
-    try:
-        with open(db_path, "w", encoding="utf-8") as f:
-            _json.dump(db, f, indent=2, ensure_ascii=False)
-        return True
-    except Exception:
-        return False
+    lst = projects[pid].get(kind)
+    if not isinstance(lst, list):
+        lst = []
+    lst.append(entry)
+    projects[pid][kind] = lst
+    save_projects(projects)
+    _invalidate_projects_cache()
+    return True
 
 
 def delete_manual_cashflow_entry(project: str, kind: str, index: int) -> bool:
-    """Удаляет запись по индексу."""
-    import json as _json
-    from .config import DATA_DIR
-    db_path = DATA_DIR.parent / "_admin" / "projects_db.json"
-    if not db_path.exists():
+    """Per-user delete: removes user_data.projects[PROJECT][kind][index]."""
+    if kind not in _MANUAL_CF_KINDS:
         return False
-    try:
-        with open(db_path, "r", encoding="utf-8") as f:
-            db = _json.load(f)
-    except Exception:
+    from .config import load_projects, save_projects, _invalidate_projects_cache
+    projects = load_projects() or {}
+    pid = project.upper()
+    lst = (projects.get(pid) or {}).get(kind)
+    if not isinstance(lst, list) or index < 0 or index >= len(lst):
         return False
-    arr = db.get(project, {}).get(kind, [])
-    if not isinstance(arr, list) or index < 0 or index >= len(arr):
-        return False
-    arr.pop(index)
-    try:
-        with open(db_path, "w", encoding="utf-8") as f:
-            _json.dump(db, f, indent=2, ensure_ascii=False)
-        return True
-    except Exception:
-        return False
+    lst.pop(index)
+    projects[pid][kind] = lst
+    save_projects(projects)
+    _invalidate_projects_cache()
+    return True
+
+
+def list_manual_cashflow_entries(project: str) -> dict:
+    """Return {kind: [entry]} for a project (3 buckets)."""
+    from .config import load_projects
+    pid = project.upper()
+    p = (load_projects() or {}).get(pid) or {}
+    return {k: (p.get(k) if isinstance(p.get(k), list) else []) for k in _MANUAL_CF_KINDS}
 
 
 _ORPHAN_DB_KEY = "f2_orphan_assignments"

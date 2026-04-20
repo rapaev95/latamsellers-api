@@ -30,6 +30,7 @@ from v2.schemas.finance import (
     OnboardingState, ProjectCreateIn, ProjectCreateOut,
     ProjectUpdateIn, ProjectMutOut,
     UploadPreviewOut,
+    ManualCashflowEntryIn, ManualCashflowEntriesOut,
 )
 from v2.storage import uploads_storage
 
@@ -1038,3 +1039,77 @@ def delete_project_endpoint(
     _invalidate_projects_cache()
     invalidate_vendas_cache(user.id)
     return {"project_id": pid, "deleted": True, "exists": True}
+
+
+# ── Manual cashflow entries (partner / expense / supplier) ─────────────────
+# Streamlit DDS tab had a form "Добавить запись вручную" — port here.
+# Data lives inside projects[PROJECT][kind] lists, so creating a new entry
+# triggers project-cache invalidation.
+
+_MANUAL_CF_KINDS = ("partner_contributions", "manual_expenses", "manual_supplier")
+
+
+@router.get("/cashflow-entries", response_model=ManualCashflowEntriesOut)
+def list_cashflow_entries(
+    project: str = Query(...),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Return 3 lists of manual entries for a project."""
+    _bind_user(user)
+    from v2.legacy.reports import list_manual_cashflow_entries
+    buckets = list_manual_cashflow_entries(project)
+    return {"project": project.upper(), **buckets}
+
+
+@router.post("/cashflow-entries", response_model=ManualCashflowEntriesOut)
+def add_cashflow_entry(
+    entry: ManualCashflowEntryIn,
+    project: str = Query(...),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Append a manual cashflow entry (inflow/outflow/supplier) to a project."""
+    _bind_user(user)
+    from v2.legacy.reports import add_manual_cashflow_entry, list_manual_cashflow_entries
+    from v2.legacy.config import _invalidate_projects_cache
+
+    if entry.kind not in _MANUAL_CF_KINDS:
+        raise HTTPException(status_code=400, detail={"error": "bad_kind", "allowed": list(_MANUAL_CF_KINDS)})
+
+    payload: dict[str, Any] = {"date": entry.date, "valor": float(entry.valor), "note": entry.note or ""}
+    if entry.kind == "partner_contributions" and entry.from_ is not None:
+        payload["from"] = entry.from_
+    if entry.kind == "manual_expenses" and entry.category is not None:
+        payload["category"] = entry.category or "expense"
+    if entry.kind == "manual_supplier" and entry.source is not None:
+        payload["source"] = entry.source
+
+    ok = add_manual_cashflow_entry(project, entry.kind, payload)
+    if not ok:
+        raise HTTPException(status_code=404, detail="project_not_found")
+    _invalidate_projects_cache()
+
+    buckets = list_manual_cashflow_entries(project)
+    return {"project": project.upper(), **buckets}
+
+
+@router.delete("/cashflow-entries", response_model=ManualCashflowEntriesOut)
+def remove_cashflow_entry(
+    project: str = Query(...),
+    kind: str = Query(...),
+    index: int = Query(..., ge=0),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Delete one manual entry by (kind, array index)."""
+    _bind_user(user)
+    from v2.legacy.reports import delete_manual_cashflow_entry, list_manual_cashflow_entries
+    from v2.legacy.config import _invalidate_projects_cache
+
+    if kind not in _MANUAL_CF_KINDS:
+        raise HTTPException(status_code=400, detail={"error": "bad_kind"})
+    ok = delete_manual_cashflow_entry(project, kind, index)
+    if not ok:
+        raise HTTPException(status_code=404, detail="entry_not_found")
+    _invalidate_projects_cache()
+
+    buckets = list_manual_cashflow_entries(project)
+    return {"project": project.upper(), **buckets}

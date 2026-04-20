@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # ── ОПиУ ────────────────────────────────────────────────────────────────────
@@ -356,3 +356,26 @@ class UploadPreviewOut(BaseModel):
     rows: list[dict[str, Any]] = []
     summary: dict[str, Any] = {}       # source-specific aggregates
     parse_error: Optional[str] = None
+
+
+# ── Manual Cashflow Entries ─────────────────────────────────────────────────
+
+class ManualCashflowEntryIn(BaseModel):
+    kind: str                     # "partner_contributions" | "manual_expenses" | "manual_supplier"
+    date: str                     # ISO YYYY-MM-DD
+    valor: float
+    note: str = ""
+    # Extra kind-specific fields the UI may populate. `from_` aliases to JSON "from"
+    # (Python reserved word). `populate_by_name` lets clients send either name.
+    from_: Optional[str] = Field(default=None, alias="from")
+    category: Optional[str] = None
+    source: Optional[str] = None
+
+    model_config = {"populate_by_name": True}
+
+
+class ManualCashflowEntriesOut(BaseModel):
+    project: str
+    partner_contributions: list[dict[str, Any]] = []
+    manual_expenses: list[dict[str, Any]] = []
+    manual_supplier: list[dict[str, Any]] = []
