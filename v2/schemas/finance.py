@@ -446,3 +446,25 @@ class RecurringSuggestion(BaseModel):
 class RecurringSuggestionsOut(BaseModel):
     suggestions: list[RecurringSuggestion]
     min_occurrences: int
+
+
+# ── Publicidade invoices (manual Mercado Ads faturas, 12-12 billing cycle) ──
+
+class PublicidadeInvoiceIn(BaseModel):
+    desde: str           # ISO YYYY-MM-DD (fatura start, typically day-12)
+    ate: str             # ISO YYYY-MM-DD (fatura end, typically day-11 next month)
+    valor: float         # invoice amount in BRL
+    note: str = ""
+
+
+class PublicidadeInvoiceOut(BaseModel):
+    index: int           # position in projects_db.json[pid][manual_publicidade]
+    desde: str
+    ate: str
+    valor: float
+    note: str = ""
+
+
+class PublicidadeInvoicesListOut(BaseModel):
+    project: str
+    invoices: list[PublicidadeInvoiceOut]

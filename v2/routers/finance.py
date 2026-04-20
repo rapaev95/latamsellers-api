@@ -33,6 +33,7 @@ from v2.schemas.finance import (
     ManualCashflowEntryIn, ManualCashflowEntriesOut,
     PlannedPaymentIn, PlannedPaymentsOut, PlannedPaymentMutOut,
     MonthlyPlanOut, RecurringSuggestionsOut,
+    PublicidadeInvoiceIn, PublicidadeInvoicesListOut,
 )
 from v2.storage import uploads_storage
 
@@ -1115,6 +1116,82 @@ def remove_cashflow_entry(
 
     buckets = list_manual_cashflow_entries(project)
     return {"project": project.upper(), **buckets}
+
+
+# ── Publicidade invoices (Mercado Ads 12-12 billing cycle) ───────────────────
+
+def _publicidade_list_response(project: str) -> dict[str, Any]:
+    from v2.legacy.reports import list_publicidade_invoices
+    items = list_publicidade_invoices(project)
+    return {
+        "project": project.upper(),
+        "invoices": [
+            {
+                "index": i,
+                "desde": str(e.get("desde", "")),
+                "ate": str(e.get("ate", "")),
+                "valor": float(e.get("valor", 0) or 0),
+                "note": str(e.get("note", "") or ""),
+            }
+            for i, e in enumerate(items)
+        ],
+    }
+
+
+@router.get("/publicidade/invoices", response_model=PublicidadeInvoicesListOut)
+def list_publicidade(
+    project: str = Query(..., description="Project ID"),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """List manual Mercado Ads invoices (faturas) for a project.
+
+    Each fatura has its own [desde, ate] period — usually a 12-12 billing cycle,
+    but arbitrary periods are allowed (backend splits per-day across requested period).
+    """
+    _bind_user(user)
+    return _publicidade_list_response(project)
+
+
+@router.post("/publicidade/invoices", response_model=PublicidadeInvoicesListOut)
+def add_publicidade(
+    entry: PublicidadeInvoiceIn,
+    project: str = Query(...),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Append one fatura entry to a project's manual_publicidade list."""
+    _bind_user(user)
+    from v2.legacy.reports import add_publicidade_invoice as _add
+
+    # Validate dates (cheap ISO sanity check; legacy code tolerates strings)
+    desde = entry.desde.strip()
+    ate = entry.ate.strip()
+    if not desde or not ate or desde > ate:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "bad_dates", "message": "desde must be <= ate, both ISO YYYY-MM-DD"},
+        )
+
+    payload = {"desde": desde, "ate": ate, "valor": float(entry.valor), "note": entry.note or ""}
+    ok = _add(project, payload)
+    if not ok:
+        raise HTTPException(status_code=404, detail="project_not_found")
+    return _publicidade_list_response(project)
+
+
+@router.delete("/publicidade/invoices", response_model=PublicidadeInvoicesListOut)
+def remove_publicidade(
+    project: str = Query(...),
+    index: int = Query(..., ge=0, description="Array index to remove"),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Delete one fatura entry by its array index."""
+    _bind_user(user)
+    from v2.legacy.reports import delete_publicidade_invoice as _del
+
+    ok = _del(project, index)
+    if not ok:
+        raise HTTPException(status_code=404, detail="entry_not_found")
+    return _publicidade_list_response(project)
 
 
 # ── Planned Payments / DDS Planning ─────────────────────────────────────────

@@ -1805,6 +1805,53 @@ def list_manual_cashflow_entries(project: str) -> dict:
     return {k: (p.get(k) if isinstance(p.get(k), list) else []) for k in _MANUAL_CF_KINDS}
 
 
+# ── Manual Publicidade invoices (Mercado Ads 12-12 billing cycle) ─────────────
+
+def list_publicidade_invoices(project: str) -> list[dict]:
+    """Return user-entered publicidade invoices for a project.
+
+    Each invoice: {desde, ate, valor, note} — matches the shape consumed by
+    `parse_publicidade_reports` (via projects_db.json[pid][manual_publicidade]).
+    """
+    from .config import load_projects
+    pid = project.upper()
+    p = (load_projects() or {}).get(pid) or {}
+    lst = p.get("manual_publicidade")
+    return lst if isinstance(lst, list) else []
+
+
+def add_publicidade_invoice(project: str, invoice: dict) -> bool:
+    """Append one fatura entry. Input: {desde, ate, valor, note} (desde/ate as YYYY-MM-DD)."""
+    from .config import load_projects, save_projects, _invalidate_projects_cache
+    projects = load_projects() or {}
+    pid = project.upper()
+    if pid not in projects:
+        return False
+    lst = projects[pid].get("manual_publicidade")
+    if not isinstance(lst, list):
+        lst = []
+    lst.append(invoice)
+    projects[pid]["manual_publicidade"] = lst
+    save_projects(projects)
+    _invalidate_projects_cache()
+    return True
+
+
+def delete_publicidade_invoice(project: str, index: int) -> bool:
+    """Delete one fatura by its array index within the project."""
+    from .config import load_projects, save_projects, _invalidate_projects_cache
+    projects = load_projects() or {}
+    pid = project.upper()
+    lst = (projects.get(pid) or {}).get("manual_publicidade")
+    if not isinstance(lst, list) or index < 0 or index >= len(lst):
+        return False
+    lst.pop(index)
+    projects[pid]["manual_publicidade"] = lst
+    save_projects(projects)
+    _invalidate_projects_cache()
+    return True
+
+
 _ORPHAN_DB_KEY = "f2_orphan_assignments"
 
 
