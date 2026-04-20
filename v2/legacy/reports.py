@@ -2508,9 +2508,18 @@ def _parse_pt_short_date(s: str):
         return None
 
 
-def _parse_publicidade_rows(rows: list, file_name: str) -> list[dict]:
+def _parse_publicidade_rows(
+    rows: list,
+    file_name: str,
+    mlb_to_sku: dict[str, str] | None = None,
+) -> list[dict]:
     """Парсит сырые rows одного отчёта publicidade. rows[1] = header.
     Используется и для csv (csv.reader), и для xlsx (df.values.tolist()).
+
+    `mlb_to_sku` — карта MLB→SKU, построенная из vendas_ml + stock_full
+    (см. `_build_mlb_to_sku_index_sync`). В ads-отчёте колонки SKU нет,
+    поэтому проект резолвится так: MLB → SKU (по карте) → catalog/prefix.
+    Без карты поведение совпадает со старым (SKU="") — FS-ветка и тесты.
     """
     if len(rows) < 2:
         return []
@@ -2552,7 +2561,8 @@ def _parse_publicidade_rows(rows: list, file_name: str) -> list[dict]:
                 inv = float(inv_str)
             except ValueError:
                 inv = 0.0
-        project = get_project_by_sku("", mlb)
+        sku_from_mlb = (mlb_to_sku or {}).get(mlb, "")
+        project = get_project_by_sku(sku_from_mlb, mlb)
         out.append({
             "file_name": file_name,
             "desde": desde,
@@ -2619,6 +2629,7 @@ def parse_publicidade_reports() -> list[dict]:
         from .db_storage import _current_user_id
         uid = _current_user_id()
         if uid is not None:
+            mlb_idx = _build_mlb_to_sku_index_sync(uid)
             for filename, file_bytes in _load_files_from_db_sync(uid, "ads_publicidade"):
                 if filename in seen:
                     continue
@@ -2626,7 +2637,7 @@ def parse_publicidade_reports() -> list[dict]:
                 rows = _rows_from_publicidade_bytes(filename, file_bytes)
                 if rows is None:
                     continue
-                result.extend(_parse_publicidade_rows(rows, filename))
+                result.extend(_parse_publicidade_rows(rows, filename, mlb_to_sku=mlb_idx))
 
     if not result:
         # FS fallback (запускается и при LS_STORAGE_MODE=fs, и если в БД у юзера пусто)
@@ -2856,6 +2867,68 @@ def _load_files_from_db_sync(user_id: int, source_key: str) -> list[tuple[str, b
     except Exception:
         return []
     return [(fn, bytes(blob)) for fn, blob in rows]
+
+
+# ── MLB → SKU index for ads project resolution ────────────────────────────
+# Ads reports have no SKU column; parser needs SKU to look up project in the
+# user's sku_catalog. Both vendas_ml (every sale row pairs MLB with its SKU)
+# and stock_full (StockFullSku.mlb) already carry that link — reuse instead
+# of asking the user to re-enter it in the catalog.
+_MLB_TO_SKU_CACHE: dict[int, dict[str, str]] = {}  # {user_id: {MLB: SKU}}
+
+
+def _build_mlb_to_sku_index_sync(user_id: int) -> dict[str, str]:
+    """Build {MLB: SKU} from the user's uploaded vendas_ml + stock_full.
+
+    Vendas are loaded first (more reliable: one row == one sale → pair is
+    guaranteed fresh). Stock_full fills in MLBs that exist as listings but
+    haven't produced sales yet (new cards).
+    """
+    cached = _MLB_TO_SKU_CACHE.get(user_id)
+    if cached is not None:
+        return cached
+
+    # Local imports — avoid circular and keep the v2 parsers optional if the
+    # legacy module is loaded outside of the FastAPI app.
+    try:
+        from v2.parsers.vendas_ml import parse_vendas_bytes
+        from v2.parsers.stock_full import parse_stock_full_bytes
+    except ImportError:
+        _MLB_TO_SKU_CACHE[user_id] = {}
+        return _MLB_TO_SKU_CACHE[user_id]
+
+    idx: dict[str, str] = {}
+
+    for _fn, blob in _load_files_from_db_sync(user_id, "vendas_ml"):
+        try:
+            for row in parse_vendas_bytes(blob):
+                mlb = (row.mlb or "").strip()
+                sku = (row.sku or "").strip()
+                if mlb and sku and mlb not in idx:
+                    idx[mlb] = sku
+        except Exception:
+            continue
+
+    for _fn, blob in _load_files_from_db_sync(user_id, "stock_full"):
+        try:
+            for sku, entry in parse_stock_full_bytes(blob).items():
+                mlb = (entry.mlb or "").strip()
+                sku = (sku or "").strip()
+                if mlb and sku and mlb not in idx:
+                    idx[mlb] = sku
+        except Exception:
+            continue
+
+    _MLB_TO_SKU_CACHE[user_id] = idx
+    return idx
+
+
+def invalidate_mlb_to_sku_index(user_id: int | None = None) -> None:
+    """Drop the cached MLB→SKU index for one user (or every user)."""
+    if user_id is None:
+        _MLB_TO_SKU_CACHE.clear()
+        return
+    _MLB_TO_SKU_CACHE.pop(user_id, None)
 
 
 def _parse_armazenagem_file(path) -> dict | None:

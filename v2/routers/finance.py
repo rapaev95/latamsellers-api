@@ -553,7 +553,7 @@ async def create_upload(
         raise HTTPException(status_code=503, detail="db_unavailable")
 
     from v2.legacy.source_detection import detect_source
-    from v2.legacy.reports import invalidate_vendas_cache
+    from v2.legacy.reports import invalidate_vendas_cache, invalidate_mlb_to_sku_index
     from v2.legacy.unlocker import try_unlock, add_known_password
 
     filename = file.filename or ""
@@ -632,6 +632,10 @@ async def create_upload(
     # without waiting for the 120s TTL (fingerprint already flips on created_at).
     if resolved_key == "vendas_ml":
         invalidate_vendas_cache(user.id)
+    # Vendas and stock_full are the sources of the MLB→SKU index used by the
+    # ads parser to resolve project for each campaign.
+    if resolved_key in ("vendas_ml", "stock_full"):
+        invalidate_mlb_to_sku_index(user.id)
 
     return {
         "id": upload_id,
@@ -654,7 +658,7 @@ async def delete_upload(
     if pool is None:
         raise HTTPException(status_code=503, detail="db_unavailable")
 
-    from v2.legacy.reports import invalidate_vendas_cache
+    from v2.legacy.reports import invalidate_vendas_cache, invalidate_mlb_to_sku_index
 
     # Peek at source_key before delete so we know whether to invalidate vendas cache.
     target = await uploads_storage.get_file(pool, user.id, upload_id)
@@ -664,6 +668,8 @@ async def delete_upload(
 
     if target is not None and target.source_key == "vendas_ml":
         invalidate_vendas_cache(user.id)
+    if target is not None and target.source_key in ("vendas_ml", "stock_full"):
+        invalidate_mlb_to_sku_index(user.id)
 
     return {"deleted": True}
 
