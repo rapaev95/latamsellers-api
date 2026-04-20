@@ -34,6 +34,7 @@ from v2.schemas.finance import (
     PlannedPaymentIn, PlannedPaymentsOut, PlannedPaymentMutOut,
     MonthlyPlanOut, RecurringSuggestionsOut,
     PublicidadeInvoiceIn, PublicidadeInvoicesListOut,
+    RentalPaymentIn, RentalPaymentsListOut,
 )
 from v2.storage import uploads_storage
 
@@ -1284,6 +1285,131 @@ def remove_publicidade(
     if not ok:
         raise HTTPException(status_code=404, detail="entry_not_found")
     return _publicidade_list_response(project)
+
+
+# ── Rental payments (cash-basis aluguel schedule per project) ────────────────
+
+def _rental_payments_response(project: str, auto_generate: bool = True) -> dict[str, Any]:
+    from v2.legacy.reports import list_rental_payments
+    from v2.legacy.config import load_projects
+    payments = list_rental_payments(project, auto_generate=auto_generate) or []
+    rental = (load_projects() or {}).get(project.upper(), {}).get("rental") or {}
+    rate_usd = float(rental.get("rate_usd", 0) or 0)
+    period = str(rental.get("period", "month"))
+
+    out: list[dict[str, Any]] = []
+    total_paid = 0.0
+    total_pending = 0.0
+    for i, p in enumerate(payments):
+        amt_usd = float(p.get("amount_usd", 0) or 0)
+        rate = p.get("rate_brl")
+        rate_f = float(rate) if rate is not None else 0.0
+        amt_brl = amt_usd * rate_f if rate_f > 0 else amt_usd * 5.46
+        status = str(p.get("status", "pending")).lower()
+        out.append({
+            "index": i,
+            "date": str(p.get("date", "")),
+            "amount_usd": amt_usd,
+            "rate_brl": rate_f if rate_f > 0 else None,
+            "amount_brl": amt_brl,
+            "status": status,
+            "note": str(p.get("note", "") or ""),
+        })
+        if status == "paid":
+            total_paid += amt_brl
+        else:
+            total_pending += amt_brl
+
+    return {
+        "project": project.upper(),
+        "rate_usd": rate_usd,
+        "period": period,
+        "payments": out,
+        "total_paid_brl": total_paid,
+        "total_pending_brl": total_pending,
+    }
+
+
+@router.get("/rental-payments", response_model=RentalPaymentsListOut)
+def list_rental(
+    project: str = Query(..., description="Project ID"),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Список платежей аренды по проекту. При первом вызове с пустым массивом
+    автосгенерирует 6 будущих pending-платежей из rental.next_payment_date."""
+    _bind_user(user)
+    return _rental_payments_response(project, auto_generate=True)
+
+
+def _rental_payment_payload(entry: RentalPaymentIn) -> dict[str, Any]:
+    """Validate + normalize payload for persistence."""
+    status = (entry.status or "pending").lower()
+    if status not in ("paid", "pending"):
+        raise HTTPException(status_code=400, detail={"error": "bad_status", "allowed": ["paid", "pending"]})
+    if entry.amount_usd is None or entry.amount_usd <= 0:
+        raise HTTPException(status_code=400, detail={"error": "bad_amount"})
+    if status == "paid" and (entry.rate_brl is None or entry.rate_brl <= 0):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "rate_required", "message": "rate_brl required when status=paid"},
+        )
+    payload: dict[str, Any] = {
+        "date": entry.date,
+        "amount_usd": float(entry.amount_usd),
+        "status": status,
+        "note": entry.note or "",
+    }
+    if entry.rate_brl is not None and entry.rate_brl > 0:
+        payload["rate_brl"] = float(entry.rate_brl)
+    return payload
+
+
+@router.post("/rental-payments", response_model=RentalPaymentsListOut)
+def add_rental(
+    entry: RentalPaymentIn,
+    project: str = Query(...),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Добавить платёж аренды (paid или pending)."""
+    _bind_user(user)
+    from v2.legacy.reports import add_rental_payment as _add
+    payload = _rental_payment_payload(entry)
+    ok = _add(project, payload)
+    if not ok:
+        raise HTTPException(status_code=404, detail="project_not_found")
+    return _rental_payments_response(project, auto_generate=False)
+
+
+@router.patch("/rental-payments", response_model=RentalPaymentsListOut)
+def update_rental(
+    entry: RentalPaymentIn,
+    project: str = Query(...),
+    index: int = Query(..., ge=0),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Заменить платёж аренды по индексу."""
+    _bind_user(user)
+    from v2.legacy.reports import update_rental_payment as _upd
+    payload = _rental_payment_payload(entry)
+    ok = _upd(project, index, payload)
+    if not ok:
+        raise HTTPException(status_code=404, detail="payment_not_found")
+    return _rental_payments_response(project, auto_generate=False)
+
+
+@router.delete("/rental-payments", response_model=RentalPaymentsListOut)
+def remove_rental(
+    project: str = Query(...),
+    index: int = Query(..., ge=0),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Удалить платёж аренды."""
+    _bind_user(user)
+    from v2.legacy.reports import delete_rental_payment as _del
+    ok = _del(project, index)
+    if not ok:
+        raise HTTPException(status_code=404, detail="payment_not_found")
+    return _rental_payments_response(project, auto_generate=False)
 
 
 # ── Planned Payments / DDS Planning ─────────────────────────────────────────

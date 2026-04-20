@@ -1963,6 +1963,136 @@ def list_manual_cashflow_entries(project: str) -> dict:
     return out
 
 
+# ── Rental payments (per-project cash-basis aluguel schedule) ───────────────
+
+_RENTAL_AUTO_COUNT = 6   # сколько будущих платежей автогенерируется при пустом payments
+
+
+def _auto_generate_pending_payments(rental: dict) -> list:
+    """Генерирует N будущих pending-платежей от next_payment_date с шагом period.
+
+    Вызывается из list_rental_payments при пустом payments-массиве, чтобы
+    пользователь сразу видел план платежей и мог «подтвердить» каждый одним
+    кликом, когда реально придёт оплата. Сгенерированное сохраняется в БД →
+    повторной авто-генерации не будет.
+    """
+    from datetime import datetime as _dt
+    rate_usd = float(rental.get("rate_usd", 0) or 0)
+    if rate_usd <= 0:
+        return []
+    period = str(rental.get("period", "month")).lower()
+    start_str = rental.get("next_payment_date")
+    if not start_str:
+        return []
+    try:
+        start = _dt.strptime(start_str, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return []
+    step_months = 3 if period.startswith("quart") else 1
+    generated: list = []
+    cur = start
+    for _ in range(_RENTAL_AUTO_COUNT):
+        generated.append({
+            "date": cur.isoformat(),
+            "amount_usd": rate_usd,
+            "rate_brl": None,
+            "status": "pending",
+            "note": "Автогенерация",
+        })
+        # advance by step_months, handling year rollover and day-out-of-range (Feb 30)
+        new_month = cur.month + step_months
+        new_year = cur.year + (new_month - 1) // 12
+        new_month = ((new_month - 1) % 12) + 1
+        try:
+            cur = cur.replace(year=new_year, month=new_month)
+        except ValueError:
+            cur = cur.replace(year=new_year, month=new_month, day=1)
+    return generated
+
+
+def list_rental_payments(project: str, auto_generate: bool = True) -> list[dict]:
+    """Вернуть payments проекта. Если массив пуст и auto_generate=True — сгенерить
+    будущие pending-платежи и сохранить (auto-populate при первом открытии UI).
+    """
+    from .config import load_projects, save_projects, _invalidate_projects_cache
+    projects = load_projects() or {}
+    pid = project.upper()
+    p = projects.get(pid) or {}
+    rental = p.get("rental") or {}
+    payments = rental.get("payments") or []
+
+    if payments or not auto_generate:
+        return payments if isinstance(payments, list) else []
+
+    # Пустой массив → автогенерация
+    generated = _auto_generate_pending_payments(rental)
+    if generated:
+        # Персистим, чтобы больше не регенерировать (а платежи пользователь
+        # может редактировать/удалять как обычные записи)
+        if "rental" not in p or not isinstance(p.get("rental"), dict):
+            p["rental"] = rental
+            projects[pid] = p
+        p["rental"]["payments"] = generated
+        save_projects(projects)
+        _invalidate_projects_cache()
+    return generated
+
+
+def add_rental_payment(project: str, payment: dict) -> bool:
+    """Добавить платёж аренды в rental.payments."""
+    from .config import load_projects, save_projects, _invalidate_projects_cache
+    projects = load_projects() or {}
+    pid = project.upper()
+    if pid not in projects:
+        return False
+    rental = projects[pid].get("rental")
+    if not isinstance(rental, dict):
+        rental = {}
+        projects[pid]["rental"] = rental
+    payments = rental.get("payments")
+    if not isinstance(payments, list):
+        payments = []
+    payments.append(payment)
+    rental["payments"] = payments
+    save_projects(projects)
+    _invalidate_projects_cache()
+    return True
+
+
+def update_rental_payment(project: str, index: int, payment: dict) -> bool:
+    """Заменить payments[index] на новый объект."""
+    from .config import load_projects, save_projects, _invalidate_projects_cache
+    projects = load_projects() or {}
+    pid = project.upper()
+    rental = (projects.get(pid) or {}).get("rental") or {}
+    payments = rental.get("payments")
+    if not isinstance(payments, list) or index < 0 or index >= len(payments):
+        return False
+    payments[index] = payment
+    rental["payments"] = payments
+    projects[pid]["rental"] = rental
+    save_projects(projects)
+    _invalidate_projects_cache()
+    return True
+
+
+def delete_rental_payment(project: str, index: int) -> bool:
+    """Удалить payments[index]."""
+    from .config import load_projects, save_projects, _invalidate_projects_cache
+    projects = load_projects() or {}
+    pid = project.upper()
+    rental = (projects.get(pid) or {}).get("rental") or {}
+    payments = rental.get("payments")
+    if not isinstance(payments, list) or index < 0 or index >= len(payments):
+        return False
+    payments.pop(index)
+    rental["payments"] = payments
+    projects[pid]["rental"] = rental
+    save_projects(projects)
+    _invalidate_projects_cache()
+    return True
+
+
 # ── Manual Publicidade invoices (Mercado Ads 12-12 billing cycle) ─────────────
 
 def list_publicidade_invoices(project: str) -> list[dict]:

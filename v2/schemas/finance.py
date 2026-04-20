@@ -463,6 +463,35 @@ class RecurringSuggestionsOut(BaseModel):
     min_occurrences: int
 
 
+# ── Rental payments (per-project cash-basis aluguel schedule) ───────────────
+
+class RentalPaymentIn(BaseModel):
+    date: str                            # ISO YYYY-MM-DD (дата платежа или планируемая)
+    amount_usd: float                    # исходная сумма в USD
+    rate_brl: Optional[float] = None     # курс на дату (обязательно для status=paid)
+    status: str                          # "paid" | "pending"
+    note: str = ""
+
+
+class RentalPaymentOut(BaseModel):
+    index: int                           # позиция в projects_db[pid][rental][payments]
+    date: str
+    amount_usd: float
+    rate_brl: Optional[float] = None
+    amount_brl: float                    # вычислено: amount_usd × rate_brl
+    status: str
+    note: str = ""
+
+
+class RentalPaymentsListOut(BaseModel):
+    project: str
+    rate_usd: float                      # из projects_db (эталонная сумма платежа, для автозаполнения)
+    period: str                          # "month" | "quarter"
+    payments: list[RentalPaymentOut]
+    total_paid_brl: float
+    total_pending_brl: float
+
+
 # ── Publicidade invoices (manual Mercado Ads faturas, 12-12 billing cycle) ──
 
 class PublicidadeInvoiceIn(BaseModel):

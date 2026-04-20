@@ -588,6 +588,49 @@ def compute_cashflow(project: str, period: tuple[date, date]) -> CashFlowReport:
             "Курс": float(item.get("rate_brl", 0) or 0) if cur != "BRL" else None,
         })
 
+    # ── Аренда: ДДС = ФАКТ платежей (cash-basis), ОПиУ = прорейт (accrual) ──
+    # op_profit из compute_pnl включает прорейт аренды → вычитаем его обратно,
+    # чтобы строка «Операционный приток» не дублировалась с реальными платежами.
+    aluguel_accrual_brl = 0.0
+    for line in (pnl.operating_expenses or []):
+        lbl = (line.label or "").lower()
+        if lbl.startswith("aluguel") or "alug" in lbl:
+            aluguel_accrual_brl += float(line.amount_brl or 0)
+    op_profit_cash = op_profit + aluguel_accrual_brl  # восстанавливаем до-арендной прибыли
+
+    # Фактически оплаченные rental.payments в периоде (status=paid)
+    rental = proj_meta.get("rental") or {}
+    rental_payments = rental.get("payments") or []
+    outflows_rental_actual = 0.0
+    rental_txs: list = []
+    for p_item in rental_payments:
+        if str(p_item.get("status", "")).lower() != "paid":
+            continue
+        try:
+            pd_t = _dt.strptime(str(p_item.get("date", "")), "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            continue
+        if pd_t < period_start or pd_t > period_end:
+            continue
+        amt_usd = float(p_item.get("amount_usd", 0) or 0)
+        rate = float(p_item.get("rate_brl", 0) or 0)
+        if rate <= 0:
+            rate = 5.46  # fallback — консервативный курс, чтобы пропустить запись
+        amt_brl = amt_usd * rate
+        outflows_rental_actual += amt_brl
+        other_expenses_txs.append({
+            "Data": pd_t.strftime("%d/%m/%Y"),
+            "Valor": -amt_brl,
+            "Descrição": p_item.get("note", "") or "Аренда (факт)",
+            "Категория": "rental",
+            "Класс.": f"USD {amt_usd:.2f} @ {rate:.4f}",
+            "Валюта": "USD",
+            "Сумма_ориг": amt_usd,
+            "Курс": rate,
+        })
+    # Показываем в outflows_other, чтобы попало в общую разбивку ДДС
+    other_expenses_total += outflows_rental_actual
+
     # ── Cash position ──
     # Opening balance: берём из project.opening_balance (BRL) если задан.
     # Смысл: касса на дату balance_date (например, сальдо на 01.09.2025 при
@@ -610,14 +653,14 @@ def compute_cashflow(project: str, period: tuple[date, date]) -> CashFlowReport:
     except (TypeError, ValueError):
         pass
 
-    closing = (opening + op_profit + usdt_total_brl + partner_total
+    closing = (opening + op_profit_cash + usdt_total_brl + partner_total
                - supplier_total - other_expenses_total)
 
     return CashFlowReport(
         project=project,
         period=period,
         opening_balance=opening,
-        inflows_operating=op_profit,
+        inflows_operating=op_profit_cash,
         inflows_count=int(pnl.vendas_count or 0),
         inflows_financing=usdt_total_brl,
         inflows_partner=partner_total,
