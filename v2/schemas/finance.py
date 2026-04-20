@@ -329,6 +329,21 @@ class ProjectCreateOut(BaseModel):
     total_projects: int
 
 
+class ProjectUpdateIn(BaseModel):
+    """Full project edit payload. `fields` are merged using the whitelist in
+    legacy.config._PROJECT_EDITABLE_KEYS; `rental_fields` merged into rental dict."""
+    fields: dict[str, Any] = {}
+    rental_fields: Optional[dict[str, Any]] = None
+
+
+class ProjectMutOut(BaseModel):
+    """Return for PUT / DELETE — confirms target + outcome."""
+    project_id: str
+    updated: bool = False
+    deleted: bool = False
+    exists: bool = True
+
+
 # ── Upload Preview ──────────────────────────────────────────────────────────
 
 class UploadPreviewOut(BaseModel):

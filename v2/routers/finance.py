@@ -28,6 +28,7 @@ from v2.schemas.finance import (
     RulesOut, RulesSaveIn, TransactionsOut,
     ClassificationSaveIn, ClassificationSaveOut,
     OnboardingState, ProjectCreateIn, ProjectCreateOut,
+    ProjectUpdateIn, ProjectMutOut,
     UploadPreviewOut,
 )
 from v2.storage import uploads_storage
@@ -987,3 +988,53 @@ def create_project(
 
     total = len(load_projects() or {})
     return {"project_id": pid, "created": is_new, "total_projects": total}
+
+
+@router.put("/projects/{project_id}", response_model=ProjectMutOut)
+def update_project_endpoint(
+    project_id: str,
+    body: ProjectUpdateIn,
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Edit an existing project. Only whitelisted fields (see `_PROJECT_EDITABLE_KEYS`
+    in legacy.config) are applied. `rental_fields` merges into the `rental` subdict.
+
+    Also invalidates per-user vendas DF cache because project → SKU resolution
+    depends on `sku_prefixes` / `mlb_fallback`.
+    """
+    _bind_user(user)
+    from v2.legacy.config import update_project, load_projects, _invalidate_projects_cache
+    from v2.legacy.reports import invalidate_vendas_cache
+
+    pid = project_id.strip().upper()
+    if not pid:
+        raise HTTPException(status_code=400, detail="project_id_required")
+
+    ok = update_project(pid, body.fields or {}, body.rental_fields)
+    if not ok:
+        return {"project_id": pid, "updated": False, "exists": False}
+
+    _invalidate_projects_cache()
+    invalidate_vendas_cache(user.id)
+    return {"project_id": pid, "updated": True, "exists": True}
+
+
+@router.delete("/projects/{project_id}", response_model=ProjectMutOut)
+def delete_project_endpoint(
+    project_id: str,
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Remove a project from user_data.projects. Raw vendas / uploads are kept."""
+    _bind_user(user)
+    from v2.legacy.config import delete_project, load_projects, _invalidate_projects_cache
+    from v2.legacy.reports import invalidate_vendas_cache
+
+    pid = project_id.strip().upper()
+    existed = pid in (load_projects() or {})
+    if not existed:
+        return {"project_id": pid, "deleted": False, "exists": False}
+
+    delete_project(pid)
+    _invalidate_projects_cache()
+    invalidate_vendas_cache(user.id)
+    return {"project_id": pid, "deleted": True, "exists": True}
