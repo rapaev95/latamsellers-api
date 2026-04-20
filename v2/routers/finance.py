@@ -31,6 +31,8 @@ from v2.schemas.finance import (
     ProjectUpdateIn, ProjectMutOut,
     UploadPreviewOut,
     ManualCashflowEntryIn, ManualCashflowEntriesOut,
+    PlannedPaymentIn, PlannedPaymentsOut, PlannedPaymentMutOut,
+    MonthlyPlanOut, RecurringSuggestionsOut,
 )
 from v2.storage import uploads_storage
 
@@ -1113,3 +1115,81 @@ def remove_cashflow_entry(
 
     buckets = list_manual_cashflow_entries(project)
     return {"project": project.upper(), **buckets}
+
+
+# ── Planned Payments / DDS Planning ─────────────────────────────────────────
+# Port of Streamlit _admin/dds_planning.py. Per-user list lives in
+# user_data.f2_planned_payments; monthly grid + recurring detection derived.
+
+@router.get("/planned-payments", response_model=PlannedPaymentsOut)
+def get_planned_payments(user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
+    _bind_user(user)
+    from v2.legacy.planning import load_payments
+    payments = load_payments()
+    return {"payments": payments, "count": len(payments)}
+
+
+@router.post("/planned-payments", response_model=PlannedPaymentMutOut)
+def create_planned_payment(
+    body: PlannedPaymentIn,
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    _bind_user(user)
+    from v2.legacy.planning import add_payment
+    row = add_payment(body.model_dump())
+    return {"updated": True, "payment": row}
+
+
+@router.put("/planned-payments/{payment_id}", response_model=PlannedPaymentMutOut)
+def put_planned_payment(
+    payment_id: int,
+    body: PlannedPaymentIn,
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    _bind_user(user)
+    from v2.legacy.planning import update_payment, load_payments
+    ok = update_payment(payment_id, body.model_dump())
+    if not ok:
+        raise HTTPException(status_code=404, detail="payment_not_found")
+    row = next((p for p in load_payments() if int(p.get("id") or -1) == payment_id), None)
+    return {"updated": True, "payment": row}
+
+
+@router.delete("/planned-payments/{payment_id}", response_model=PlannedPaymentMutOut)
+def remove_planned_payment(
+    payment_id: int,
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    _bind_user(user)
+    from v2.legacy.planning import delete_payment
+    ok = delete_payment(payment_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="payment_not_found")
+    return {"deleted": True}
+
+
+@router.get("/planned-payments/monthly", response_model=MonthlyPlanOut)
+def get_monthly_plan(
+    months: int = Query(12, ge=1, le=36),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Aggregate all planned payments into next N months. Used by Planning → Monthly grid."""
+    _bind_user(user)
+    from v2.legacy.planning import build_monthly_plan
+    plan = build_monthly_plan(months)
+    months_sorted = sorted(plan.keys())
+    buckets = {k: {"month": k, **v} for k, v in plan.items()}
+    return {"months": months_sorted, "buckets": buckets}
+
+
+@router.get("/planned-payments/suggest-recurring", response_model=RecurringSuggestionsOut)
+def get_recurring_suggestions(
+    min_occurrences: int = Query(3, ge=2, le=12),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Scan all bank uploads of the user and suggest recurring payment patterns
+    (same label appearing in >= min_occurrences distinct months)."""
+    _bind_user(user)
+    from v2.legacy.planning import detect_recurring_from_bank_sync
+    items = detect_recurring_from_bank_sync(user.id, min_occurrences)
+    return {"suggestions": items, "min_occurrences": min_occurrences}

@@ -379,3 +379,70 @@ class ManualCashflowEntriesOut(BaseModel):
     partner_contributions: list[dict[str, Any]] = []
     manual_expenses: list[dict[str, Any]] = []
     manual_supplier: list[dict[str, Any]] = []
+
+
+# ── Planned Payments (DDS Planning) ─────────────────────────────────────────
+
+class PlannedPayment(BaseModel):
+    id: Optional[int] = None
+    date: str                               # ISO YYYY-MM-DD
+    amount: float
+    direction: str = "expense"              # "expense" | "income"
+    recurrence: str = "once"                # "once" | "monthly" | "quarterly" | "yearly"
+    contragent: str = ""
+    category: str = ""
+    note: str = ""
+    project: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class PlannedPaymentIn(BaseModel):
+    date: str
+    amount: float
+    direction: str = "expense"
+    recurrence: str = "once"
+    contragent: str = ""
+    category: str = ""
+    note: str = ""
+    project: Optional[str] = None
+
+
+class PlannedPaymentsOut(BaseModel):
+    payments: list[PlannedPayment] = []
+    count: int = 0
+
+
+class PlannedPaymentMutOut(BaseModel):
+    updated: bool = False
+    deleted: bool = False
+    payment: Optional[PlannedPayment] = None
+
+
+class MonthlyPlanBucket(BaseModel):
+    month: str                              # YYYY-MM
+    income: list[dict[str, Any]] = []
+    expense: list[dict[str, Any]] = []
+    total_in: float = 0
+    total_out: float = 0
+    net: float = 0
+
+
+class MonthlyPlanOut(BaseModel):
+    months: list[str]
+    buckets: dict[str, MonthlyPlanBucket]
+
+
+class RecurringSuggestion(BaseModel):
+    contragent: str
+    category: str = ""
+    direction: str                          # "expense" | "income"
+    avg_amount: float
+    min_amount: float
+    max_amount: float
+    months_count: int
+    total_txs: int
+
+
+class RecurringSuggestionsOut(BaseModel):
+    suggestions: list[RecurringSuggestion]
+    min_occurrences: int
