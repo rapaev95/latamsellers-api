@@ -1049,7 +1049,10 @@ def delete_project_endpoint(
 # Data lives inside projects[PROJECT][kind] lists, so creating a new entry
 # triggers project-cache invalidation.
 
-_MANUAL_CF_KINDS = ("partner_contributions", "manual_expenses", "manual_supplier")
+_MANUAL_CF_KINDS = (
+    "partner_contributions", "manual_expenses", "manual_supplier",
+    "loan_given", "loan_received",
+)
 
 
 @router.get("/cashflow-entries", response_model=ManualCashflowEntriesOut)
@@ -1086,9 +1089,32 @@ def add_cashflow_entry(
     if entry.kind == "manual_supplier" and entry.source is not None:
         payload["source"] = entry.source
 
+    # Multi-currency: only persist non-default values to keep payloads clean
+    cur = (entry.currency or "BRL").upper()
+    if cur != "BRL":
+        payload["currency"] = cur
+        if entry.rate_brl is None or entry.rate_brl <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "rate_required", "message": "rate_brl required when currency != BRL"},
+            )
+        payload["rate_brl"] = float(entry.rate_brl)
+
+    # Inter-project loans: require counterparty_project (validated downstream)
+    if entry.kind in ("loan_given", "loan_received"):
+        if not entry.counterparty_project:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "counterparty_required", "message": "loan entries need counterparty_project"},
+            )
+        payload["counterparty_project"] = entry.counterparty_project.upper()
+
     ok = add_manual_cashflow_entry(project, entry.kind, payload)
     if not ok:
-        raise HTTPException(status_code=404, detail="project_not_found")
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "project_or_counterparty_not_found"},
+        )
     _invalidate_projects_cache()
 
     buckets = list_manual_cashflow_entries(project)

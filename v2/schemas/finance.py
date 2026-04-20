@@ -367,15 +367,22 @@ class UploadPreviewOut(BaseModel):
 # ── Manual Cashflow Entries ─────────────────────────────────────────────────
 
 class ManualCashflowEntryIn(BaseModel):
-    kind: str                     # "partner_contributions" | "manual_expenses" | "manual_supplier"
+    kind: str                     # "partner_contributions" | "manual_expenses" | "manual_supplier" | "loan_given" | "loan_received"
     date: str                     # ISO YYYY-MM-DD
-    valor: float
+    valor: float                  # в исходной валюте (см. currency)
     note: str = ""
     # Extra kind-specific fields the UI may populate. `from_` aliases to JSON "from"
     # (Python reserved word). `populate_by_name` lets clients send either name.
     from_: Optional[str] = Field(default=None, alias="from")
     category: Optional[str] = None
     source: Optional[str] = None
+    # Multi-currency support (partner_contributions and loans often come in USDT/USD).
+    # currency defaults to "BRL" for backward compat; rate_brl required when currency ≠ BRL.
+    currency: Optional[str] = "BRL"         # "BRL" | "USDT" | "USD"
+    rate_brl: Optional[float] = None         # курс к BRL на дату (если currency != BRL)
+    # Inter-project loans: who's on the other side. Required for loan_given / loan_received.
+    # Backend writes a mirror entry in the counterparty project, linked by auto-generated loan_id.
+    counterparty_project: Optional[str] = None
 
     model_config = {"populate_by_name": True}
 
@@ -385,6 +392,8 @@ class ManualCashflowEntriesOut(BaseModel):
     partner_contributions: list[dict[str, Any]] = []
     manual_expenses: list[dict[str, Any]] = []
     manual_supplier: list[dict[str, Any]] = []
+    loans_given: list[dict[str, Any]] = []       # этот проект ВЫДАЛ займ другому (outflow)
+    loans_received: list[dict[str, Any]] = []    # этот проект ПОЛУЧИЛ займ от другого (inflow)
 
 
 # ── Planned Payments (DDS Planning) ─────────────────────────────────────────

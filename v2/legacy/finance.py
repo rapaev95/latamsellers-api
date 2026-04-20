@@ -30,6 +30,37 @@ from .reports import (
 
 
 # ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+
+def _entry_valor_brl(item: dict) -> float:
+    """BRL-normalized amount for a manual cashflow entry.
+
+    Entries may be recorded in non-BRL currencies (USDT/USD) with a snapshot
+    exchange rate for the date of the transaction. This helper returns the BRL
+    equivalent used in ДДС aggregations.
+
+    - currency missing or "BRL" → return valor as-is
+    - currency != BRL with positive rate_brl → valor × rate_brl
+    - currency != BRL but rate_brl missing/zero → fallback: return valor
+      (treats amount as already-BRL; a missing rate is a data issue, not a
+      show-stopper — caller can surface it in the UI)
+    """
+    try:
+        v = float(item.get("valor", 0) or 0)
+    except (ValueError, TypeError):
+        return 0.0
+    cur = str(item.get("currency", "BRL") or "BRL").upper()
+    if cur == "BRL":
+        return v
+    try:
+        rate = float(item.get("rate_brl", 0) or 0)
+    except (ValueError, TypeError):
+        rate = 0.0
+    return v * rate if rate > 0 else v
+
+
+# ─────────────────────────────────────────────
 # DATACLASSES
 # ─────────────────────────────────────────────
 
@@ -416,7 +447,9 @@ def compute_cashflow(project: str, period: tuple[date, date]) -> CashFlowReport:
         if inv_date <= period_end:
             usdt_total_brl += float(inv.get("brl", 0) or 0)
 
-    # 2b. Поступления от партнёра — факт, учитываем всё до period_end
+    # 2b. Поступления от партнёра — факт, учитываем всё до period_end.
+    # Валюта: partner может внести USDT/USD с указанным курсом → _entry_valor_brl
+    # нормализует в BRL.
     partner_total = 0.0
     partner_txs: list = []
     for item in (proj_meta.get("partner_contributions") or []):
@@ -426,17 +459,40 @@ def compute_cashflow(project: str, period: tuple[date, date]) -> CashFlowReport:
             continue
         if d_t > period_end:
             continue
-        try:
-            v = float(item.get("valor", 0) or 0)
-        except (ValueError, TypeError):
-            v = 0
-        partner_total += v
+        v_brl = _entry_valor_brl(item)
+        partner_total += v_brl
+        cur = str(item.get("currency", "BRL") or "BRL").upper()
         partner_txs.append({
             "Data": d_t.strftime("%d/%m/%Y"),
-            "Valor": v,
+            "Valor": v_brl,
             "Descrição": item.get("note", ""),
             "Категория": "partner",
             "Класс.": item.get("from", ""),
+            "Валюта": cur,
+            "Сумма_ориг": float(item.get("valor", 0) or 0),
+            "Курс": float(item.get("rate_brl", 0) or 0) if cur != "BRL" else None,
+        })
+
+    # 2c. Полученные займы от других проектов — inflow, учитываем до period_end
+    for item in (proj_meta.get("loans_received") or []):
+        try:
+            d_t = _dt.strptime(str(item.get("date", "")), "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            continue
+        if d_t > period_end:
+            continue
+        v_brl = _entry_valor_brl(item)
+        partner_total += v_brl  # в inflows_partner (финансирование от «партнёра по займу»)
+        cur = str(item.get("currency", "BRL") or "BRL").upper()
+        partner_txs.append({
+            "Data": d_t.strftime("%d/%m/%Y"),
+            "Valor": v_brl,
+            "Descrição": item.get("note", "") or "Займ получен",
+            "Категория": "loan_received",
+            "Класс.": item.get("counterparty_project", ""),
+            "Валюта": cur,
+            "Сумма_ориг": float(item.get("valor", 0) or 0),
+            "Курс": float(item.get("rate_brl", 0) or 0) if cur != "BRL" else None,
         })
 
     # 4. Manual expenses — факт, учитываем всё до period_end
@@ -449,17 +505,40 @@ def compute_cashflow(project: str, period: tuple[date, date]) -> CashFlowReport:
             continue
         if d_t > period_end:
             continue
-        try:
-            v = abs(float(item.get("valor", 0) or 0))
-        except (ValueError, TypeError):
-            v = 0
+        v = abs(_entry_valor_brl(item))
         other_expenses_total += v
+        cur = str(item.get("currency", "BRL") or "BRL").upper()
         other_expenses_txs.append({
             "Data": d_t.strftime("%d/%m/%Y"),
             "Valor": -v,
             "Descrição": item.get("note", ""),
             "Категория": item.get("category", "expense"),
             "Класс.": "manual",
+            "Валюта": cur,
+            "Сумма_ориг": float(item.get("valor", 0) or 0),
+            "Курс": float(item.get("rate_brl", 0) or 0) if cur != "BRL" else None,
+        })
+
+    # 4b. Выданные займы другим проектам — outflow, учитываем до period_end
+    for item in (proj_meta.get("loans_given") or []):
+        try:
+            d_t = _dt.strptime(str(item.get("date", "")), "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            continue
+        if d_t > period_end:
+            continue
+        v = abs(_entry_valor_brl(item))
+        other_expenses_total += v
+        cur = str(item.get("currency", "BRL") or "BRL").upper()
+        other_expenses_txs.append({
+            "Data": d_t.strftime("%d/%m/%Y"),
+            "Valor": -v,
+            "Descrição": item.get("note", "") or "Займ выдан",
+            "Категория": "loan_given",
+            "Класс.": item.get("counterparty_project", ""),
+            "Валюта": cur,
+            "Сумма_ориг": float(item.get("valor", 0) or 0),
+            "Курс": float(item.get("rate_brl", 0) or 0) if cur != "BRL" else None,
         })
 
     # 3. Supplier outflows — факт, учитываем всё до period_end
@@ -495,17 +574,18 @@ def compute_cashflow(project: str, period: tuple[date, date]) -> CashFlowReport:
             continue
         if tx_date > period_end:
             continue
-        try:
-            val = abs(float(item.get("valor", 0) or 0))
-        except (ValueError, TypeError):
-            val = 0
+        val = abs(_entry_valor_brl(item))
         supplier_total += val
+        cur = str(item.get("currency", "BRL") or "BRL").upper()
         supplier_txs.append({
             "Data": tx_date.strftime("%d/%m/%Y"),
             "Valor": -val,
             "Descrição": item.get("note", ""),
             "Категория": "supplier",
             "Класс.": f"manual ({item.get('source','')})",
+            "Валюта": cur,
+            "Сумма_ориг": float(item.get("valor", 0) or 0),
+            "Курс": float(item.get("rate_brl", 0) or 0) if cur != "BRL" else None,
         })
 
     # ── Cash position ──

@@ -1457,12 +1457,21 @@ def _parse_one_vendas_file(filename: str, blob: bytes) -> "pd.DataFrame | None":
 
 
 def _load_vendas_from_db_sync(user_id: int) -> "pd.DataFrame | None":
-    """Read the SINGLE NEWEST Vendas ML file the user uploaded and parse it.
+    """Read ALL Vendas ML files for the user, parse each, concat, dedupe.
 
-    Mirrors legacy Streamlit `load_vendas_ml_report` which picks the most
-    recent `vendas_ml*.xlsx` from `_data/{month}/` — one file per report run,
-    no cross-file merging / deduping. Each user upload fully replaces the
-    prior view.
+    Users upload a mix of:
+      - monthly exports (setembro.csv, outubro.csv, ...)
+      - ML-generated 90-day snapshot (Vendas_BR_Mercado_Libre_*.csv)
+
+    The snapshot overlaps with the most recent monthly exports by design.
+    Dedupe by `(N.º de venda, SKU)` — keeps one row per sale line across
+    overlapping files. `ORDER BY created_at DESC` + `keep="first"` means
+    the freshest upload wins when the same (sale, SKU) appears in both.
+
+    Multi-item packages ("Pacote de N produtos") have one parent row with
+    empty SKU plus child rows with SKUs — dedupe keeps each child once and
+    one parent per sale, preserving the structure needed by downstream
+    project-assignment logic.
     """
     import os
     import psycopg2
@@ -1475,23 +1484,40 @@ def _load_vendas_from_db_sync(user_id: int) -> "pd.DataFrame | None":
         cur.execute(
             """SELECT filename, file_bytes FROM uploads
                WHERE user_id=%s AND source_key='vendas_ml' AND file_bytes IS NOT NULL
-               ORDER BY created_at DESC
-               LIMIT 1""",
+               ORDER BY created_at DESC""",
             (user_id,),
         )
-        row = cur.fetchone()
+        rows = cur.fetchall()
         cur.close()
         conn.close()
     except Exception:
         return None
-    if row is None:
+    if not rows:
         return None
 
-    filename, blob = row
-    df = _parse_one_vendas_file(filename, bytes(blob))
-    if df is None or df.empty:
+    parts: list[pd.DataFrame] = []
+    filenames: list[str] = []
+    for filename, blob in rows:
+        df_part = _parse_one_vendas_file(filename, bytes(blob))
+        if df_part is None or df_part.empty:
+            continue
+        parts.append(df_part)
+        filenames.append(filename)
+    if not parts:
         return None
-    df.attrs["__source_file"] = filename
+
+    # Align columns via pd.concat (handles differing column sets gracefully)
+    df = pd.concat(parts, ignore_index=True)
+
+    # Dedupe across overlapping files. `(N.º de venda, SKU)` is a composite key:
+    # - two rows with same sale_id + same SKU in two files → overlap, keep 1
+    # - same sale_id + different SKU → legitimate multi-item line, keep both
+    # - empty SKU parent rows of same sale → dedupe to 1 parent
+    dedupe_cols = [c for c in ("N.º de venda", "SKU") if c in df.columns]
+    if dedupe_cols:
+        df = df.drop_duplicates(subset=dedupe_cols, keep="first").reset_index(drop=True)
+
+    df.attrs["__source_file"] = ", ".join(filenames)
     df.attrs["__source_path"] = "<db:uploads>"
     return df
 
@@ -1757,12 +1783,33 @@ def load_sku_titles_from_vendas() -> dict[str, str]:
     return out
 
 
-_MANUAL_CF_KINDS = ("partner_contributions", "manual_expenses", "manual_supplier")
+_MANUAL_CF_KINDS = (
+    "partner_contributions", "manual_expenses", "manual_supplier",
+    "loan_given", "loan_received",
+)
+
+
+def _cf_list_name(kind: str) -> str:
+    """Map a cashflow kind to its storage list name inside projects_db[pid].
+    Most kinds map 1:1; loan_given/loan_received use plural list names.
+    """
+    return {
+        "loan_given": "loans_given",
+        "loan_received": "loans_received",
+    }.get(kind, kind)
+
+
+def _mirror_loan_kind(kind: str) -> str:
+    """loan_given ↔ loan_received (used for mirror entry in counterparty project)."""
+    return {"loan_given": "loan_received", "loan_received": "loan_given"}.get(kind, kind)
 
 
 def add_manual_cashflow_entry(project: str, kind: str, entry: dict) -> bool:
-    """Per-user add: appends entry into user_data.projects[PROJECT][kind] list.
-    kind ∈ ('partner_contributions', 'manual_expenses', 'manual_supplier').
+    """Per-user add: appends entry into user_data.projects[PROJECT][list_name].
+
+    For loan_given/loan_received additionally writes a mirrored entry in the
+    counterparty project (atomic — single save_projects call). Both entries
+    are linked by a shared `loan_id` (UUID) so deletion cascades correctly.
     """
     if kind not in _MANUAL_CF_KINDS:
         return False
@@ -1771,39 +1818,90 @@ def add_manual_cashflow_entry(project: str, kind: str, entry: dict) -> bool:
     pid = project.upper()
     if pid not in projects:
         return False
-    lst = projects[pid].get(kind)
+
+    is_loan = kind in ("loan_given", "loan_received")
+    counterparty_pid: str | None = None
+    if is_loan:
+        cp = str(entry.get("counterparty_project") or "").upper().strip()
+        if not cp or cp == pid or cp not in projects:
+            return False
+        counterparty_pid = cp
+        # Stamp a loan_id for mirror-pair tracking
+        if not entry.get("loan_id"):
+            import uuid
+            entry = {**entry, "loan_id": str(uuid.uuid4())}
+        entry = {**entry, "counterparty_project": cp}
+
+    list_name = _cf_list_name(kind)
+    lst = projects[pid].get(list_name)
     if not isinstance(lst, list):
         lst = []
     lst.append(entry)
-    projects[pid][kind] = lst
+    projects[pid][list_name] = lst
+
+    # Mirror entry on the counterparty side (opposite direction, same loan_id)
+    if is_loan and counterparty_pid:
+        mirror_kind = _mirror_loan_kind(kind)
+        mirror_list_name = _cf_list_name(mirror_kind)
+        mirror_entry = {**entry, "counterparty_project": pid}
+        mirror_list = projects[counterparty_pid].get(mirror_list_name)
+        if not isinstance(mirror_list, list):
+            mirror_list = []
+        mirror_list.append(mirror_entry)
+        projects[counterparty_pid][mirror_list_name] = mirror_list
+
     save_projects(projects)
     _invalidate_projects_cache()
     return True
 
 
 def delete_manual_cashflow_entry(project: str, kind: str, index: int) -> bool:
-    """Per-user delete: removes user_data.projects[PROJECT][kind][index]."""
+    """Per-user delete by (kind, index). For loans also removes the mirror entry
+    in the counterparty project (matched by shared loan_id).
+    """
     if kind not in _MANUAL_CF_KINDS:
         return False
     from .config import load_projects, save_projects, _invalidate_projects_cache
     projects = load_projects() or {}
     pid = project.upper()
-    lst = (projects.get(pid) or {}).get(kind)
+    list_name = _cf_list_name(kind)
+    lst = (projects.get(pid) or {}).get(list_name)
     if not isinstance(lst, list) or index < 0 or index >= len(lst):
         return False
-    lst.pop(index)
-    projects[pid][kind] = lst
+    removed = lst.pop(index)
+    projects[pid][list_name] = lst
+
+    # Cascade-delete the mirror if this was a loan entry
+    if kind in ("loan_given", "loan_received"):
+        loan_id = removed.get("loan_id")
+        counterparty_pid = str(removed.get("counterparty_project") or "").upper()
+        if loan_id and counterparty_pid and counterparty_pid in projects:
+            mirror_list_name = _cf_list_name(_mirror_loan_kind(kind))
+            mirror_list = projects[counterparty_pid].get(mirror_list_name)
+            if isinstance(mirror_list, list):
+                projects[counterparty_pid][mirror_list_name] = [
+                    e for e in mirror_list if e.get("loan_id") != loan_id
+                ]
+
     save_projects(projects)
     _invalidate_projects_cache()
     return True
 
 
 def list_manual_cashflow_entries(project: str) -> dict:
-    """Return {kind: [entry]} for a project (3 buckets)."""
+    """Return {kind: [entry]} for a project (5 buckets).
+
+    Output keys mirror the storage list names (loans_given/loans_received are
+    plural — matches `ManualCashflowEntriesOut` schema).
+    """
     from .config import load_projects
     pid = project.upper()
     p = (load_projects() or {}).get(pid) or {}
-    return {k: (p.get(k) if isinstance(p.get(k), list) else []) for k in _MANUAL_CF_KINDS}
+    out: dict = {}
+    for k in _MANUAL_CF_KINDS:
+        list_name = _cf_list_name(k)
+        out[list_name] = p.get(list_name) if isinstance(p.get(list_name), list) else []
+    return out
 
 
 # ── Manual Publicidade invoices (Mercado Ads 12-12 billing cycle) ─────────────
