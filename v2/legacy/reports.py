@@ -2231,53 +2231,108 @@ def _parse_publicidade_rows(rows: list, file_name: str) -> list[dict]:
     return out
 
 
-def parse_publicidade_reports() -> list[dict]:
-    """Парсит ВСЕ отчёты publicidade:
-    1) `_data/publicidade/*.csv` и `*.xlsx`
-    2) `_data/{месяц}/ads_publicidade.{csv,xlsx}` (куда кладёт UI uploader)
+def _rows_from_publicidade_bytes(filename: str, file_bytes: bytes) -> list | None:
+    """Decode uploaded publicidade file bytes → rows suitable for `_parse_publicidade_rows`.
+
+    Handles both CSV and XLSX based on filename extension. Mirrors the FS code's
+    format detection in `parse_publicidade_reports`.
     """
     import csv as _csv
+    import io
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    try:
+        if ext == "xlsx":
+            xl = pd.ExcelFile(io.BytesIO(file_bytes))
+            target_sheet = None
+            for sn in xl.sheet_names:
+                if "Anúncios" in sn or "Anuncios" in sn or "Relat" in sn:
+                    target_sheet = sn
+            if target_sheet is None:
+                target_sheet = xl.sheet_names[-1]
+            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet, header=None)
+            return df.where(pd.notna(df), None).values.tolist()
+        # default: csv
+        text: str | None = None
+        for enc in ("utf-8-sig", "utf-8", "latin-1"):
+            try:
+                text = file_bytes.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is None:
+            return None
+        return list(_csv.reader(io.StringIO(text), delimiter=";"))
+    except Exception:
+        return None
+
+
+def parse_publicidade_reports() -> list[dict]:
+    """Парсит ВСЕ отчёты publicidade:
+    - LS_STORAGE_MODE=db: файлы из `uploads WHERE source_key='ads_publicidade'` (per-user)
+    - LS_STORAGE_MODE=fs (fallback):
+        1) `_data/publicidade/*.csv` и `*.xlsx`
+        2) `_data/{месяц}/ads_publicidade.{csv,xlsx}` (куда кладёт UI uploader)
+    + ручные записи из `projects_db.json[manual_publicidade]`.
+    """
+    import csv as _csv
+    import os
     result: list[dict] = []
     seen: set = set()  # дедуп по имени файла
 
-    def _scan_dir(d):
-        if not d.exists():
-            return []
-        return sorted(list(d.glob("*.csv")) + list(d.glob("*.xlsx")))
+    storage_mode = os.environ.get("LS_STORAGE_MODE", "fs").strip().lower()
+    if storage_mode == "db":
+        from .db_storage import _current_user_id
+        uid = _current_user_id()
+        if uid is not None:
+            for filename, file_bytes in _load_files_from_db_sync(uid, "ads_publicidade"):
+                if filename in seen:
+                    continue
+                seen.add(filename)
+                rows = _rows_from_publicidade_bytes(filename, file_bytes)
+                if rows is None:
+                    continue
+                result.extend(_parse_publicidade_rows(rows, filename))
 
-    paths: list = []
-    paths.extend(_scan_dir(DATA_DIR / "publicidade"))
-    # _data/{месяц}/ads_publicidade.*
-    for month_dir in DATA_DIR.iterdir():
-        if not month_dir.is_dir():
-            continue
-        for p in month_dir.glob("ads_publicidade*"):
-            if p.suffix.lower() in (".csv", ".xlsx"):
-                paths.append(p)
+    if not result:
+        # FS fallback (запускается и при LS_STORAGE_MODE=fs, и если в БД у юзера пусто)
+        def _scan_dir(d):
+            if not d.exists():
+                return []
+            return sorted(list(d.glob("*.csv")) + list(d.glob("*.xlsx")))
 
-    for path in paths:
-        if path.name in seen:
-            continue
-        seen.add(path.name)
-        try:
-            if path.suffix.lower() == ".xlsx":
-                xl = pd.ExcelFile(path)
-                # Ищем sheet с данными "Relatório Anúncios patrocinados" или
-                # содержащий "Anúncios" в названии. Иначе берём последний.
-                target_sheet = None
-                for sn in xl.sheet_names:
-                    if "Anúncios" in sn or "Anuncios" in sn or "Relat" in sn:
-                        target_sheet = sn
-                if target_sheet is None:
-                    target_sheet = xl.sheet_names[-1]
-                df = pd.read_excel(path, sheet_name=target_sheet, header=None)
-                rows = df.where(pd.notna(df), None).values.tolist()
-            else:
-                with open(path, encoding="utf-8-sig") as f:
-                    rows = list(_csv.reader(f, delimiter=";"))
-        except Exception:
-            continue
-        result.extend(_parse_publicidade_rows(rows, path.name))
+        paths: list = []
+        paths.extend(_scan_dir(DATA_DIR / "publicidade"))
+        # _data/{месяц}/ads_publicidade.*
+        for month_dir in DATA_DIR.iterdir():
+            if not month_dir.is_dir():
+                continue
+            for p in month_dir.glob("ads_publicidade*"):
+                if p.suffix.lower() in (".csv", ".xlsx"):
+                    paths.append(p)
+
+        for path in paths:
+            if path.name in seen:
+                continue
+            seen.add(path.name)
+            try:
+                if path.suffix.lower() == ".xlsx":
+                    xl = pd.ExcelFile(path)
+                    # Ищем sheet с данными "Relatório Anúncios patrocinados" или
+                    # содержащий "Anúncios" в названии. Иначе берём последний.
+                    target_sheet = None
+                    for sn in xl.sheet_names:
+                        if "Anúncios" in sn or "Anuncios" in sn or "Relat" in sn:
+                            target_sheet = sn
+                    if target_sheet is None:
+                        target_sheet = xl.sheet_names[-1]
+                    df = pd.read_excel(path, sheet_name=target_sheet, header=None)
+                    rows = df.where(pd.notna(df), None).values.tolist()
+                else:
+                    with open(path, encoding="utf-8-sig") as f:
+                        rows = list(_csv.reader(f, delimiter=";"))
+            except Exception:
+                continue
+            result.extend(_parse_publicidade_rows(rows, path.name))
 
     # Ручные записи из projects_db.json[manual_publicidade]
     from datetime import datetime as _dt
@@ -2417,17 +2472,72 @@ def _parse_brl_money(s) -> float:
         return 0.0
 
 
+def _load_files_from_db_sync(user_id: int, source_key: str) -> list[tuple[str, bytes]]:
+    """Fetch ALL user-uploaded files for a given source_key from Postgres.
+
+    Used by LS_STORAGE_MODE=db branches of loaders that merge across multiple
+    uploads (armazenagem, publicidade). Returns newest-first so callers can
+    honour freshness ordering.
+    """
+    import os
+    import psycopg2
+    dsn = os.environ.get("DATABASE_URL") or os.environ.get("DATABASE_PUBLIC_URL")
+    if not dsn:
+        return []
+    try:
+        conn = psycopg2.connect(dsn)
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT filename, file_bytes FROM uploads
+               WHERE user_id=%s AND source_key=%s AND file_bytes IS NOT NULL
+               ORDER BY created_at DESC""",
+            (user_id, source_key),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+    except Exception:
+        return []
+    return [(fn, bytes(blob)) for fn, blob in rows]
+
+
 def _parse_armazenagem_file(path) -> dict | None:
     """Парсит один Custos_por_servico_armazenamento.csv.
     Возвращает {by_sku: {sku: {MLB, anuncio, values: {date: float}}}, daily_cols: list[str]}.
     """
     import csv as _csv
-    import re as _re
     try:
         with open(path, encoding="utf-8-sig") as f:
             rows = list(_csv.reader(f, delimiter=";"))
     except Exception:
         return None
+    return _parse_armazenagem_rows(rows)
+
+
+def _parse_armazenagem_bytes_daily(file_bytes: bytes) -> dict | None:
+    """Bytes-variant of `_parse_armazenagem_file` for DB-mode (LS_STORAGE_MODE=db).
+
+    Returns the same `{by_sku, daily_cols}` dict shape. Tries utf-8-sig / utf-8 /
+    latin-1 encodings to match the FS parser's `encoding="utf-8-sig"` default.
+    """
+    import csv as _csv
+    import io
+    text: str | None = None
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            text = file_bytes.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        return None
+    rows = list(_csv.reader(io.StringIO(text), delimiter=";"))
+    return _parse_armazenagem_rows(rows)
+
+
+def _parse_armazenagem_rows(rows: list) -> dict | None:
+    """Source-agnostic armazenagem parser — shared between FS (file path) and DB (bytes) variants."""
+    import re as _re
     if len(rows) < 5:
         return None
     hdr = rows[4]
@@ -2459,25 +2569,42 @@ def _parse_armazenagem_file(path) -> dict | None:
 
 
 def load_armazenagem_report() -> "pd.DataFrame | None":
-    """Загружает ВСЕ Custos_por_servico_armazenamento*.csv из _data/armazenagem/
-    и объединяет по SKU+дате (берётся максимум из всех файлов, чтобы свежий
-    перекрывал старый, нули не затирали данные).
+    """Загружает ВСЕ Custos_por_servico_armazenamento*.csv из БД (LS_STORAGE_MODE=db,
+    per-user) или из `_data/armazenagem/` (FS fallback). Файлы объединяются по
+    SKU+дате: берётся максимум (свежий перекрывает старый, нули не затирают).
     """
-    arm_dir = DATA_DIR / "armazenagem"
-    if not arm_dir.exists():
-        return None
-    files = sorted(arm_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime)
-    if not files:
+    import os
+
+    # (source_name, parsed_dict) — наполняется либо из БД, либо из ФС
+    file_parses: list[tuple[str, dict]] = []
+
+    storage_mode = os.environ.get("LS_STORAGE_MODE", "fs").strip().lower()
+    if storage_mode == "db":
+        from .db_storage import _current_user_id
+        uid = _current_user_id()
+        if uid is not None:
+            for filename, file_bytes in _load_files_from_db_sync(uid, "armazenagem_full"):
+                parsed = _parse_armazenagem_bytes_daily(file_bytes)
+                if parsed:
+                    file_parses.append((filename, parsed))
+
+    if not file_parses:
+        arm_dir = DATA_DIR / "armazenagem"
+        if arm_dir.exists():
+            files = sorted(arm_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime)
+            for path in files:
+                parsed = _parse_armazenagem_file(path)
+                if parsed:
+                    file_parses.append((path.name, parsed))
+
+    if not file_parses:
         return None
 
     merged: dict = {}     # sku → {SKU, MLB, anuncio, values: {date: max_value}}
     all_dates: set = set()
     sources: list[str] = []
-    for path in files:
-        parsed = _parse_armazenagem_file(path)
-        if not parsed:
-            continue
-        sources.append(path.name)
+    for source_name, parsed in file_parses:
+        sources.append(source_name)
         all_dates.update(parsed["daily_cols"])
         for sku, entry in parsed["by_sku"].items():
             if sku not in merged:
