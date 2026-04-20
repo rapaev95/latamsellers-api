@@ -134,6 +134,73 @@ def compute_lucro_presumido_effective(state: Optional[str]) -> dict[str, Any]:
     }
 
 
+def resolve_tax_settings(
+    project_meta: dict,
+    all_projects: Optional[dict] = None,
+) -> dict[str, Any]:
+    """Determine effective tax_regime + anexo with company-level inheritance.
+
+    Правило пользователя: проекты одной компании (same company_cnpj) делят
+    налоговый режим и Anexo. Исключение — проекты с type == 'services':
+    они всегда используют Anexo III независимо от наследования.
+
+    Алгоритм:
+    1. Если у проекта есть tax_regime — используется свой (override).
+    2. Иначе — ищем любой другой проект с тем же company_cnpj,
+       у которого tax_regime задан, и наследуем от него regime и anexo.
+    3. Для simples_nacional: если type == 'services' — форсим Anexo III.
+
+    Возвращает обогащённый meta-dict с ключами tax_regime, simples_anexo
+    и inherited_from (для отладки и UI-подсказок).
+    """
+    cnpj = (project_meta.get("company_cnpj") or "").strip()
+    own_regime = (project_meta.get("tax_regime") or "").strip().lower() or None
+    own_anexo = (project_meta.get("simples_anexo") or "").strip().upper() or None
+    ptype = (project_meta.get("type") or "").strip().lower()
+
+    regime = own_regime
+    anexo = own_anexo
+    source_regime = "own" if own_regime else None
+    source_anexo = "own" if own_anexo else None
+    inherited_pid: Optional[str] = None
+
+    # 1. Наследование от компании если своего режима нет
+    if not regime and cnpj and all_projects:
+        for pid, other in all_projects.items():
+            if not isinstance(other, dict):
+                continue
+            if (other.get("company_cnpj") or "").strip() != cnpj:
+                continue
+            other_regime = (other.get("tax_regime") or "").strip().lower() or None
+            if not other_regime:
+                continue
+            regime = other_regime
+            source_regime = "inherited"
+            inherited_pid = pid
+            if not anexo:
+                other_anexo = (other.get("simples_anexo") or "").strip().upper() or None
+                if other_anexo:
+                    anexo = other_anexo
+                    source_anexo = "inherited"
+            break
+
+    # 2. Services проекты → Anexo III (даже если компания на I)
+    if regime == "simples_nacional" and ptype == "services":
+        if anexo != "III":
+            anexo = "III"
+            source_anexo = "forced_services"
+
+    merged = dict(project_meta)
+    merged["tax_regime"] = regime
+    merged["simples_anexo"] = anexo
+    merged["_tax_inheritance"] = {
+        "source_regime": source_regime,
+        "source_anexo": source_anexo,
+        "inherited_from": inherited_pid,
+    }
+    return merged
+
+
 def compute_das(project_meta: dict, bruto_month: float, rbt12: float) -> dict[str, Any]:
     """Single DAS entry point.
 
@@ -172,6 +239,7 @@ def compute_das(project_meta: dict, bruto_month: float, rbt12: float) -> dict[st
             "display_pt": display_pt,
             "display_ru": display_ru,
             "exceed_limit": simples["exceed_limit"],
+            "inheritance": project_meta.get("_tax_inheritance"),
         }
 
     if regime == "lucro_presumido":
@@ -195,6 +263,7 @@ def compute_das(project_meta: dict, bruto_month: float, rbt12: float) -> dict[st
             "display_pt": display_pt,
             "display_ru": display_ru,
             "exceed_limit": False,
+            "inheritance": project_meta.get("_tax_inheritance"),
         }
 
     # Legacy fallback — behaviour identical to pre-feature code.
@@ -214,4 +283,5 @@ def compute_das(project_meta: dict, bruto_month: float, rbt12: float) -> dict[st
         "display_pt": "Legado Simples 4.5%",
         "display_ru": "Legacy Simples 4.5%",
         "exceed_limit": False,
+        "inheritance": project_meta.get("_tax_inheritance"),
     }

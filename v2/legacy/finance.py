@@ -275,8 +275,12 @@ def compute_pnl(project: str, period: tuple[date, date], basis: str = "accrual")
     except Exception:
         pass
 
-    from .tax_brazil import compute_das as _compute_das
-    das_info = _compute_das(proj_meta_for_tax, revenue_gross if revenue_gross > 0 else 0.0, rbt12)
+    from .tax_brazil import compute_das as _compute_das, resolve_tax_settings
+    from .config import load_projects as _load_projects
+    # Наследуем режим от других проектов той же компании (same company_cnpj).
+    # Services-проекты форсят Anexo III (см. resolve_tax_settings).
+    effective_meta = resolve_tax_settings(proj_meta_for_tax, _load_projects() or {})
+    das_info = _compute_das(effective_meta, revenue_gross if revenue_gross > 0 else 0.0, rbt12)
     das_val = das_info["das_brl"]
 
     # Publicidade — из отчётов publicidade (auto + manual) с фильтром по периоду

@@ -3668,7 +3668,11 @@ def build_monthly_pnl_matrix(project: str) -> dict:
     years = sorted({m[:4] for m in months})
 
     # Расходы по месяцам — publicidade, armazenagem, DAS (4.5%×bruto), aluguel (пропорц)
-    proj_meta = (load_projects() or {}).get(project, {}) or {}
+    _all_projects = load_projects() or {}
+    proj_meta_raw = _all_projects.get(project, {}) or {}
+    # Company-level inheritance для tax_regime/anexo (same company_cnpj).
+    from .tax_brazil import resolve_tax_settings as _resolve_tax
+    proj_meta = _resolve_tax(proj_meta_raw, _all_projects)
     approved_data = get_approved_data(project) or {}
 
     # Aluguel — приоритет источников (нормализуем в BRL/мес):
