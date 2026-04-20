@@ -490,6 +490,10 @@ class RentalPaymentsListOut(BaseModel):
     payments: list[RentalPaymentOut]
     total_paid_brl: float
     total_pending_brl: float
+    # Последняя оплата + период = дата до которой аренда закрыта фактически.
+    last_paid_date: Optional[str] = None    # ISO YYYY-MM-DD
+    paid_until: Optional[str] = None        # ISO YYYY-MM-DD (last_paid_date + period − 1 день)
+    launch_date: Optional[str] = None       # ISO YYYY-MM-DD — старт проекта, для UI
 
 
 # ── Publicidade invoices (manual Mercado Ads faturas, 12-12 billing cycle) ──

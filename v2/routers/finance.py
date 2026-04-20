@@ -1300,16 +1300,20 @@ def remove_publicidade(
 # ── Rental payments (cash-basis aluguel schedule per project) ────────────────
 
 def _rental_payments_response(project: str, auto_generate: bool = True) -> dict[str, Any]:
-    from v2.legacy.reports import list_rental_payments
+    from v2.legacy.reports import list_rental_payments, _step_date_by_months
     from v2.legacy.config import load_projects
+    from datetime import datetime as _dt, timedelta as _td
     payments = list_rental_payments(project, auto_generate=auto_generate) or []
-    rental = (load_projects() or {}).get(project.upper(), {}).get("rental") or {}
+    proj_meta = (load_projects() or {}).get(project.upper(), {}) or {}
+    rental = proj_meta.get("rental") or {}
     rate_usd = float(rental.get("rate_usd", 0) or 0)
     period = str(rental.get("period", "month"))
+    step_months = 3 if period.lower().startswith("quart") else 1
 
     out: list[dict[str, Any]] = []
     total_paid = 0.0
     total_pending = 0.0
+    last_paid_date = None
     for i, p in enumerate(payments):
         amt_usd = float(p.get("amount_usd", 0) or 0)
         rate = p.get("rate_brl")
@@ -1327,8 +1331,21 @@ def _rental_payments_response(project: str, auto_generate: bool = True) -> dict[
         })
         if status == "paid":
             total_paid += amt_brl
+            # Track latest paid date for paid_until calculation
+            try:
+                pd = _dt.strptime(str(p.get("date", "")), "%Y-%m-%d").date()
+                if last_paid_date is None or pd > last_paid_date:
+                    last_paid_date = pd
+            except (ValueError, TypeError):
+                pass
         else:
             total_pending += amt_brl
+
+    # paid_until = дата последней оплаты + шаг period − 1 день
+    paid_until_iso = None
+    if last_paid_date is not None:
+        next_period_start = _step_date_by_months(last_paid_date, step_months)
+        paid_until_iso = (next_period_start - _td(days=1)).isoformat()
 
     return {
         "project": project.upper(),
@@ -1337,6 +1354,9 @@ def _rental_payments_response(project: str, auto_generate: bool = True) -> dict[
         "payments": out,
         "total_paid_brl": total_paid,
         "total_pending_brl": total_pending,
+        "last_paid_date": last_paid_date.isoformat() if last_paid_date else None,
+        "paid_until": paid_until_iso,
+        "launch_date": proj_meta.get("launch_date") or None,
     }
 
 

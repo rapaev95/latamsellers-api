@@ -1965,33 +1965,65 @@ def list_manual_cashflow_entries(project: str) -> dict:
 
 # ── Rental payments (per-project cash-basis aluguel schedule) ───────────────
 
-_RENTAL_AUTO_COUNT = 6   # сколько будущих платежей автогенерируется при пустом payments
+_RENTAL_FUTURE_PERIODS = 6   # сколько будущих периодов автогенерируется сверх next_payment_date
 
 
-def _auto_generate_pending_payments(rental: dict) -> list:
-    """Генерирует N будущих pending-платежей от next_payment_date с шагом period.
+def _step_date_by_months(d, months: int):
+    """Shift a date by N calendar months, handling year rollover and day-out-of-range (Feb 30)."""
+    m_new = d.month + months
+    y_new = d.year + (m_new - 1) // 12
+    m_new = ((m_new - 1) % 12) + 1
+    try:
+        return d.replace(year=y_new, month=m_new)
+    except ValueError:
+        return d.replace(year=y_new, month=m_new, day=1)
 
-    Вызывается из list_rental_payments при пустом payments-массиве, чтобы
-    пользователь сразу видел план платежей и мог «подтвердить» каждый одним
-    кликом, когда реально придёт оплата. Сгенерированное сохраняется в БД →
-    повторной авто-генерации не будет.
+
+def _auto_generate_pending_payments(rental: dict, launch_date_iso: str | None = None) -> list:
+    """Генерирует полную сетку pending-платежей:
+    - стартует с launch_date проекта (чтобы видна вся история с запуска),
+    - fallback на next_payment_date, если launch_date не задан,
+    - идёт до next_payment_date + _RENTAL_FUTURE_PERIODS периодов вперёд.
+
+    Вызывается из list_rental_payments при пустом payments-массиве. Сохраняется
+    в БД — повторной авто-генерации не будет. Пользователь может отмечать
+    прошлые записи как paid, если реально оплачивал в те периоды.
     """
-    from datetime import datetime as _dt
+    from datetime import datetime as _dt, date as _date
     rate_usd = float(rental.get("rate_usd", 0) or 0)
     if rate_usd <= 0:
         return []
     period = str(rental.get("period", "month")).lower()
-    start_str = rental.get("next_payment_date")
-    if not start_str:
-        return []
-    try:
-        start = _dt.strptime(start_str, "%Y-%m-%d").date()
-    except (ValueError, TypeError):
-        return []
     step_months = 3 if period.startswith("quart") else 1
+
+    # Start: launch_date > next_payment_date (fallback)
+    start = None
+    if launch_date_iso:
+        try:
+            start = _dt.strptime(launch_date_iso, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            start = None
+    next_str = rental.get("next_payment_date")
+    next_anchor = None
+    if next_str:
+        try:
+            next_anchor = _dt.strptime(next_str, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            next_anchor = None
+    if start is None:
+        start = next_anchor
+    if start is None:
+        return []
+
+    # End anchor = next_payment_date (if set) else today, shifted N periods forward
+    end_anchor = next_anchor or _date.today()
+    for _ in range(_RENTAL_FUTURE_PERIODS):
+        end_anchor = _step_date_by_months(end_anchor, step_months)
+
+    max_count = 60  # safety cap on generated records
     generated: list = []
     cur = start
-    for _ in range(_RENTAL_AUTO_COUNT):
+    while cur <= end_anchor and len(generated) < max_count:
         generated.append({
             "date": cur.isoformat(),
             "amount_usd": rate_usd,
@@ -1999,14 +2031,7 @@ def _auto_generate_pending_payments(rental: dict) -> list:
             "status": "pending",
             "note": "Автогенерация",
         })
-        # advance by step_months, handling year rollover and day-out-of-range (Feb 30)
-        new_month = cur.month + step_months
-        new_year = cur.year + (new_month - 1) // 12
-        new_month = ((new_month - 1) % 12) + 1
-        try:
-            cur = cur.replace(year=new_year, month=new_month)
-        except ValueError:
-            cur = cur.replace(year=new_year, month=new_month, day=1)
+        cur = _step_date_by_months(cur, step_months)
     return generated
 
 
@@ -2024,8 +2049,9 @@ def list_rental_payments(project: str, auto_generate: bool = True) -> list[dict]
     if payments or not auto_generate:
         return payments if isinstance(payments, list) else []
 
-    # Пустой массив → автогенерация
-    generated = _auto_generate_pending_payments(rental)
+    # Пустой массив → автогенерация от launch_date (вся история с запуска проекта)
+    launch_date_iso = p.get("launch_date")
+    generated = _auto_generate_pending_payments(rental, launch_date_iso)
     if generated:
         # Персистим, чтобы больше не регенерировать (а платежи пользователь
         # может редактировать/удалять как обычные записи)
@@ -2753,8 +2779,17 @@ def get_publicidade_by_period(project: str, period_from, period_to) -> dict:
             "rows": frows,
         }
 
-    # Сортировка: более узкие первыми (короткий period перекрывает длинный)
-    sorted_files = sorted(file_meta.items(), key=lambda kv: kv[1]["total_days"])
+    # Сортировка: более узкие первыми (короткий period перекрывает длинный).
+    # Фильтруем ТОЛЬКО файлы, где есть row'ы текущего проекта — иначе файл-
+    # пустышка (скажем, CSV только по ORGANIZADOR) заклеймит дни и заблокирует
+    # файл, где у запрашиваемого проекта реально есть данные. Пример бага:
+    # ARTHUR за Jan 2026 → 0, потому что CSV с ORGANIZADOR-only строками
+    # (77 дней) перекрывал 90d_mensal (91 день) с ARTHUR-данными.
+    project_file_meta = {
+        fn: m for fn, m in file_meta.items()
+        if any(r["project"] == project for r in m["rows"])
+    }
+    sorted_files = sorted(project_file_meta.items(), key=lambda kv: kv[1]["total_days"])
 
     # day_to_file: для каждого дня в выбранном периоде → имя файла
     day_to_file: dict = {}
@@ -2782,7 +2817,7 @@ def get_publicidade_by_period(project: str, period_from, period_to) -> dict:
     total = 0.0
     by_sku: dict = {}
 
-    for fname, meta in file_meta.items():
+    for fname, meta in project_file_meta.items():
         days_used = file_days_used.get(fname, 0)
         if days_used == 0:
             files_skipped.append({
