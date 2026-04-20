@@ -49,6 +49,7 @@ def _parse_val(v: Any) -> float:
 CATEGORY_OPTIONS = [
     "internal_transfer", "income", "expense", "supplier", "fulfillment",
     "shipping", "ads", "tax", "accounting", "salary", "freelancer",
+    "certification",  # INMETRO / Anatel / product certification fees
     "rent", "utilities", "software", "bank_fee", "fx", "loan",
     "investment", "refund", "dividends", "personal", "uncategorized",
 ]
