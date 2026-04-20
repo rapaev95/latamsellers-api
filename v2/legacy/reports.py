@@ -10,6 +10,7 @@ from .config import (
     DATA_DIR, MONTHS, DATA_SOURCES, get_project_by_sku,
     ESTONIA_TAX_APPLIED, PROJETOS_DIR, load_projects, TRADE_DAS_RATE,
 )
+from .tax_brazil import compute_das
 
 
 def parse_brl(val) -> float:
@@ -3474,6 +3475,110 @@ def get_collection_mp_credited_by_period(
     }
 
 
+def get_monthly_bruto(project: str) -> dict[str, float]:
+    """Return {"YYYY-MM": bruto_BRL} для проекта за все месяцы с данными.
+
+    Источник — vendas_ml.xlsx, та же фильтрация что в build_monthly_pnl_matrix
+    (delivered + returned buckets, колонка "Receita por produtos (BRL)").
+    Используется для RBT12 (rolling 12-мес. сумма bruto для расчёта Faixa
+    в Simples Nacional).
+
+    Пустой dict если данных нет.
+    """
+    import re as _re
+    from datetime import date as _date
+
+    df = load_vendas_ml_report()
+    if df is None or df.empty:
+        return {}
+    sub = df[df["__project"] == project]
+    if sub.empty:
+        return {}
+
+    pt_months = {
+        "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3, "abril": 4,
+        "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
+        "outubro": 10, "novembro": 11, "dezembro": 12,
+    }
+
+    def _ymd(s):
+        m = _re.search(r"(\d+)\s+de\s+(\w+)\s+de\s+(\d{4})", str(s))
+        if not m:
+            return None
+        mn = pt_months.get(m.group(2).lower())
+        if not mn:
+            return None
+        try:
+            return _date(int(m.group(3)), mn, int(m.group(1)))
+        except (ValueError, TypeError):
+            return None
+
+    out: dict[str, float] = {}
+    for _, row in sub.iterrows():
+        if row.get("__bucket") not in ("delivered", "returned"):
+            continue
+        d = _ymd(row.get("Data da venda"))
+        if d is None:
+            continue
+        mk = f"{d.year:04d}-{d.month:02d}"
+        g = pd.to_numeric(row.get("Receita por produtos (BRL)"), errors="coerce")
+        out[mk] = out.get(mk, 0.0) + (0.0 if pd.isna(g) else float(g))
+    return out
+
+
+def rolling_rbt12(bruto_by_month: dict[str, float], target_mk: str) -> float:
+    """Сумма bruto за 12 месяцев ПЕРЕД target_mk (не включая сам target_mk).
+
+    Соответствует стандарту LC 123/2006: RBT12 = «Receita Bruta dos últimos 12
+    meses» — считается до начала текущего месяца.
+    """
+    if not target_mk or len(target_mk) < 7:
+        return 0.0
+    y, m = int(target_mk[:4]), int(target_mk[5:7])
+    total = 0.0
+    for i in range(1, 13):
+        y2, m2 = y, m - i
+        while m2 <= 0:
+            m2 += 12
+            y2 -= 1
+        key = f"{y2:04d}-{m2:02d}"
+        total += float(bruto_by_month.get(key, 0.0) or 0.0)
+    return total
+
+
+def _build_das_tax_info(proj_meta: dict, das_info_by_month: dict, months: list) -> dict | None:
+    """Свернуть per-month das_info в row-level tax_info для matrix.
+
+    Regime / anexo одинаковы для всех месяцев (зависят от настроек проекта),
+    а faixa/effective_pct/rbt12 меняются по мере роста истории — их кладём
+    в by_month map. UI рендерит общий бейдж и может показывать тултип с
+    прогрессией faixa.
+    """
+    if not das_info_by_month:
+        return None
+    sample = next(iter(das_info_by_month.values()))
+    by_month = {}
+    for m in months:
+        info = das_info_by_month.get(m)
+        if not info:
+            continue
+        by_month[m] = {
+            "faixa": info.get("faixa"),
+            "effective_pct": round(float(info.get("effective_pct") or 0.0), 4),
+            "rbt12": round(float(info.get("rbt12") or 0.0), 2),
+        }
+    return {
+        "regime": sample.get("regime"),
+        "anexo": sample.get("anexo"),
+        "icms_pct": sample.get("icms_pct"),
+        "state": sample.get("state"),
+        "display_pt": sample.get("display_pt"),
+        "display_ru": sample.get("display_ru"),
+        "exceed_limit": sample.get("exceed_limit", False),
+        "by_month": by_month,
+    }
+
+
 def build_monthly_pnl_matrix(project: str) -> dict:
     """Помесячный P&L по проекту из vendas_ml.xlsx + publicidade + armazenagem.
 
@@ -3605,6 +3710,7 @@ def build_monthly_pnl_matrix(project: str) -> dict:
     publi_by_month: dict = {}
     armaz_by_month: dict = {}
     das_by_month: dict = {}
+    das_info_by_month: dict = {}  # per-month {faixa, effective_pct, rbt12, ...}
     aluguel_by_month: dict = {}
     for mk in months:
         y, mo = int(mk[:4]), int(mk[5:7])
@@ -3618,8 +3724,13 @@ def build_monthly_pnl_matrix(project: str) -> dict:
             armaz_by_month[mk] = float(get_armazenagem_by_period(project, pf, pt_).get("total", 0.0))
         except Exception:
             armaz_by_month[mk] = 0.0
-        # DAS = 4.5% × bruto за месяц
-        das_by_month[mk] = round(rev_gross.get(mk, 0.0) * 0.045, 2)
+        # DAS — по выбранному tax_regime (Simples Nacional Anexo I/II/III
+        # или Lucro Presumido + ICMS). Если режим не задан — legacy 4.5%.
+        # RBT12 = сумма bruto за 12 мес. ПЕРЕД данным месяцем.
+        _rbt12 = rolling_rbt12(rev_gross, mk)
+        _das_info = compute_das(proj_meta, rev_gross.get(mk, 0.0), _rbt12)
+        das_by_month[mk] = _das_info["das_brl"]
+        das_info_by_month[mk] = _das_info
         # Aluguel — приоритет: project.aluguel_mensal + launch_date, иначе fallback.
         days_in_month = last_day
         if mensal > 0:
@@ -3692,7 +3803,10 @@ def build_monthly_pnl_matrix(project: str) -> dict:
         },
         _row("pnl_publicidade", "EXPENSES", publi_by_month, sign=-1, key="publicidade"),
         _row("pnl_armazenagem", "EXPENSES", armaz_by_month, sign=-1, key="armazenagem"),
-        _row("pnl_das", "EXPENSES", das_by_month, sign=-1, key="das"),
+        {
+            **_row("pnl_das", "EXPENSES", das_by_month, sign=-1, key="das"),
+            "tax_info": _build_das_tax_info(proj_meta, das_info_by_month, months),
+        },
         _row("pnl_aluguel", "EXPENSES", aluguel_by_month, sign=-1, key="aluguel"),
         {
             "key": "op_profit",

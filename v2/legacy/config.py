@@ -195,7 +195,11 @@ _PROJECT_EDITABLE_KEYS = frozenset({
     "company_name", "company_cnpj", "company_state",
     "manual_publicidade", "ff_manual",
     "storage_mode", "aluguel_mensal",
+    "tax_regime", "simples_anexo",  # Brazilian tax regime + Simples anexo
 })
+
+_VALID_TAX_REGIMES = frozenset({"", "simples_nacional", "lucro_presumido"})
+_VALID_SIMPLES_ANEXOS = frozenset({"", "I", "II", "III"})
 
 
 def update_project(
@@ -248,7 +252,24 @@ def update_project(
         if key == "mlb_fallback" and isinstance(val, str):
             p[key] = [s.strip() for s in val.replace("\n", ",").split(",") if s.strip()]
             continue
+        if key == "tax_regime":
+            s = str(val or "").strip().lower()
+            if s not in _VALID_TAX_REGIMES:
+                continue
+            p[key] = s or None
+            continue
+        if key == "simples_anexo":
+            s = str(val or "").strip().upper()
+            if s not in _VALID_SIMPLES_ANEXOS:
+                continue
+            p[key] = s or None
+            continue
         p[key] = val
+
+    # Invariant: simples_anexo имеет смысл только при simples_nacional.
+    if p.get("tax_regime") != "simples_nacional":
+        if p.get("simples_anexo") is not None:
+            p["simples_anexo"] = None
 
     if rental_fields:
         r = p.get("rental")

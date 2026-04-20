@@ -36,6 +36,9 @@ class PnLReportOut(BaseModel):
     net_profit: Optional[float] = None
     vendas_count: int = 0
     margin_pct: float = 0
+    # DAS/Simples/LP metadata for UI badge (regime, anexo, faixa, effective %).
+    # Shape: см. compute_das() в v2/legacy/tax_brazil.py.
+    tax_info: Optional[dict] = None
 
 
 # ── ДДС ─────────────────────────────────────────────────────────────────────
@@ -165,6 +168,9 @@ class PnlMatrixRow(BaseModel):
     is_pct: bool = False
     is_count: bool = False
     is_info: bool = False
+    # Дополнительная мета — используется только для строки DAS (regime, anexo,
+    # по-месячная faixa/effective/RBT12). None для остальных строк.
+    tax_info: Optional[dict] = None
 
 
 class PnlMatrixOut(BaseModel):

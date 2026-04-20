@@ -54,6 +54,10 @@ class PnLReport:
     net_profit: float | None        # operating_profit - cogs
     vendas_count: int = 0
     margin_pct: float = 0.0
+    # Расчётные данные по DAS (Simples Nacional / Lucro Presumido / legacy)
+    # — faixa, aliquot effective, ICMS. Используется UI для бейджа рядом
+    # со строкой DAS в operating_expenses.
+    tax_info: dict | None = None
 
 
 @dataclass
@@ -254,8 +258,26 @@ def compute_pnl(project: str, period: tuple[date, date], basis: str = "accrual")
         returned_loss = 0.0
 
     approved = get_approved_data(project) or {}
-    # DAS Simples Nacional 4,5% от bruto (delivered) — динамически за период
-    das_val = round(revenue_gross * 0.045, 2) if revenue_gross > 0 else 0.0
+
+    # DAS — считаем по выбранному налоговому режиму проекта (Simples Anexo
+    # I/II/III с настоящими faixas или Lucro Presumido + ICMS по штату). Для
+    # проектов без tax_regime сохраняем legacy 4.5% (backward compat).
+    # RBT12 = сумма bruto за 12 мес. перед текущим (LC 123/2006).
+    proj_meta_for_tax = get_project_meta(project) or {}
+    rbt12 = 0.0
+    try:
+        from .reports import get_monthly_bruto
+        bruto_by_month = get_monthly_bruto(project) or {}
+        cur_mk = f"{period_end.year:04d}-{period_end.month:02d}"
+        # 12 месяцев перед period_end (не включая текущий)
+        from .reports import rolling_rbt12
+        rbt12 = rolling_rbt12(bruto_by_month, cur_mk)
+    except Exception:
+        pass
+
+    from .tax_brazil import compute_das as _compute_das
+    das_info = _compute_das(proj_meta_for_tax, revenue_gross if revenue_gross > 0 else 0.0, rbt12)
+    das_val = das_info["das_brl"]
 
     # Publicidade — из отчётов publicidade (auto + manual) с фильтром по периоду
     pub_data = get_publicidade_by_period(project, period_start, period_end)
@@ -307,9 +329,18 @@ def compute_pnl(project: str, period: tuple[date, date], basis: str = "accrual")
 
     # NB: envios_dif и returned_loss НЕ добавляем в opex — они уже в taxas_ml
     # (то есть уже вычтены при revenue_net = bruto - taxas).
+    # DAS-строка теперь использует регим-aware label («DAS» / «DAS Simples Anexo
+    # I» / «DAS Lucro Presumido»). UI рендерит бейдж через tax_info.
+    das_label = "DAS (Simples 4,5% × bruto)"
+    _regime = das_info.get("regime")
+    if _regime == "simples_nacional":
+        das_label = f"DAS Simples Nacional (Anexo {das_info.get('anexo', 'I')})"
+    elif _regime == "lucro_presumido":
+        das_label = "DAS Lucro Presumido + ICMS"
+
     opex_items = [
         ("Publicidade (Mercado Ads)", publicidade_val),
-        ("DAS (Simples 4,5% × bruto)", das_val),
+        (das_label, das_val),
         ("Armazenagem Full", armazenagem_val),
         ("Aluguel empresa (proрационально)", aluguel_val),
     ]
@@ -338,6 +369,7 @@ def compute_pnl(project: str, period: tuple[date, date], basis: str = "accrual")
         net_profit=net_profit,
         vendas_count=vendas_count,
         margin_pct=margin,
+        tax_info=das_info,
     )
 
 
@@ -522,7 +554,10 @@ def compute_balance(project: str, as_of: date, basis: str = "accrual") -> Balanc
     out_full_express = float(approved.get("full_express", 0) or 0)
     out_das = float(approved.get("das", 0) or 0)
     if out_das == 0 and pnl.revenue_gross > 0:
-        out_das = round(pnl.revenue_gross * 0.045, 2)
+        # Используем DAS уже посчитанный в compute_pnl с учётом tax_regime.
+        # pnl.tax_info.das_brl всегда есть (включая legacy 4.5% fallback).
+        tinfo = pnl.tax_info if isinstance(pnl.tax_info, dict) else None
+        out_das = float((tinfo or {}).get("das_brl") or round(pnl.revenue_gross * 0.045, 2))
     out_armazenagem = float(approved.get("armazenagem", 0) or 0)
     out_aluguel = float(approved.get("aluguel", 0) or 0)
 
