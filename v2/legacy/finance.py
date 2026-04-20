@@ -589,7 +589,27 @@ def compute_cashflow(project: str, period: tuple[date, date]) -> CashFlowReport:
         })
 
     # ── Cash position ──
+    # Opening balance: берём из project.opening_balance (BRL) если задан.
+    # Смысл: касса на дату balance_date (например, сальдо на 01.09.2025 при
+    # переносе из старой учётной системы). Если balance_date позже period_end
+    # — не применяем (ещё не наступила точка отсчёта).
     opening = 0.0
+    try:
+        ob = proj_meta.get("opening_balance")
+        if ob is not None:
+            ob_f = float(ob)
+            bd_str = (proj_meta.get("balance_date") or "").strip()[:10]
+            bd = None
+            if bd_str:
+                try:
+                    bd = _dt.strptime(bd_str, "%Y-%m-%d").date()
+                except (ValueError, TypeError):
+                    bd = None
+            if bd is None or bd <= period_end:
+                opening = ob_f
+    except (TypeError, ValueError):
+        pass
+
     closing = (opening + op_profit + usdt_total_brl + partner_total
                - supplier_total - other_expenses_total)
 
