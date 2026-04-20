@@ -1855,6 +1855,65 @@ def add_manual_cashflow_entry(project: str, kind: str, entry: dict) -> bool:
     return True
 
 
+def update_manual_cashflow_entry(project: str, kind: str, index: int, entry: dict) -> bool:
+    """Replace the entry at (project, kind, index) with new data.
+
+    For loans: preserves loan_id, removes old mirror, and re-creates a fresh
+    mirror in the (possibly new) counterparty project. Caller should send the
+    full new entry — missing fields aren't merged with the old.
+    """
+    if kind not in _MANUAL_CF_KINDS:
+        return False
+    from .config import load_projects, save_projects, _invalidate_projects_cache
+    projects = load_projects() or {}
+    pid = project.upper()
+    list_name = _cf_list_name(kind)
+    lst = (projects.get(pid) or {}).get(list_name)
+    if not isinstance(lst, list) or index < 0 or index >= len(lst):
+        return False
+
+    old_entry = lst[index]
+    is_loan = kind in ("loan_given", "loan_received")
+
+    if is_loan:
+        # Preserve loan_id for stable mirror-pair tracking across edits
+        preserved_loan_id = old_entry.get("loan_id")
+        if preserved_loan_id and not entry.get("loan_id"):
+            entry = {**entry, "loan_id": preserved_loan_id}
+        cp_new = str(entry.get("counterparty_project") or "").upper().strip()
+        if not cp_new or cp_new == pid or cp_new not in projects:
+            return False
+        entry = {**entry, "counterparty_project": cp_new}
+        # Remove old mirror (might be in a different counterparty)
+        cp_old = str(old_entry.get("counterparty_project") or "").upper()
+        if cp_old and cp_old in projects and preserved_loan_id:
+            mirror_list_name = _cf_list_name(_mirror_loan_kind(kind))
+            old_mirror = projects[cp_old].get(mirror_list_name, [])
+            if isinstance(old_mirror, list):
+                projects[cp_old][mirror_list_name] = [
+                    e for e in old_mirror if e.get("loan_id") != preserved_loan_id
+                ]
+
+    # Replace in current project
+    lst[index] = entry
+    projects[pid][list_name] = lst
+
+    # Re-create mirror for loan (in new counterparty)
+    if is_loan:
+        cp_new = entry["counterparty_project"]
+        mirror_list_name = _cf_list_name(_mirror_loan_kind(kind))
+        mirror_entry = {**entry, "counterparty_project": pid}
+        mirror_list = projects[cp_new].get(mirror_list_name)
+        if not isinstance(mirror_list, list):
+            mirror_list = []
+        mirror_list.append(mirror_entry)
+        projects[cp_new][mirror_list_name] = mirror_list
+
+    save_projects(projects)
+    _invalidate_projects_cache()
+    return True
+
+
 def delete_manual_cashflow_entry(project: str, kind: str, index: int) -> bool:
     """Per-user delete by (kind, index). For loans also removes the mirror entry
     in the counterparty project (matched by shared loan_id).

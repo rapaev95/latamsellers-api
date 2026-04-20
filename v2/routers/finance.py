@@ -1158,6 +1158,58 @@ def remove_cashflow_entry(
     return {"project": project.upper(), **buckets}
 
 
+@router.patch("/cashflow-entries", response_model=ManualCashflowEntriesOut)
+def update_cashflow_entry(
+    entry: ManualCashflowEntryIn,
+    project: str = Query(...),
+    index: int = Query(..., ge=0, description="Array index within the kind's bucket"),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Replace one manual entry at (project, kind, index).
+
+    For loan_given/loan_received rewrites the mirror in the counterparty project
+    (loan_id preserved — stable across edits, even when counterparty changes).
+    Client must send the full entry body — no partial merges.
+    """
+    _bind_user(user)
+    from v2.legacy.reports import update_manual_cashflow_entry, list_manual_cashflow_entries
+    from v2.legacy.config import _invalidate_projects_cache
+
+    if entry.kind not in _MANUAL_CF_KINDS:
+        raise HTTPException(status_code=400, detail={"error": "bad_kind", "allowed": list(_MANUAL_CF_KINDS)})
+
+    payload: dict[str, Any] = {"date": entry.date, "valor": float(entry.valor), "note": entry.note or ""}
+    if entry.kind == "partner_contributions" and entry.from_ is not None:
+        payload["from"] = entry.from_
+    if entry.kind == "manual_expenses" and entry.category is not None:
+        payload["category"] = entry.category or "expense"
+    if entry.kind == "manual_supplier" and entry.source is not None:
+        payload["source"] = entry.source
+
+    cur = (entry.currency or "BRL").upper()
+    if cur != "BRL":
+        payload["currency"] = cur
+        if entry.rate_brl is None or entry.rate_brl <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "rate_required", "message": "rate_brl required when currency != BRL"},
+            )
+        payload["rate_brl"] = float(entry.rate_brl)
+
+    if entry.kind in ("loan_given", "loan_received"):
+        if not entry.counterparty_project:
+            raise HTTPException(status_code=400, detail={"error": "counterparty_required"})
+        payload["counterparty_project"] = entry.counterparty_project.upper()
+
+    ok = update_manual_cashflow_entry(project, entry.kind, index, payload)
+    if not ok:
+        raise HTTPException(status_code=404, detail={"error": "entry_or_counterparty_not_found"})
+    _invalidate_projects_cache()
+
+    buckets = list_manual_cashflow_entries(project)
+    return {"project": project.upper(), **buckets}
+
+
 # ── Publicidade invoices (Mercado Ads 12-12 billing cycle) ───────────────────
 
 def _publicidade_list_response(project: str) -> dict[str, Any]:
