@@ -3565,8 +3565,22 @@ def build_monthly_pnl_matrix(project: str) -> dict:
     # Расходы по месяцам — publicidade, armazenagem, DAS (4.5%×bruto), aluguel (пропорц)
     proj_meta = (load_projects() or {}).get(project, {}) or {}
     approved_data = get_approved_data(project) or {}
+
+    # Aluguel — новая схема: project.aluguel_mensal + launch_date, с частичным
+    # первым месяцем пропорционально дням. Старый fallback (baseline_overrides
+    # aluguel / baseline_days) активен если aluguel_mensal не задан.
+    mensal = float(proj_meta.get("aluguel_mensal", 0) or 0)
+    launch_date_obj = None
+    launch_str = (proj_meta.get("launch_date") or "").strip()[:10]
+    if launch_str:
+        try:
+            from datetime import datetime as _dt
+            launch_date_obj = _dt.strptime(launch_str, "%Y-%m-%d").date()
+        except Exception:
+            launch_date_obj = None
+
     aluguel_full = float(approved_data.get("aluguel", 0) or 0)
-    # baseline period длительность для пропорции aluguel
+    # baseline period длительность для пропорции aluguel (legacy fallback)
     bp_str = proj_meta.get("report_period", "")
     baseline_days = 206  # fallback ARTUR
     if bp_str and "/" in bp_str:
@@ -3597,9 +3611,20 @@ def build_monthly_pnl_matrix(project: str) -> dict:
             armaz_by_month[mk] = 0.0
         # DAS = 4.5% × bruto за месяц
         das_by_month[mk] = round(rev_gross.get(mk, 0.0) * 0.045, 2)
-        # Aluguel пропорционально дням месяца относительно baseline_days
+        # Aluguel — приоритет: project.aluguel_mensal + launch_date, иначе fallback.
         days_in_month = last_day
-        aluguel_by_month[mk] = round(aluguel_full * days_in_month / baseline_days, 2) if aluguel_full > 0 else 0.0
+        if mensal > 0:
+            if launch_date_obj and launch_date_obj > pt_:
+                # Проект ещё не запущен в этом месяце — аренды нет.
+                aluguel_by_month[mk] = 0.0
+            elif launch_date_obj and launch_date_obj > pf:
+                # Частичный первый месяц — пропорционально дням после запуска.
+                accrued_days = (pt_ - launch_date_obj).days + 1
+                aluguel_by_month[mk] = round(mensal * accrued_days / days_in_month, 2)
+            else:
+                aluguel_by_month[mk] = mensal
+        else:
+            aluguel_by_month[mk] = round(aluguel_full * days_in_month / baseline_days, 2) if aluguel_full > 0 else 0.0
 
     def _row(label: str, section: str, by_month: dict, sign: int = 1, key: str = "") -> dict:
         values = {m: sign * float(by_month.get(m, 0.0)) for m in months}
