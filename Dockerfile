@@ -21,4 +21,7 @@ COPY migrations/ ./migrations/
 ENV PORT=8000
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Dual-stack bind: Railway healthcheck hits IPv4, private DNS (*.railway.internal)
+# resolves to AAAA only — need both. gunicorn supports multiple --bind; a single
+# uvicorn --host :: is unreliable (kernel-level IPV6_V6ONLY varies per container).
+CMD ["sh", "-c", "gunicorn main:app -k uvicorn.workers.UvicornWorker -w 1 --bind 0.0.0.0:${PORT:-8000} --bind [::]:${PORT:-8000}"]
