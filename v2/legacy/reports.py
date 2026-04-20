@@ -2508,9 +2508,27 @@ def parse_publicidade_reports() -> list[dict]:
 def get_publicidade_by_period(project: str, period_from, period_to) -> dict:
     """Сумма Investimento всех файлов чей период [Desde, Até] полностью внутри
     [period_from, period_to], для проекта.
+
+    Учитывает `launch_date` проекта: дни фактуры, попадающие ДО даты запуска
+    проекта, не считаются операционными → обрезаются из total_days. Иначе
+    фактура ML за период 12.08–11.09, когда проект стартанул 01.09, даст
+    ratio 11/31 и клиент увидит только треть суммы — хотя в те 20 дней
+    августа проекта ещё не было (см. баг-репорт selle'ра 2026-04-20).
     """
     from datetime import timedelta as _td
+    from datetime import datetime as _dt
     rows = parse_publicidade_reports()
+
+    # launch_date проекта — обрезает начало фактур (см. docstring)
+    from .config import load_projects as _lp
+    _proj_meta = (_lp() or {}).get(project.upper(), {}) or {}
+    _launch_str = _proj_meta.get("launch_date")
+    launch_date = None
+    if _launch_str:
+        try:
+            launch_date = _dt.strptime(_launch_str, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            launch_date = None
 
     # Группируем по файлу
     by_file: dict = {}
@@ -2521,8 +2539,12 @@ def get_publicidade_by_period(project: str, period_from, period_to) -> dict:
     for fname, frows in by_file.items():
         f_desde = min(r["desde"] for r in frows)
         f_ate = max(r["ate"] for r in frows)
+        # Обрезаем начало по launch_date проекта — дни до запуска не операционные
+        if launch_date and f_desde < launch_date:
+            f_desde = launch_date
         total_days = (f_ate - f_desde).days + 1
         if total_days <= 0:
+            # Вся фактура до launch_date — вклада в проект нет
             continue
         file_meta[fname] = {
             "desde": f_desde,
