@@ -3566,10 +3566,19 @@ def build_monthly_pnl_matrix(project: str) -> dict:
     proj_meta = (load_projects() or {}).get(project, {}) or {}
     approved_data = get_approved_data(project) or {}
 
-    # Aluguel — новая схема: project.aluguel_mensal + launch_date, с частичным
-    # первым месяцем пропорционально дням. Старый fallback (baseline_overrides
-    # aluguel / baseline_days) активен если aluguel_mensal не задан.
+    # Aluguel — приоритет источников (нормализуем в BRL/мес):
+    #   1) project.aluguel_mensal (BRL/мес)
+    #   2) project.rental.rate_usd × period (quarter|month) × 5.46 USD→BRL
+    #   3) fallback baseline_overrides.aluguel / baseline_days (legacy)
     mensal = float(proj_meta.get("aluguel_mensal", 0) or 0)
+    if mensal <= 0:
+        rental = proj_meta.get("rental") or {}
+        if isinstance(rental, dict):
+            rate_usd = float(rental.get("rate_usd", 0) or 0)
+            if rate_usd > 0:
+                period_kind = (rental.get("period") or "month").lower()
+                mensal_usd = rate_usd / 3.0 if period_kind.startswith("quart") else rate_usd
+                mensal = mensal_usd * 5.46
     launch_date_obj = None
     launch_str = (proj_meta.get("launch_date") or "").strip()[:10]
     if launch_str:

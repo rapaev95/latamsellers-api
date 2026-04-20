@@ -265,15 +265,26 @@ def compute_pnl(project: str, period: tuple[date, date], basis: str = "accrual")
     arm_data = get_armazenagem_by_period(project, period_start, period_end)
     armazenagem_val = float(arm_data.get("total", 0) or 0)
 
-    # Aluguel — два источника по приоритету:
-    # 1) project.aluguel_mensal (форма проекта) — предпочитаем её, начисляем
-    #    от max(launch_date, period_start) до period_end, приближённо через
-    #    30.4375 дней в месяце (= 365.25/12).
-    # 2) Fallback на baseline_overrides.aluguel (устаревшая схема ARTUR 206 дней).
+    # Aluguel — приоритет источников (все нормализуем в BRL/месяц):
+    #   1) project.aluguel_mensal (форма, BRL/мес) — прямое значение.
+    #   2) project.rental.rate_usd + period(quarter|month) — USD, конвертим
+    #      в BRL через USD_BRL_RATE = 5.46 (тот же курс что в compute_balance).
+    #   3) Fallback на baseline_overrides.aluguel (ARTUR legacy 206 дней).
+    # Начисление: от max(launch_date, period_start) до period_end
+    # пропорционально дням (30.4375/мес = 365.25/12).
     proj_meta_for_rent = get_project_meta(project) or {}
-    mensal = float(proj_meta_for_rent.get("aluguel_mensal", 0) or 0)
+    mensal_brl = float(proj_meta_for_rent.get("aluguel_mensal", 0) or 0)
+    if mensal_brl <= 0:
+        rental = proj_meta_for_rent.get("rental") or {}
+        if isinstance(rental, dict):
+            rate_usd = float(rental.get("rate_usd", 0) or 0)
+            if rate_usd > 0:
+                period_kind = (rental.get("period") or "month").lower()
+                mensal_usd = rate_usd / 3.0 if period_kind.startswith("quart") else rate_usd
+                mensal_brl = mensal_usd * 5.46  # USD→BRL (согласован с compute_balance)
+
     aluguel_val = 0.0
-    if mensal > 0:
+    if mensal_brl > 0:
         accrual_start = period_start
         launch_str = (proj_meta_for_rent.get("launch_date") or "").strip()[:10]
         if launch_str:
@@ -286,7 +297,7 @@ def compute_pnl(project: str, period: tuple[date, date], basis: str = "accrual")
                 pass
         if accrual_start <= period_end:
             days = (period_end - accrual_start).days + 1
-            aluguel_val = round(mensal * days / 30.4375, 2)
+            aluguel_val = round(mensal_brl * days / 30.4375, 2)
     else:
         aluguel_full = float(approved.get("aluguel", 0) or 0)
         if aluguel_full > 0:
