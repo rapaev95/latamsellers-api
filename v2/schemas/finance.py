@@ -512,3 +512,4 @@ class PublicidadeInvoiceOut(BaseModel):
 class PublicidadeInvoicesListOut(BaseModel):
     project: str
     invoices: list[PublicidadeInvoiceOut]
+    launch_date: Optional[str] = None   # ISO YYYY-MM-DD — фронт обрезает period для отображения

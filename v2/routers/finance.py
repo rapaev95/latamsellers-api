@@ -1221,9 +1221,13 @@ def update_cashflow_entry(
 
 def _publicidade_list_response(project: str) -> dict[str, Any]:
     from v2.legacy.reports import list_publicidade_invoices
+    from v2.legacy.config import load_projects
     items = list_publicidade_invoices(project)
+    proj_meta = (load_projects() or {}).get(project.upper(), {}) or {}
+    launch_date = proj_meta.get("launch_date") or None
     return {
         "project": project.upper(),
+        "launch_date": launch_date,
         "invoices": [
             {
                 "index": i,
