@@ -21,7 +21,8 @@ COPY migrations/ ./migrations/
 ENV PORT=8000
 EXPOSE 8000
 
-# Dual-stack bind: Railway healthcheck hits IPv4, private DNS (*.railway.internal)
-# resolves to AAAA only — need both. gunicorn supports multiple --bind; a single
-# uvicorn --host :: is unreliable (kernel-level IPV6_V6ONLY varies per container).
-CMD ["sh", "-c", "gunicorn main:app -k uvicorn.workers.UvicornWorker -w 1 --bind 0.0.0.0:${PORT:-8000} --bind [::]:${PORT:-8000}"]
+# Single IPv6 bind with kernel IPv4-mapping (container has net.ipv6.bindv6only=0).
+# *.railway.internal resolves to AAAA only and Railway's healthcheck arrives as
+# IPv4 → both are served by the same [::] socket. uvicorn --host :: was
+# unreliable because uvicorn forces IPV6_V6ONLY=1; gunicorn does not.
+CMD ["sh", "-c", "gunicorn main:app -k uvicorn.workers.UvicornWorker -w 1 --bind [::]:${PORT:-8000}"]
