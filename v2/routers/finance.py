@@ -148,11 +148,25 @@ def get_reports(
     except Exception:
         pass  # individual computes will re-raise properly
 
-    # Three computes run in parallel under a single shared timeout
+    # P&L фильтруется выбранным периодом — показывает доходы/расходы отрезка.
+    # ДДС и Баланс — всегда кумулятивно на сегодня: от даты запуска проекта
+    # (launch_date / report_period start) или от минимальной найденной даты
+    # продаж до today(). Иначе пользователь при узком периоде видит
+    # отрицательный «закрывающий остаток», что не имеет экономического смысла.
+    today = date.today()
+    proj_meta = projects.get(project, {}) or {}
+    cumul_start = _parse_iso((proj_meta.get("launch_date") or "").strip()[:10]) or pf
+    rp = proj_meta.get("report_period", "")
+    if rp and "/" in rp:
+        rp_start = _parse_iso(rp.split("/")[0].strip())
+        if rp_start and rp_start < (cumul_start or today):
+            cumul_start = rp_start
+    cumul_start = cumul_start or pf
+
     results = _run_parallel_with_timeout({
         "pnl": lambda: compute_pnl(project, (pf, pt), basis=basis),
-        "cashflow": lambda: compute_cashflow(project, (pf, pt)),
-        "balance": lambda: compute_balance(project, pt, basis=basis),
+        "cashflow": lambda: compute_cashflow(project, (cumul_start, today)),
+        "balance": lambda: compute_balance(project, today, basis=basis),
     })
 
     pnl_res, pnl_err = results["pnl"]
