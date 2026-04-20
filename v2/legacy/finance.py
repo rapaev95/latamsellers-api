@@ -297,11 +297,11 @@ def compute_pnl(project: str, period: tuple[date, date], basis: str = "accrual")
     proj_meta_for_tax = get_project_meta(project) or {}
     rbt12 = 0.0
     try:
-        from .reports import get_monthly_bruto
-        bruto_by_month = get_monthly_bruto(project) or {}
+        # RBT12 по CNPJ: суммируем bruto всех проектов одной компании
+        from .reports import get_company_monthly_bruto, rolling_rbt12
+        from .config import load_projects as _lp
+        bruto_by_month = get_company_monthly_bruto(project, _lp() or {}) or {}
         cur_mk = f"{period_end.year:04d}-{period_end.month:02d}"
-        # 12 месяцев перед period_end (не включая текущий)
-        from .reports import rolling_rbt12
         rbt12 = rolling_rbt12(bruto_by_month, cur_mk)
     except Exception:
         pass

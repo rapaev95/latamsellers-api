@@ -3624,6 +3624,35 @@ def get_monthly_bruto(project: str) -> dict[str, float]:
     return out
 
 
+def get_company_monthly_bruto(project: str, all_projects: dict | None = None) -> dict[str, float]:
+    """Сумма monthly bruto по ВСЕМ проектам с тем же company_cnpj.
+
+    RBT12 в Simples Nacional считается по CNPJ — одна компания с 3 проектами
+    делит общий оборот при определении faixa. Если cnpj не задан или среди
+    остальных нет сиблингов — возвращаем bruto только этого проекта.
+    """
+    if all_projects is None:
+        all_projects = load_projects() or {}
+
+    this_meta = all_projects.get(project, {}) or {}
+    cnpj = (this_meta.get("company_cnpj") or "").strip()
+    if not cnpj:
+        return get_monthly_bruto(project)
+
+    sibling_ids = [
+        pid for pid, p in all_projects.items()
+        if isinstance(p, dict) and (p.get("company_cnpj") or "").strip() == cnpj
+    ]
+    if len(sibling_ids) <= 1:
+        return get_monthly_bruto(project)
+
+    combined: dict[str, float] = {}
+    for pid in sibling_ids:
+        for mk, v in (get_monthly_bruto(pid) or {}).items():
+            combined[mk] = combined.get(mk, 0.0) + float(v or 0)
+    return combined
+
+
 def rolling_rbt12(bruto_by_month: dict[str, float], target_mk: str) -> float:
     """Сумма bruto за 12 месяцев ПЕРЕД target_mk (не включая сам target_mk).
 
@@ -3814,6 +3843,8 @@ def build_monthly_pnl_matrix(project: str) -> dict:
     das_by_month: dict = {}
     das_info_by_month: dict = {}  # per-month {faixa, effective_pct, rbt12, ...}
     aluguel_by_month: dict = {}
+    # Company-wide bruto для RBT12 (суммируем все сиблинги same company_cnpj)
+    _company_bruto_by_month = get_company_monthly_bruto(project, _all_projects)
     for mk in months:
         y, mo = int(mk[:4]), int(mk[5:7])
         last_day = calendar.monthrange(y, mo)[1]
@@ -3826,10 +3857,10 @@ def build_monthly_pnl_matrix(project: str) -> dict:
             armaz_by_month[mk] = float(get_armazenagem_by_period(project, pf, pt_).get("total", 0.0))
         except Exception:
             armaz_by_month[mk] = 0.0
-        # DAS — по выбранному tax_regime (Simples Nacional Anexo I/II/III
-        # или Lucro Presumido + ICMS). Если режим не задан — legacy 4.5%.
-        # RBT12 = сумма bruto за 12 мес. ПЕРЕД данным месяцем.
-        _rbt12 = rolling_rbt12(rev_gross, mk)
+        # DAS — по выбранному tax_regime. RBT12 считаем ПО КОМПАНИИ (сумма
+        # bruto всех проектов с тем же company_cnpj) — именно так работает
+        # Simples Nacional: одна компания → общий faixa.
+        _rbt12 = rolling_rbt12(_company_bruto_by_month, mk)
         _das_info = compute_das(proj_meta, rev_gross.get(mk, 0.0), _rbt12)
         das_by_month[mk] = _das_info["das_brl"]
         das_info_by_month[mk] = _das_info
