@@ -291,7 +291,25 @@ async def exchange_authorization_code(
         ml_user_id=payload.get("user_id"),
         scope=payload.get("scope"),
     )
+
+    # Kick off a 30-day backfill in the background so the UI shows history
+    # immediately after OAuth-connect. Fire-and-forget; failures are logged
+    # but don't block the OAuth response.
+    try:
+        from . import ml_backfill as _ml_backfill  # local import to avoid circular
+        asyncio.create_task(_backfill_after_oauth(pool, user_id, _ml_backfill))
+    except Exception as err:  # noqa: BLE001
+        log.warning("backfill kickoff failed for user_id=%s: %s", user_id, err)
+
     return payload
+
+
+async def _backfill_after_oauth(pool: asyncpg.Pool, user_id: int, backfill_module) -> None:
+    try:
+        async with httpx.AsyncClient() as http:
+            await backfill_module.backfill_user(pool, http, user_id, days=30)
+    except Exception as err:  # noqa: BLE001
+        log.warning("post-OAuth backfill failed for user_id=%s: %s", user_id, err)
 
 
 async def refresh_user_token(

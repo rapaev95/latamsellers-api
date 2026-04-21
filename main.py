@@ -51,6 +51,8 @@ app.add_middleware(
 # Mount v2 router (Finance 2.0)
 from v2.app import router as v2_router  # noqa: E402
 from v2.db import close_pool, create_pool, get_pool  # noqa: E402
+from v2.services import ml_backfill as ml_backfill_svc  # noqa: E402
+from v2.services import ml_notices as ml_notices_svc  # noqa: E402
 from v2.services import ml_oauth as ml_oauth_svc  # noqa: E402
 from v2.services import ml_scraper  # noqa: E402
 from v2.storage import positions_storage  # noqa: E402
@@ -76,6 +78,41 @@ async def _refresh_ml_tokens_job() -> None:
     )
 
 
+async def _sync_ml_notices_job() -> None:
+    """Pull /communications/notices for every user with a live ML token,
+    upsert into Railway Postgres ml_notices, dispatch new ones to Telegram."""
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("ML notices tick skipped: no DB pool")
+            return
+        result = await ml_notices_svc.sync_all_users_notices(pool)
+        _ml_log.info(
+            "ML notices tick: users=%s fetched=%s saved=%s tg_sent=%s",
+            result.get("users"), result.get("fetched"),
+            result.get("saved"), result.get("sent"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("ML notices job failed: %s", err)
+
+
+async def _backfill_all_users_job() -> None:
+    """Daily catch-up: pull last 24h from orders/questions/claims/items/messages
+    for every ML-connected user. Closes gaps if webhook delivery failed."""
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("ML backfill tick skipped: no DB pool")
+            return
+        result = await ml_backfill_svc.backfill_all_users(pool, days=1)
+        _ml_log.info(
+            "ML backfill tick: users=%s fetched=%s saved=%s",
+            result.get("users"), result.get("fetched"), result.get("saved"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("ML backfill job failed: %s", err)
+
+
 @app.on_event("startup")
 async def _v2_startup() -> None:
     global _ml_scheduler
@@ -91,6 +128,10 @@ async def _v2_startup() -> None:
             await positions_storage.ensure_schema(pool)
         except Exception as err:  # noqa: BLE001
             _ml_log.exception("Positions schema bootstrap failed: %s", err)
+        try:
+            await ml_notices_svc.ensure_schema(pool)
+        except Exception as err:  # noqa: BLE001
+            _ml_log.exception("ML notices schema bootstrap failed: %s", err)
 
     # Spin up the headless Chromium used by /escalar/positions scraper.
     # Failure here is logged but non-fatal — the scraper self-heals on first use.
@@ -108,11 +149,40 @@ async def _v2_startup() -> None:
         id="ml_token_refresh",
         replace_existing=True,
     )
+    # /communications/notices sync (Phase 1 — ML anouncements: billing, policies).
+    # Usually empty for most sellers. Runs slowly as it's a secondary source.
+    _notices_interval = int(os.environ.get("NOTICES_SYNC_INTERVAL_MIN", "1440"))
+    _ml_scheduler.add_job(
+        _sync_ml_notices_job,
+        "interval",
+        minutes=_notices_interval,
+        id="ml_notices_sync",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Daily backfill from orders/questions/claims/items/messages (Phase 2 — catch-up
+    # for webhook gaps). Webhook is the primary real-time source; this is the safety net.
+    _backfill_interval_hours = float(os.environ.get("BACKFILL_INTERVAL_HOURS", "24"))
+    _ml_scheduler.add_job(
+        _backfill_all_users_job,
+        "interval",
+        hours=_backfill_interval_hours,
+        id="ml_backfill_daily",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
     _ml_scheduler.start()
-    _ml_log.info("ML token refresh scheduler started (every 5h)")
+    _ml_log.info(
+        "ML schedulers started: token_refresh=5h, notices_sync=%dm, backfill=%.2fh",
+        _notices_interval, _backfill_interval_hours,
+    )
 
     # Kick once on boot so tokens that expired during downtime get refreshed immediately.
     _asyncio.create_task(_refresh_ml_tokens_job())
+    # Also kick notices sync — catches anything missed while API was down.
+    _asyncio.create_task(_sync_ml_notices_job())
 
 
 @app.on_event("shutdown")

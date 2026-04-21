@@ -8,9 +8,11 @@ from fastapi import APIRouter, Depends, Query
 from v2.deps import CurrentUser, current_user, get_pool
 from v2.parsers import db_loader
 from v2.schemas.escalar import EscalarProductsOut, SnoozeIn, SnoozeOut
-from v2.services import abc, projects
+from v2.services import abc, ml_backfill as ml_backfill_svc, projects
 from v2.settings import get_settings
 from v2.storage import user_storage
+
+import httpx
 
 router = APIRouter(prefix="/escalar", tags=["escalar"])
 
@@ -94,3 +96,17 @@ async def post_snooze(
     new_list = sorted(current)
     await user_storage.put(pool, user.id, SNOOZE_KEY, new_list)
     return {"snoozedSkus": new_list}
+
+
+@router.post("/backfill-notices")
+async def backfill_notices(
+    days: int = Query(30, ge=1, le=90),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Pull last `days` of orders / questions / claims / paused-items / messages
+    and upsert into ml_notices. Used by the «Sincronizar histórico» button and
+    right after OAuth-connect."""
+    async with httpx.AsyncClient() as http:
+        result = await ml_backfill_svc.backfill_user(pool, http, user.id, days=days)
+    return {"fetched": result["fetched"], "saved": result["saved"]}
