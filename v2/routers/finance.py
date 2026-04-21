@@ -1217,7 +1217,12 @@ def update_cashflow_entry(
     return {"project": project.upper(), **buckets}
 
 
-# ── Publicidade invoices (Mercado Ads 12-12 billing cycle) ───────────────────
+# ── Publicidade invoices (ML billing cycle: anchor date + 30-day window) ─────
+
+def _invoice_anchor(entry: dict) -> str:
+    """Extract anchor date from entry. New schema uses `date`; legacy had `ate`."""
+    return str(entry.get("date") or entry.get("ate") or "")
+
 
 def _publicidade_list_response(project: str) -> dict[str, Any]:
     from v2.legacy.reports import list_publicidade_invoices
@@ -1231,8 +1236,7 @@ def _publicidade_list_response(project: str) -> dict[str, Any]:
         "invoices": [
             {
                 "index": i,
-                "desde": str(e.get("desde", "")),
-                "ate": str(e.get("ate", "")),
+                "date": _invoice_anchor(e),
                 "valor": float(e.get("valor", 0) or 0),
                 "note": str(e.get("note", "") or ""),
             }
@@ -1261,20 +1265,29 @@ def add_publicidade(
     project: str = Query(...),
     user: CurrentUser = Depends(current_user),
 ) -> dict[str, Any]:
-    """Append one fatura entry to a project's manual_publicidade list."""
+    """Append one fatura entry to a project's manual_publicidade list.
+
+    Схема (новая): {date, valor, note}. Фатура = anchor-дата закрытия цикла ML.
+    Окно [date-29, date] и daily rate = valor/30 считаются в `get_publicidade_by_period`.
+    """
     _bind_user(user)
     from v2.legacy.reports import add_publicidade_invoice as _add
 
-    # Validate dates (cheap ISO sanity check; legacy code tolerates strings)
-    desde = entry.desde.strip()
-    ate = entry.ate.strip()
-    if not desde or not ate or desde > ate:
+    date_str = entry.date.strip()
+    if not date_str:
         raise HTTPException(
             status_code=400,
-            detail={"error": "bad_dates", "message": "desde must be <= ate, both ISO YYYY-MM-DD"},
+            detail={"error": "bad_date", "message": "date must be ISO YYYY-MM-DD"},
+        )
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "bad_date_format", "message": "expected YYYY-MM-DD"},
         )
 
-    payload = {"desde": desde, "ate": ate, "valor": float(entry.valor), "note": entry.note or ""}
+    payload = {"date": date_str, "valor": float(entry.valor), "note": entry.note or ""}
     ok = _add(project, payload)
     if not ok:
         raise HTTPException(status_code=404, detail="project_not_found")

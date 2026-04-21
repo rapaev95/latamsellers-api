@@ -2707,45 +2707,69 @@ def parse_publicidade_reports() -> list[dict]:
             result.extend(_parse_publicidade_rows(rows, path.name))
 
     # Ручные записи из projects_db.json[manual_publicidade]
+    # Схема фатуры: {date, valor, note} — одна дата (день закрытия цикла ML).
+    # Backward compat: если date нет, но есть ate (старые записи) — берём ate.
     from datetime import datetime as _dt
     for proj_name, proj_data in (load_projects() or {}).items():
         manual = (proj_data or {}).get("manual_publicidade") or []
         for item in manual:
+            date_str = item.get("date") or item.get("ate")
+            if not date_str:
+                continue
             try:
-                desde = _dt.strptime(item["desde"], "%Y-%m-%d").date()
-                ate = _dt.strptime(item["ate"], "%Y-%m-%d").date()
+                anchor = _dt.strptime(str(date_str), "%Y-%m-%d").date()
                 valor = float(item["valor"])
             except (KeyError, ValueError, TypeError):
                 continue
             note = item.get("note", "")
+            # Фатура представлена как одна anchor-дата; окно вычисляется в get_publicidade_by_period.
             result.append({
                 "file_name": f"manual:{proj_name}:{note}",
-                "desde": desde,
-                "ate": ate,
+                "desde": anchor,        # сжатое представление: desde = ate = anchor
+                "ate": anchor,
                 "project": proj_name,
                 "mlb": "MANUAL",
                 "campanha": note,
                 "titulo": note,
                 "investimento": valor,
+                "is_fatura": True,
+                "anchor_date": anchor,
             })
     return result
 
 
-def get_publicidade_by_period(project: str, period_from, period_to) -> dict:
-    """Сумма Investimento всех файлов чей период [Desde, Até] полностью внутри
-    [period_from, period_to], для проекта.
+FATURA_BILLING_DAYS = 30  # ML биллинг-цикл: 30 дней (стандарт)
 
-    Учитывает `launch_date` проекта: дни фактуры, попадающие ДО даты запуска
-    проекта, не считаются операционными → обрезаются из total_days. Иначе
-    фактура ML за период 12.08–11.09, когда проект стартанул 01.09, даст
-    ratio 11/31 и клиент увидит только треть суммы — хотя в те 20 дней
-    августа проекта ещё не было (см. баг-репорт selle'ра 2026-04-20).
+
+def get_publicidade_by_period(project: str, period_from, period_to, only: str = "all") -> dict:
+    """Сумма Investimento за период для проекта.
+
+    Источники:
+      - CSV (Relatorio_anuncios_patrocinados*.csv) — дневные факт-расходы ML Ads.
+        Окно = [desde, ate] из CSV. Дневной rate = investimento / (ate-desde+1).
+      - Fatura (ручная запись, manual_publicidade): {date, valor, note}
+        Окно = [date - 29, date] (30 дней назад от anchor).
+        Дневной rate = valor / 30 (фиксированный "месячный" биллинг-цикл ML).
+
+    Алгоритм (по дням):
+      для каждого дня в [period_from, period_to] ∩ [launch_date, ∞):
+        1) если CSV покрывает день → rate от CSV (самый узкий файл первым)
+        2) иначе если fatura-окно покрывает день → rate = valor/30 (ранний anchor первым)
+        3) иначе день непокрыт (uncovered)
+
+    CSV имеет приоритет над фатурой (реальный дневной расход точнее).
+
+    only: "all" | "csv" | "fatura" — фильтр источников для панели сверки.
+
+    Инварианты:
+      - launch_date обрезает дни до запуска проекта (bug 2026-04-20).
+      - Только файлы с row'ами текущего проекта учитываются (ARTHUR Jan 2026 fix).
     """
     from datetime import timedelta as _td
     from datetime import datetime as _dt
     rows = parse_publicidade_reports()
 
-    # launch_date проекта — обрезает начало фактур (см. docstring)
+    # launch_date проекта — обрезает начало
     from .config import load_projects as _lp
     _proj_meta = (_lp() or {}).get(project.upper(), {}) or {}
     _launch_str = _proj_meta.get("launch_date")
@@ -2756,106 +2780,211 @@ def get_publicidade_by_period(project: str, period_from, period_to) -> dict:
         except (ValueError, TypeError):
             launch_date = None
 
-    # Группируем по файлу
-    by_file: dict = {}
+    # Разделяем rows: CSV и fatura, отфильтрованные по проекту (ARTHUR fix)
+    csv_files: dict = {}           # fname → {desde, ate, total_days, rows}
+    fatura_by_file: dict = {}      # fname → fatura row (unique per fatura)
     for r in rows:
-        by_file.setdefault(r["file_name"], []).append(r)
+        if r["project"] != project:
+            continue
+        is_fatura = bool(r.get("is_fatura")) or r["file_name"].startswith("manual:")
+        if is_fatura:
+            fatura_by_file[r["file_name"]] = r
+        else:
+            csv_files.setdefault(r["file_name"], []).append(r)
 
-    file_meta: dict = {}
-    for fname, frows in by_file.items():
+    # Собираем метаданные CSV-файлов
+    csv_meta: dict = {}
+    for fname, frows in csv_files.items():
         f_desde = min(r["desde"] for r in frows)
         f_ate = max(r["ate"] for r in frows)
-        # Обрезаем начало по launch_date проекта — дни до запуска не операционные
         if launch_date and f_desde < launch_date:
             f_desde = launch_date
         total_days = (f_ate - f_desde).days + 1
         if total_days <= 0:
-            # Вся фактура до launch_date — вклада в проект нет
             continue
-        file_meta[fname] = {
+        # CSV daily rate = Σ investimento / total_days
+        total_invest = sum(r["investimento"] for r in frows)
+        csv_meta[fname] = {
             "desde": f_desde,
             "ate": f_ate,
             "total_days": total_days,
+            "daily_rate": total_invest / total_days if total_days else 0.0,
             "rows": frows,
         }
 
-    # Сортировка: более узкие первыми (короткий period перекрывает длинный).
-    # Фильтруем ТОЛЬКО файлы, где есть row'ы текущего проекта — иначе файл-
-    # пустышка (скажем, CSV только по ORGANIZADOR) заклеймит дни и заблокирует
-    # файл, где у запрашиваемого проекта реально есть данные. Пример бага:
-    # ARTHUR за Jan 2026 → 0, потому что CSV с ORGANIZADOR-only строками
-    # (77 дней) перекрывал 90d_mensal (91 день) с ARTHUR-данными.
-    project_file_meta = {
-        fn: m for fn, m in file_meta.items()
-        if any(r["project"] == project for r in m["rows"])
-    }
-    sorted_files = sorted(project_file_meta.items(), key=lambda kv: kv[1]["total_days"])
+    # Метаданные фатур: окно [anchor - 29, anchor]
+    fatura_meta: dict = {}
+    for fname, r in fatura_by_file.items():
+        anchor = r.get("anchor_date") or r.get("ate")
+        if not anchor:
+            continue
+        window_end = anchor
+        window_start = anchor - _td(days=FATURA_BILLING_DAYS - 1)
+        if launch_date and window_start < launch_date:
+            window_start = launch_date
+        if window_start > window_end:
+            # Всё окно до launch_date — вклад 0
+            fatura_meta[fname] = {
+                "desde": window_start,
+                "ate": window_end,
+                "anchor": anchor,
+                "total_days": FATURA_BILLING_DAYS,
+                "daily_rate": 0.0,   # заморозка: всё окно пред-запуска
+                "row": r,
+                "skipped_reason": "окно фатуры до launch_date",
+            }
+            continue
+        fatura_meta[fname] = {
+            "desde": window_start,
+            "ate": window_end,
+            "anchor": anchor,
+            "total_days": FATURA_BILLING_DAYS,
+            "daily_rate": r["investimento"] / FATURA_BILLING_DAYS,
+            "row": r,
+        }
 
-    # day_to_file: для каждого дня в выбранном периоде → имя файла
-    day_to_file: dict = {}
+    # Фильтрация по only
+    if only == "csv":
+        fatura_meta = {}
+    elif only == "fatura":
+        csv_meta = {}
+
+    # Идём по дням: CSV → fatura → uncovered
+    day_source: dict = {}
+    day_value: dict = {}
+    uncovered = 0
+    total_days_in_period = 0
     cur = period_from
     while cur <= period_to:
-        day_to_file[cur] = None
+        total_days_in_period += 1
+        if launch_date and cur < launch_date:
+            cur = cur + _td(days=1)
+            continue
+        # Приоритет 1 — CSV (самый узкий файл)
+        csv_candidates = [
+            (fname, m) for fname, m in csv_meta.items()
+            if m["desde"] <= cur <= m["ate"]
+        ]
+        if csv_candidates:
+            csv_candidates.sort(key=lambda fm: fm[1]["total_days"])
+            fname, m = csv_candidates[0]
+            day_source[cur] = fname
+            day_value[cur] = m["daily_rate"]
+            cur = cur + _td(days=1)
+            continue
+        # Приоритет 2 — fatura (самый ранний anchor)
+        fatura_candidates = [
+            (fname, m) for fname, m in fatura_meta.items()
+            if m["desde"] <= cur <= m["ate"]
+        ]
+        if fatura_candidates:
+            fatura_candidates.sort(key=lambda fm: fm[1]["anchor"])
+            fname, m = fatura_candidates[0]
+            day_source[cur] = fname
+            day_value[cur] = m["daily_rate"]
+            cur = cur + _td(days=1)
+            continue
+        # Непокрыт
+        uncovered += 1
         cur = cur + _td(days=1)
 
-    for fname, meta in sorted_files:
-        cur = max(meta["desde"], period_from)
-        end = min(meta["ate"], period_to)
-        while cur <= end:
-            if day_to_file.get(cur) is None:
-                day_to_file[cur] = fname
-            cur = cur + _td(days=1)
-
-    # Сколько дней использовано из каждого файла
+    # Агрегация по файлу
     file_days_used: dict = {}
-    for fname in day_to_file.values():
-        if fname:
-            file_days_used[fname] = file_days_used.get(fname, 0) + 1
+    file_contribution: dict = {}
+    for day, fname in day_source.items():
+        file_days_used[fname] = file_days_used.get(fname, 0) + 1
+        file_contribution[fname] = file_contribution.get(fname, 0) + day_value.get(day, 0.0)
 
-    files_used: list[dict] = []
-    files_skipped: list[dict] = []
-    total = 0.0
-    by_sku: dict = {}
+    total = sum(day_value.values())
 
-    for fname, meta in project_file_meta.items():
+    files_used: list = []
+    files_skipped: list = []
+
+    # CSV — в files_used / files_skipped
+    for fname, m in csv_meta.items():
         days_used = file_days_used.get(fname, 0)
         if days_used == 0:
             files_skipped.append({
                 "file_name": fname,
-                "desde": meta["desde"],
-                "ate": meta["ate"],
-                "reason": "перекрыт более узким файлом или вне периода",
+                "desde": m["desde"],
+                "ate": m["ate"],
+                "reason": "перекрыт более узким CSV или вне периода",
             })
             continue
-        ratio = days_used / meta["total_days"]
         files_used.append({
             "file_name": fname,
             "days_used": days_used,
-            "total_days": meta["total_days"],
-            "ratio": round(ratio, 3),
+            "total_days": m["total_days"],
+            "ratio": round(days_used / m["total_days"], 3) if m["total_days"] else 0,
+            "contribution": round(file_contribution.get(fname, 0.0), 2),
+            "is_fatura": False,
+            "kind": "csv",
         })
-        for r in meta["rows"]:
-            if r["project"] != project:
-                continue
-            inv_part = r["investimento"] * ratio
-            total += inv_part
-            key = r["mlb"]
+
+    # Fatura — в files_used / files_skipped
+    for fname, m in fatura_meta.items():
+        days_used = file_days_used.get(fname, 0)
+        if days_used == 0:
+            files_skipped.append({
+                "file_name": fname,
+                "desde": m["desde"],
+                "ate": m["ate"],
+                "reason": m.get("skipped_reason") or "перекрыто CSV или вне периода",
+            })
+            continue
+        files_used.append({
+            "file_name": fname,
+            "days_used": days_used,
+            "total_days": FATURA_BILLING_DAYS,
+            "ratio": round(days_used / FATURA_BILLING_DAYS, 3),
+            "contribution": round(file_contribution.get(fname, 0.0), 2),
+            "is_fatura": True,
+            "kind": "fatura",
+        })
+
+    # by_sku: для CSV-дней распределяем day_value пропорционально; fatura → SKU "MANUAL"
+    by_sku: dict = {}
+    for day, fname in day_source.items():
+        value = day_value.get(day, 0.0)
+        if value <= 0:
+            continue
+        if fname.startswith("manual:"):
+            m = fatura_meta.get(fname)
+            frow = m["row"] if m else None
+            key = "MANUAL"
             if key not in by_sku:
                 by_sku[key] = {
-                    "mlb": r["mlb"],
-                    "campanha": r["campanha"],
-                    "titulo": r["titulo"],
+                    "mlb": "MANUAL",
+                    "campanha": (frow or {}).get("campanha", ""),
+                    "titulo": (frow or {}).get("titulo", ""),
                     "investimento": 0.0,
                 }
-            by_sku[key]["investimento"] += inv_part
+            by_sku[key]["investimento"] += value
+        else:
+            m = csv_meta.get(fname)
+            if not m:
+                continue
+            total_invest = sum(r["investimento"] for r in m["rows"])
+            if total_invest <= 0:
+                continue
+            for r in m["rows"]:
+                share = r["investimento"] / total_invest
+                key = r["mlb"]
+                if key not in by_sku:
+                    by_sku[key] = {
+                        "mlb": r["mlb"],
+                        "campanha": r["campanha"],
+                        "titulo": r["titulo"],
+                        "investimento": 0.0,
+                    }
+                by_sku[key]["investimento"] += value * share
 
-    uncovered = sum(1 for v in day_to_file.values() if v is None)
     return {
         "total": total,
-        "files_used": sorted(files_used, key=lambda f: -f["days_used"]),
+        "files_used": sorted(files_used, key=lambda f: (-f["days_used"], -f["contribution"])),
         "files_skipped": files_skipped,
         "uncovered_days": uncovered,
-        "total_days": len(day_to_file),
+        "total_days": total_days_in_period,
         "by_sku": sorted(by_sku.values(), key=lambda r: -r["investimento"]),
     }
 

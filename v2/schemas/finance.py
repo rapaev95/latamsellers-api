@@ -499,16 +499,15 @@ class RentalPaymentsListOut(BaseModel):
 # ── Publicidade invoices (manual Mercado Ads faturas, 12-12 billing cycle) ──
 
 class PublicidadeInvoiceIn(BaseModel):
-    desde: str           # ISO YYYY-MM-DD (fatura start, typically day-12)
-    ate: str             # ISO YYYY-MM-DD (fatura end, typically day-11 next month)
+    """Вход: одна дата фатуры ML (день закрытия цикла) + валор. Окно считается автоматически."""
+    date: str            # ISO YYYY-MM-DD — день закрытия цикла ML (anchor)
     valor: float         # invoice amount in BRL
     note: str = ""
 
 
 class PublicidadeInvoiceOut(BaseModel):
     index: int           # position in projects_db.json[pid][manual_publicidade]
-    desde: str
-    ate: str
+    date: str            # ISO YYYY-MM-DD — anchor
     valor: float
     note: str = ""
 
@@ -516,4 +515,32 @@ class PublicidadeInvoiceOut(BaseModel):
 class PublicidadeInvoicesListOut(BaseModel):
     project: str
     invoices: list[PublicidadeInvoiceOut]
-    launch_date: Optional[str] = None   # ISO YYYY-MM-DD — фронт обрезает period для отображения
+    launch_date: Optional[str] = None
+
+
+# ── Publicidade reconciliation ───────────────────────────────────────────────
+
+class FileUsageInfo(BaseModel):
+    """Один источник publicidade (CSV или ручная fatura) с его вкладом в total."""
+    file_name: str
+    days_used: int
+    total_days: int                           # CSV: период файла; fatura: всегда 30
+    ratio: float
+    contribution: float                       # BRL, вклад в total этого файла за период
+    is_fatura: bool
+    kind: str                                 # "csv" | "fatura"
+
+
+class PublicidadeReconciliationOut(BaseModel):
+    """Сверка publicidade за период: CSV (реальный дневной расход) vs fatura (anchor + /30)."""
+    project: str
+    period_from: str                          # YYYY-MM-DD
+    period_to: str                            # YYYY-MM-DD
+    csv_total: float
+    csv_files_used: list[FileUsageInfo]
+    fatura_total: float
+    fatura_files_used: list[FileUsageInfo]
+    delta: float                              # fatura_total − csv_total
+    uncovered_days_csv: int
+    uncovered_days_fatura: int
+    total_days: int
