@@ -466,6 +466,15 @@ DATA_SOURCES = {
         "export_from": "ML > Full > Estoque > Exportar relatório geral",
         "columns_key": None,
     },
+    "dados_fiscais": {
+        "name": "Dados Fiscais ML (catálogo)",
+        "description": "Catálogo oficial ML — SKU × MLB × NCM × Origem × Custo × Peso × CSOSN. Fonte autoritativa para себестоимость и налоги на уровне SKU.",
+        "file_pattern": "Dados_Fiscais*.xlsx",
+        "frequency": "on_demand",
+        "type": "ecom",
+        "export_from": "ML > Minha conta > Dados fiscais > Exportar Excel",
+        "columns_key": "Código do Anúncio",
+    },
     "full_express": {
         "name": "Fatura Full Express (3PL)",
         "description": "Fatura de preparo, seguro, frete — 3PL",

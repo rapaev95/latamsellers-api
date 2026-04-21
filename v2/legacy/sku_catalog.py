@@ -22,6 +22,23 @@ def normalize_sku(sku: str) -> str:
     return (sku or "").strip().upper()
 
 
+def _safe_float(v: Any) -> float | None:
+    try:
+        if v is None or v == "":
+            return None
+        f = float(v)
+        return f if f >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_str(v: Any) -> str | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s and s.lower() != "nan" else None
+
+
 def _coerce_item(it: dict[str, Any]) -> dict[str, Any] | None:
     sku_raw = str(it.get("sku", "")).strip()
     sku_key = normalize_sku(sku_raw)
@@ -30,16 +47,7 @@ def _coerce_item(it: dict[str, Any]) -> dict[str, Any] | None:
     st = str(it.get("supplier_type") or "local").lower().strip()
     if st not in VALID_SUPPLIER_TYPES:
         st = "local"
-    cost_raw = it.get("unit_cost_brl")
-    cost: float | None
-    try:
-        if cost_raw is None or cost_raw == "":
-            cost = None
-        else:
-            c = float(cost_raw)
-            cost = c if c >= 0 else None
-    except (TypeError, ValueError):
-        cost = None
+    cost = _safe_float(it.get("unit_cost_brl"))
     # Supplier state (UF) — for ICMS calculation
     supplier_state = str(it.get("supplier_state") or "").strip().upper()[:2]
     if supplier_state and supplier_state not in (
@@ -55,6 +63,17 @@ def _coerce_item(it: dict[str, Any]) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         lead_time = None
     project = str(it.get("project") or "").strip()
+
+    # Dados Fiscais fields (всё опционально, default None)
+    origem_code = it.get("origem_code")
+    try:
+        origem_code = int(origem_code) if origem_code is not None and origem_code != "" else None
+    except (TypeError, ValueError):
+        origem_code = None
+    origem_type_raw = str(it.get("origem_type") or "").strip().lower() or None
+    if origem_type_raw not in (None, "import", "local"):
+        origem_type_raw = None
+
     return {
         "sku": sku_raw,
         "project": project,
@@ -63,6 +82,24 @@ def _coerce_item(it: dict[str, Any]) -> dict[str, Any] | None:
         "supplier_state": supplier_state,
         "lead_time_days": lead_time,
         "note": str(it.get("note") or ""),
+        # --- Dados Fiscais (ML official) ---
+        "mlb": _safe_str(it.get("mlb")),
+        "titulo": _safe_str(it.get("titulo")) or _safe_str(it.get("titulo_anuncio")),
+        "variacao": _safe_str(it.get("variacao")),
+        "ean": _safe_str(it.get("ean")),
+        "ncm": _safe_str(it.get("ncm")),
+        "cest": _safe_str(it.get("cest")),
+        "origem_code": origem_code,
+        "origem_type": origem_type_raw,
+        "peso_liquido_kg": _safe_float(it.get("peso_liquido_kg")),
+        "peso_bruto_kg": _safe_float(it.get("peso_bruto_kg")),
+        "unidade": _safe_str(it.get("unidade")),
+        "descricao_nfe": _safe_str(it.get("descricao_nfe")),
+        "csosn_venda": _safe_str(it.get("csosn_venda")),
+        "csosn_transferencia": _safe_str(it.get("csosn_transferencia")),
+        "chave_fci": _safe_str(it.get("chave_fci")),
+        "regra_tributaria": _safe_str(it.get("regra_tributaria")),
+        "dados_fiscais_synced_at": _safe_str(it.get("dados_fiscais_synced_at")),
     }
 
 
@@ -233,4 +270,110 @@ def assess_stock_for_project(
         "units_from_fallback": units_from_fallback,
         "missing_skus": sorted(set(missing_skus)),
         "missing_units": missing_units,
+    }
+
+
+# Fields populated from Dados Fiscais — merged into each catalog item on sync.
+# `unit_cost_brl` also gets updated, but only when `overwrite_costs=True` (opt-in).
+_DADOS_FISCAIS_FIELDS = (
+    "mlb", "titulo", "variacao", "ean", "ncm", "cest",
+    "origem_code", "origem_type",
+    "peso_liquido_kg", "peso_bruto_kg",
+    "unidade", "descricao_nfe",
+    "csosn_venda", "csosn_transferencia",
+    "chave_fci", "regra_tributaria",
+)
+
+
+def sync_from_dados_fiscais(
+    parsed: dict[str, dict[str, Any]],
+    *,
+    overwrite_costs: bool = True,
+) -> dict[str, Any]:
+    """Merge parsed Dados Fiscais records into sku_catalog.
+
+    Args:
+      parsed: `{sku_key: {mlb, custo_brl, ncm, origem_type, peso_*, ...}}`
+        — output of `parse_dados_fiscais_bytes`.
+      overwrite_costs: if True (default), Custo do Produto из ML перезаписывает
+        `unit_cost_brl` в каталоге. Set False чтобы preserve ручные overrides.
+
+    Returns:
+      stats = {created, updated_fields, cost_updated, skipped, synced_at}
+        — updated_fields counts SKUs where any Dados Fiscais field changed
+          (независимо от cost).
+    """
+    from datetime import datetime, timezone
+
+    if not parsed:
+        return {"created": 0, "updated_fields": 0, "cost_updated": 0, "skipped": 0, "synced_at": None}
+
+    synced_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+    # Index current catalog by normalized SKU
+    current = {normalize_sku(r.get("sku") or ""): r for r in load_catalog()}
+
+    created = 0
+    updated_fields = 0
+    cost_updated = 0
+    skipped = 0
+
+    for sku_key, parsed_rec in parsed.items():
+        if not sku_key:
+            skipped += 1
+            continue
+        existing = current.get(sku_key)
+
+        if existing is None:
+            # New SKU
+            new_item = {
+                "sku": parsed_rec.get("sku") or sku_key,
+                "supplier_type": parsed_rec.get("origem_type") or "local",
+                "unit_cost_brl": parsed_rec.get("custo_brl"),
+                "dados_fiscais_synced_at": synced_at,
+            }
+            for f in _DADOS_FISCAIS_FIELDS:
+                if f in parsed_rec:
+                    new_item[f] = parsed_rec[f]
+            current[sku_key] = new_item
+            created += 1
+            continue
+
+        # Update existing — compare and merge Dados Fiscais fields
+        field_changed = False
+        for f in _DADOS_FISCAIS_FIELDS:
+            new_val = parsed_rec.get(f)
+            if new_val is None:
+                continue  # don't wipe existing data with None
+            if existing.get(f) != new_val:
+                existing[f] = new_val
+                field_changed = True
+
+        # Mirror origem_type into supplier_type if not set explicitly
+        if parsed_rec.get("origem_type") and not existing.get("supplier_type"):
+            existing["supplier_type"] = parsed_rec["origem_type"]
+            field_changed = True
+
+        # Cost update (opt-in)
+        new_cost = parsed_rec.get("custo_brl")
+        if overwrite_costs and new_cost is not None and new_cost > 0:
+            if existing.get("unit_cost_brl") != new_cost:
+                existing["unit_cost_brl"] = new_cost
+                cost_updated += 1
+
+        if field_changed or overwrite_costs:
+            existing["dados_fiscais_synced_at"] = synced_at
+        if field_changed:
+            updated_fields += 1
+
+    # Persist: save_catalog re-coerces every item + writes DB + JSON
+    save_catalog(list(current.values()))
+
+    return {
+        "created": created,
+        "updated_fields": updated_fields,
+        "cost_updated": cost_updated,
+        "skipped": skipped,
+        "synced_at": synced_at,
+        "total_skus": len(parsed),
     }

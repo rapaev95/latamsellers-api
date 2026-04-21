@@ -637,6 +637,23 @@ async def create_upload(
     if resolved_key in ("vendas_ml", "stock_full"):
         invalidate_mlb_to_sku_index(user.id)
 
+    # Dados Fiscais: автоматический sync в sku_catalog
+    # Парсит файл (sheet "Produtos Únicos") → мёрджит NCM/Origem/Peso/CSOSN/Custo
+    # для всех SKU юзера. overwrite_costs=True — считаем Dados Fiscais авторитетным
+    # источником cost (юзер сам заполнил правильные цифры в ML-файле).
+    dados_fiscais_sync: Optional[dict[str, Any]] = None
+    if resolved_key == "dados_fiscais":
+        try:
+            from v2.parsers.dados_fiscais import parse_dados_fiscais_bytes
+            from v2.legacy.sku_catalog import sync_from_dados_fiscais
+            parsed = parse_dados_fiscais_bytes(file_bytes)
+            if parsed:
+                dados_fiscais_sync = sync_from_dados_fiscais(parsed, overwrite_costs=True)
+            else:
+                dados_fiscais_sync = {"error": "empty_or_invalid_sheet"}
+        except Exception as e:
+            dados_fiscais_sync = {"error": f"{type(e).__name__}: {e}"}
+
     return {
         "id": upload_id,
         "filename": filename,
@@ -645,6 +662,7 @@ async def create_upload(
         "size_bytes": len(file_bytes),
         "was_duplicate": was_duplicate,
         "unlocked": unlocked_pwd is not None,
+        "dados_fiscais_sync": dados_fiscais_sync,
     }
 
 

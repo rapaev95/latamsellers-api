@@ -40,6 +40,14 @@ class ABCProduct(BaseModel):
     project: Optional[str] = None
     returnPct: float
     adPct: float
+    # Dados Fiscais (ML официальный каталог) — заполняется из sku_catalog
+    ncm: Optional[str] = None
+    origem_type: Optional[Literal["import", "local"]] = None
+    peso_liquido_kg: Optional[float] = None
+    peso_bruto_kg: Optional[float] = None
+    ean: Optional[str] = None
+    csosn_venda: Optional[str] = None
+    descricao_nfe: Optional[str] = None
 
 
 class ABCMeta(BaseModel):

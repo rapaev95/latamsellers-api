@@ -238,6 +238,10 @@ class UploadSaveOut(BaseModel):
     size_bytes: int
     was_duplicate: bool              # True = SHA already existed; created_at refreshed
     unlocked: bool = False           # True = file was encrypted and we decrypted it
+    # Только для source_key="dados_fiscais" — статистика sync в sku_catalog.
+    # {created, updated_fields, cost_updated, skipped, synced_at, total_skus}
+    # или {"error": "..."} при failure парсинга.
+    dados_fiscais_sync: Optional[dict[str, Any]] = None
 
 
 class SourceCatalogEntry(BaseModel):

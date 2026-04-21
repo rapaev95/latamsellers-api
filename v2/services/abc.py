@@ -19,6 +19,18 @@ from v2.parsers.armazenagem import StorageData, load_all_armazenagem
 from v2.parsers.stock_full import StockFullSku, load_all_stock_full
 from v2.services.projects import ProjectResolver
 
+
+# Поля из Dados Fiscais, пробрасываемые в каждую запись продукта для UI.
+# Значения берутся из sku_catalog (загружается один раз в начале aggregate).
+_DADOS_FISCAIS_PRODUCT_FIELDS = (
+    "ncm", "origem_type", "peso_liquido_kg", "peso_bruto_kg",
+    "ean", "csosn_venda", "descricao_nfe",
+)
+
+
+def _empty_dados_fiscais_fields() -> dict[str, Any]:
+    return {k: None for k in _DADOS_FISCAIS_PRODUCT_FIELDS}
+
 LEAD_TIME = 30
 BATCH_SIZE = 100
 LIBERACAO = 5
@@ -80,6 +92,24 @@ def aggregate(
         storage_map = load_all_armazenagem()
     if stock_full_map is None:
         stock_full_map = load_all_stock_full()
+
+    # Sku_catalog index — подтягивает NCM/Origem/Peso/EAN/CSOSN из Dados Fiscais.
+    # Безопасно относительно отсутствия каталога (возвращает {}).
+    try:
+        from v2.legacy.sku_catalog import load_catalog, normalize_sku as _nsku
+        _catalog_by_sku: dict[str, dict[str, Any]] = {}
+        for _item in load_catalog():
+            _sk = _nsku(str(_item.get("sku") or ""))
+            if _sk:
+                _catalog_by_sku[_sk] = _item
+    except Exception:
+        _catalog_by_sku = {}
+
+    def _fiscal_fields_for(sku: str) -> dict[str, Any]:
+        item = _catalog_by_sku.get((sku or "").upper())
+        if not item:
+            return _empty_dados_fiscais_fields()
+        return {k: item.get(k) for k in _DADOS_FISCAIS_PRODUCT_FIELDS}
 
     source_rows: Iterable[VendasRow] = vendas_rows if vendas_rows is not None else load_all_vendas()
     filenames: list[str] = (
@@ -216,6 +246,7 @@ def aggregate(
             "project": (resolver.resolve(a.sku, a.mlb) if resolver else "") or None,
             "returnPct": return_pct,
             "adPct": ad_pct,
+            **_fiscal_fields_for(a.sku),
         })
 
     # Include SKUs that sit in the warehouse but didn't sell in the period.
@@ -265,6 +296,7 @@ def aggregate(
             "project": proj_resolved or None,
             "returnPct": 0.0,
             "adPct": 0.0,
+            **_fiscal_fields_for(sku),
         })
 
     # ABC classification (Pareto 80/95)

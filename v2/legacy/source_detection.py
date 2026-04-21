@@ -44,6 +44,10 @@ def detect_source_from_filename(filename: str) -> Optional[str]:
     if "anuncios" in fname or "patrocinados" in fname:
         return "ads_publicidade"
 
+    # ML fiscal catalog — SKU × MLB × NCM × Origem × Custo
+    if "dados_fiscais" in fname or "dados-fiscais" in fname:
+        return "dados_fiscais"
+
     # Logistics / inventory
     if "armazenamento" in fname or "armazenagem" in fname:
         return "armazenagem_full"
