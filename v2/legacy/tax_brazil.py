@@ -258,49 +258,34 @@ def compute_das(
 
     regime = (project_meta.get("tax_regime") or "").lower().strip()
     ml_only = bool(project_meta.get("ml_only_revenue"))
-    allow_progressive = ml_only or has_1yr_bank_data
+    # RBT12 считается из ML vendas (get_company_monthly_bruto). Он "reliable"
+    # когда пользователь продаёт только на ML (RBT12=сумма vendas_ml = вся
+    # выручка компании) ИЛИ загружены 12 мес. банк-выписок (т.е. sторонние
+    # доходы видны и учтены в другом слое UI). Иначе прогрессивная ставка
+    # может быть ЗАНИЖЕНА (реальный RBT12 больше → faixa выше). Мы всё равно
+    # считаем прогрессивно (это выше чем faixa 1 nominal), но возвращаем flag
+    # для UI-warning'а.
+    rbt12_reliable = ml_only or has_1yr_bank_data
 
     # ── (2) Simples Nacional ─────────────────────────────────────────────
     if regime == "simples_nacional" or regime == "":
         anexo = (project_meta.get("simples_anexo") or "I").strip().upper()
         if anexo not in ANEXOS:
             anexo = "I"
-        tiers = ANEXOS[anexo]
-
-        if not allow_progressive:
-            # No reliable RBT12 → use faixa 1 nominal as a safe floor.
-            # Flagged as "faixa_1_fallback" so the UI can nudge the user to
-            # (a) toggle ml_only_revenue or (b) upload 12mo bank statements.
-            t = tiers[0]
-            eff = t["aliquota_nominal"]
-            das_brl = round(bruto_month * eff / 100.0, 2)
-            return {
-                "das_brl": das_brl,
-                "effective_pct": eff,
-                "regime": regime or "simples_nacional",
-                "method": "faixa_1_fallback",
-                "anexo": anexo,
-                "faixa": t["faixa"],
-                "aliquota_nominal": t["aliquota_nominal"],
-                "parcela_deduzir": t["parcela_deduzir"],
-                "icms_pct": None,
-                "state": None,
-                "rbt12": rbt12,
-                "display_pt": f"Simples Anexo {anexo} · Faixa 1 ({eff:.2f}%) · mínimo (sem RBT12 confiável)",
-                "display_ru": f"Simples Annex {anexo} · Фаикса 1 ({eff:.2f}%) · минимум (нет надежной RBT12)",
-                "exceed_limit": False,
-                "inheritance": project_meta.get("_tax_inheritance"),
-            }
 
         simples = compute_simples_effective(rbt12, anexo)
         eff = simples["effective_pct"]
         das_brl = round(bruto_month * eff / 100.0, 2)
         faixa = simples["faixa"]
+        method = "simples_progressive" if rbt12_reliable else "simples_progressive_unverified"
+        display_suffix = "" if rbt12_reliable else " · RBT12 не проверен"
+        display_suffix_pt = "" if rbt12_reliable else " · RBT12 não verificado"
         return {
             "das_brl": das_brl,
             "effective_pct": eff,
             "regime": regime or "simples_nacional",
-            "method": "simples_progressive",
+            "method": method,
+            "rbt12_reliable": rbt12_reliable,
             "anexo": anexo,
             "faixa": faixa,
             "aliquota_nominal": simples["aliquota_nominal"],
@@ -308,8 +293,8 @@ def compute_das(
             "icms_pct": None,
             "state": None,
             "rbt12": rbt12,
-            "display_pt": f"Simples Anexo {anexo} · Faixa {faixa} ({eff:.2f}%)",
-            "display_ru": f"Simples Annex {anexo} · Фаикса {faixa} ({eff:.2f}%)",
+            "display_pt": f"Simples Anexo {anexo} · Faixa {faixa} ({eff:.2f}%){display_suffix_pt}",
+            "display_ru": f"Simples Annex {anexo} · Фаикса {faixa} ({eff:.2f}%){display_suffix}",
             "exceed_limit": simples["exceed_limit"],
             "inheritance": project_meta.get("_tax_inheritance"),
         }
