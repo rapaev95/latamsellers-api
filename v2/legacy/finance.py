@@ -1040,9 +1040,15 @@ def compute_balance(
     from .planning import unpaid_ap_total as _unpaid_ap_total
 
     # Assets
-    # cash_brl = saldo (inflows − outflows): это чистая позиция по кассе
-    # после всех операций. stock_value остаётся в inventory. AR=0 по A1.
-    cash_brl = round(saldo, 2)
+    # cash_brl = ровно closing_balance из ДДС (compute_cashflow) — чтобы
+    # "ДДС.закр.остаток + товар − долги" совпадало с NAV на балансе.
+    # Старая формула `saldo = inflows − outflows` давала расхождение на
+    # величину partner_contributions, opening_balance и прорейта аренды.
+    try:
+        cf = compute_cashflow(project, (date(2025, 1, 1), as_of))
+        cash_brl = round(float(cf.closing_balance or 0), 2)
+    except Exception:
+        cash_brl = round(saldo, 2)  # fallback на legacy
     inventory_brl = round(stock_value_brl, 2)
     accounts_receivable_brl = 0.0
     assets_total = round(cash_brl + accounts_receivable_brl + inventory_brl, 2)
