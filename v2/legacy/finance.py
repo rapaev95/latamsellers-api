@@ -89,6 +89,9 @@ class PnLReport:
     # Dados Fiscais или заполнить на /finance/sku-mapping).
     cogs_missing_skus: list[str] = field(default_factory=list)
     cogs_missing_units: int = 0
+    # Per-SKU детализация: [{sku, mlb, units}] — для объединённого UI-списка
+    # missing-cost (вместе с stock_missing_sku_details из Balance).
+    cogs_missing_sku_details: list[dict] = field(default_factory=list)
     unit_cost_per_sku: dict[str, float] = field(default_factory=dict)
     # Расчётные данные по DAS (Simples Nacional / Lucro Presumido / override)
     # — faixa, aliquot effective, ICMS, method. Используется UI для бейджа рядом
@@ -101,9 +104,13 @@ class CashFlowReport:
     project: str
     period: tuple[date, date]
     opening_balance: float          # стартовое сальдо (обычно 0)
-    inflows_operating: float        # operating profit за период
-    inflows_count: int              # кол-во продаж за период
-    inflows_financing: float        # USDT инвестиции собственника
+    # Источник opening_balance: "configured" (project.opening_balance задан),
+    # "partner_investments" (fallback из ручных partner-взносов в ДДС),
+    # "none" (нет ни того, ни другого). UI подбирает подпись по этому полю.
+    opening_balance_source: str = "none"
+    inflows_operating: float = 0.0  # operating profit за период
+    inflows_count: int = 0          # кол-во продаж за период
+    inflows_financing: float = 0.0  # USDT инвестиции собственника
     inflows_partner: float = 0.0    # ручные поступления от партнёра
     outflows_operating: float = 0.0 # supplier (закупки)
     outflows_other: float = 0.0     # ручные прочие расходы
@@ -146,6 +153,26 @@ class BalanceReport:
 
     # ── Reconciliation ───────────────────────────────────────────────────
     balance_delta_brl: float = 0.0         # assets − (liab + equity)
+
+    # ── Investment return (time-weighted MOIC + annualized) ─────────────
+    # «Вложил 10K, сейчас 40K → x4» — главная метрика владельца.
+    # weighted_avg_invested = Σ(amount × days_worked) / total_days. Это
+    # реальный "средний работавший капитал" — если 3K лежали год а 40K
+    # всего месяц, весит первое.
+    # NAV = assets − liabilities (чистая стоимость капитала сейчас).
+    # Total return NAV = NAV + Σ dividends (учитываем уже-выведенные деньги).
+    total_invested_brl: float = 0.0        # номинальная сумма (Σ всех взносов)
+    weighted_avg_invested_brl: float = 0.0 # time-weighted (честная база для MOIC)
+    current_nav_brl: float = 0.0           # assets − liabilities
+    total_return_nav_brl: float = 0.0      # NAV + dividends_paid
+    moic_simple: float = 0.0               # nav / total_invested (наивный)
+    moic_current: float = 0.0              # nav / weighted_avg_invested (time-weighted)
+    moic_total_return: float = 0.0         # (nav + divs) / weighted_avg_invested
+    annualized_pct: float = 0.0            # CAGR по time-weighted MOIC
+    years_since_launch: float = 0.0        # для UI "xN за Y лет"
+    launch_date_iso: str | None = None     # для UI подписи
+    # Timeline взносов для UI-tooltip: [{date, brl, kind}]
+    capital_contributions: list = field(default_factory=list)
 
     # ── Legacy flow-based fields (back-compat) ───────────────────────────
     inflow_usdt_brl: float = 0.0
@@ -475,6 +502,7 @@ def compute_pnl(
     cogs_total = 0.0
     cogs_missing_skus: list[str] = []
     cogs_missing_units = 0
+    cogs_missing_details: list[dict] = []
     unit_cost_per_sku: dict[str, float] = {}
     for sku, qty in sku_qty.items():
         # Step 1: прямой lookup по SKU
@@ -507,6 +535,11 @@ def compute_pnl(
         else:
             cogs_missing_skus.append(sku)
             cogs_missing_units += int(qty)
+            cogs_missing_details.append({
+                "sku": str(sku).strip(),
+                "mlb": sku_mlbs.get(sku, "") or "",
+                "units": int(qty),
+            })
     cogs_total = round(cogs_total, 2)
     net_profit = round(operating_profit - cogs_total, 2)
 
@@ -526,6 +559,7 @@ def compute_pnl(
         margin_pct=margin,
         cogs_missing_skus=cogs_missing_skus,
         cogs_missing_units=cogs_missing_units,
+        cogs_missing_sku_details=sorted(cogs_missing_details, key=lambda d: -d["units"]),
         unit_cost_per_sku=unit_cost_per_sku,
         tax_info=das_info,
     )
@@ -791,6 +825,14 @@ def compute_cashflow(project: str, period: tuple[date, date]) -> CashFlowReport:
     # как inflows_partner — иначе двойной счёт.
     partner_total_for_inflows = 0.0 if opening_from_fallback else partner_total
 
+    # Источник opening_balance для UI-подписи.
+    if ob_set:
+        opening_source = "configured"
+    elif opening_from_fallback:
+        opening_source = "partner_investments"
+    else:
+        opening_source = "none"
+
     closing = (opening + op_profit_cash + usdt_total_brl + partner_total_for_inflows
                - supplier_total - other_expenses_total)
 
@@ -798,6 +840,7 @@ def compute_cashflow(project: str, period: tuple[date, date]) -> CashFlowReport:
         project=project,
         period=period,
         opening_balance=opening,
+        opening_balance_source=opening_source,
         inflows_operating=op_profit_cash,
         inflows_count=int(pnl.vendas_count or 0),
         inflows_financing=usdt_total_brl,
@@ -1035,6 +1078,120 @@ def compute_balance(
 
     balance_delta_brl = round(assets_total - (liabilities_total + equity_total), 2)
 
+    # ── Investment return: time-weighted MOIC + annualized CAGR ──────────
+    # Собираем все взносы капитала с датами в один timeline, нормализуем в BRL.
+    # "Время работы" каждого взноса = (as_of - date_of_contribution). Это дает
+    # честный weighted-avg invested, который не искажается поздними вливаниями.
+    #
+    # Источники:
+    #   - initial_equity_brl — считаем что зашёл на launch_date (или, если
+    #     launch_date нет, игнорируем: без даты не знаем сколько дней работал).
+    #   - usdt_investments — из проекта, каждый со своей date.
+    #   - partner_contributions — из проекта, каждый со своей date + валютной
+    #     нормализацией через _entry_valor_brl.
+    contributions: list[dict] = []
+
+    launch_iso_str = None
+    launch_date_parsed: date | None = None
+    launch_raw = str(proj_meta.get("launch_date") or "").strip()[:10]
+    if launch_raw:
+        try:
+            launch_date_parsed = datetime.strptime(launch_raw, "%Y-%m-%d").date()
+            launch_iso_str = launch_date_parsed.isoformat()
+        except (ValueError, TypeError):
+            launch_date_parsed = None
+
+    if initial_equity_brl > 0 and launch_date_parsed is not None:
+        contributions.append({
+            "date": launch_date_parsed,
+            "brl": initial_equity_brl,
+            "kind": "initial_equity",
+        })
+
+    import calendar as _cal_tw
+    for inv in (proj_meta.get("usdt_investments") or []):
+        ds = str(inv.get("date") or "")
+        inv_date: date | None = None
+        try:
+            inv_date = datetime.strptime(ds, "%Y-%m").date()
+            last = _cal_tw.monthrange(inv_date.year, inv_date.month)[1]
+            inv_date = inv_date.replace(day=last)
+        except (ValueError, TypeError):
+            try:
+                inv_date = datetime.strptime(ds, "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                inv_date = None
+        if inv_date is None or inv_date > as_of:
+            continue
+        amt_brl = float(inv.get("brl", 0) or 0)
+        if amt_brl > 0:
+            contributions.append({"date": inv_date, "brl": amt_brl, "kind": "usdt"})
+
+    for item in (proj_meta.get("partner_contributions") or []):
+        try:
+            d_t = datetime.strptime(str(item.get("date", "")), "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            continue
+        if d_t > as_of:
+            continue
+        amt_brl = _entry_valor_brl(item)
+        if amt_brl > 0:
+            contributions.append({"date": d_t, "brl": amt_brl, "kind": "partner"})
+
+    contributions.sort(key=lambda c: c["date"])
+
+    # Номинальная сумма (для справки, используется в simple MOIC)
+    total_invested_brl = round(sum(c["brl"] for c in contributions), 2)
+
+    # Time-weighted average invested = Σ(amount × days_worked) / total_period_days
+    weighted_avg_invested_brl = 0.0
+    years_since_launch = 0.0
+    if contributions:
+        earliest = contributions[0]["date"]
+        # Период = от первого взноса (или launch_date, если он раньше) до as_of
+        period_start = min(earliest, launch_date_parsed) if launch_date_parsed else earliest
+        total_days = max(1, (as_of - period_start).days)
+        weighted_sum = sum(
+            c["brl"] * max(0, (as_of - c["date"]).days) for c in contributions
+        )
+        weighted_avg_invested_brl = round(weighted_sum / total_days, 2)
+        years_since_launch = round(total_days / 365.25, 3)
+
+    # NAV
+    current_nav_brl = round(assets_total - liabilities_total, 2)
+    total_return_nav_brl = round(current_nav_brl + dividends_paid_brl, 2)
+
+    moic_simple = (
+        round(current_nav_brl / total_invested_brl, 3) if total_invested_brl > 0 else 0.0
+    )
+    moic_current = (
+        round(current_nav_brl / weighted_avg_invested_brl, 3)
+        if weighted_avg_invested_brl > 0 else 0.0
+    )
+    moic_total_return = (
+        round(total_return_nav_brl / weighted_avg_invested_brl, 3)
+        if weighted_avg_invested_brl > 0 else 0.0
+    )
+
+    # Annualized CAGR на time-weighted базе. Для периода < 1 мес — пропускаем
+    # (annualized на 7 днях даёт бессмысленно огромные цифры).
+    annualized_pct = 0.0
+    if years_since_launch >= 0.083 and moic_total_return > 0:
+        annualized_pct = round(
+            (moic_total_return ** (1.0 / years_since_launch) - 1.0) * 100.0, 2
+        )
+
+    # Timeline для UI tooltip
+    capital_contributions_out = [
+        {
+            "date": c["date"].isoformat(),
+            "brl": round(c["brl"], 2),
+            "kind": c["kind"],
+            "days_worked": max(0, (as_of - c["date"]).days),
+        }
+        for c in contributions
+    ]
+
     return BalanceReport(
         project=project,
         as_of=as_of,
@@ -1054,6 +1211,18 @@ def compute_balance(
         equity_total=equity_total,
         # Reconciliation
         balance_delta_brl=balance_delta_brl,
+        # Investment return (time-weighted MOIC + simple for comparison)
+        total_invested_brl=total_invested_brl,
+        weighted_avg_invested_brl=weighted_avg_invested_brl,
+        current_nav_brl=current_nav_brl,
+        total_return_nav_brl=total_return_nav_brl,
+        moic_simple=moic_simple,
+        moic_current=moic_current,
+        moic_total_return=moic_total_return,
+        annualized_pct=annualized_pct,
+        years_since_launch=years_since_launch,
+        launch_date_iso=launch_iso_str,
+        capital_contributions=capital_contributions_out,
         # Legacy (back-compat)
         inflow_usdt_brl=inflow_usdt_brl,
         inflow_usdt_usd=inflow_usdt_usd,

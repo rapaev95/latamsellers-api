@@ -41,6 +41,8 @@ class PnLReportOut(BaseModel):
     # (user needs to load Dados Fiscais or fill them manually on /finance/sku-mapping).
     cogs_missing_skus: list[str] = []
     cogs_missing_units: int = 0
+    # [{sku, mlb, units}] — per-SKU детализация проданных SKU без себестоимости.
+    cogs_missing_sku_details: list[dict[str, Any]] = []
     unit_cost_per_sku: dict[str, float] = {}
     # DAS/Simples/LP metadata for UI badge (regime, anexo, faixa, effective %).
     # Shape: см. compute_das() в v2/legacy/tax_brazil.py.
@@ -54,6 +56,9 @@ class CashFlowReportOut(BaseModel):
 
     project: str
     opening_balance: float = 0
+    # Источник opening_balance: "configured" (project.opening_balance),
+    # "partner_investments" (fallback из partner_txs в ДДС), "none".
+    opening_balance_source: str = "none"
     inflows_operating: float = 0
     inflows_count: int = 0
     inflows_financing: float = 0
@@ -108,6 +113,21 @@ class BalanceReportOut(BaseModel):
 
     # ── Reconciliation ───────────────────────────────────────────────────
     balance_delta_brl: float = 0             # assets − (liab + equity). |Δ| > 100 → warn
+
+    # ── Investment return (time-weighted MOIC + annualized) ─────────────
+    # «Вложил 10K, сейчас 40K → x4» — главная метрика владельца.
+    total_invested_brl: float = 0            # Σ всех взносов (nominal, для simple MOIC)
+    weighted_avg_invested_brl: float = 0     # time-weighted — честная база для MOIC
+    current_nav_brl: float = 0               # assets − liabilities
+    total_return_nav_brl: float = 0          # NAV + dividends_paid
+    moic_simple: float = 0                   # NAV / total_invested
+    moic_current: float = 0                  # NAV / weighted_avg_invested (primary)
+    moic_total_return: float = 0             # (NAV + divs) / weighted_avg_invested
+    annualized_pct: float = 0                # CAGR по time-weighted MOIC
+    years_since_launch: float = 0
+    launch_date_iso: Optional[str] = None
+    # Timeline: [{date, brl, kind, days_worked}]
+    capital_contributions: list[dict[str, Any]] = []
 
     # ── Legacy flow fields (kept for back-compat) ────────────────────────
     inflow_usdt_brl: float = 0
