@@ -46,7 +46,7 @@ from v2.storage import uploads_storage
 
 router = APIRouter(prefix="/finance", tags=["finance"])
 
-_COMPUTE_TIMEOUT_SECONDS = 30  # legacy compute can scan many files; cap response time
+_COMPUTE_TIMEOUT_SECONDS = 90  # legacy compute can scan many files; cap response time
 
 T = TypeVar("T")
 
@@ -351,6 +351,8 @@ def get_pnl_matrix(
     })
     data, err = results["matrix"]
     if data is None or err:
+        import sys
+        print(f"[pnl-matrix] project={project} err={err}", file=sys.stderr, flush=True)
         return {"project": project, "months": [], "years": [], "rows": []}
     return {
         "project": project,
@@ -1023,7 +1025,7 @@ def create_project(
     only collect the minimum needed to unblock the wizard.
     """
     _bind_user(user)
-    from v2.legacy.config import add_project, load_projects, _invalidate_projects_cache
+    from v2.legacy.config import add_project, load_projects, _invalidate_projects_cache, update_project
 
     pid = (body.project_id or "").strip().upper()
     if not pid:
@@ -1039,6 +1041,19 @@ def create_project(
         compensation_mode=body.compensation_mode or "profit_share",
         profit_share_pct=body.profit_share_pct,
     )
+    # Stamp tax-block fields from onboarding Step 1 (company-level) onto
+    # the new project via the editable-keys whitelist. Keeps add_project()
+    # signature stable while letting the wizard preset tax_regime + anexo +
+    # ml_only_revenue in one step.
+    extra_fields: dict[str, Any] = {}
+    if body.tax_regime is not None:
+        extra_fields["tax_regime"] = body.tax_regime
+    if body.simples_anexo is not None:
+        extra_fields["simples_anexo"] = body.simples_anexo
+    if body.ml_only_revenue is not None:
+        extra_fields["ml_only_revenue"] = bool(body.ml_only_revenue)
+    if extra_fields:
+        update_project(pid, extra_fields)
     _invalidate_projects_cache()
 
     total = len(load_projects() or {})

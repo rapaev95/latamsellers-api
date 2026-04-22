@@ -377,6 +377,12 @@ class ProjectCreateIn(BaseModel):
     sku_prefixes: list[str] = []
     compensation_mode: str = "profit_share"
     profit_share_pct: Optional[float] = None
+    # Inherited from onboarding Step 1 (company-level), stamped onto every
+    # project from this wizard run so DAS/Balance compute correctly without
+    # a second trip to /finance/projects settings.
+    tax_regime: Optional[str] = None     # "simples_nacional" | "lucro_presumido" | ""
+    simples_anexo: Optional[str] = None  # "I" | "II" | "III" | ""
+    ml_only_revenue: Optional[bool] = None  # true → прогрессивный Simples без RBT12-warning
 
 
 class ProjectCreateOut(BaseModel):
