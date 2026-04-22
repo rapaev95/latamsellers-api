@@ -759,10 +759,16 @@ def compute_cashflow(project: str, period: tuple[date, date]) -> CashFlowReport:
     # Смысл: касса на дату balance_date (например, сальдо на 01.09.2025 при
     # переносе из старой учётной системы). Если balance_date позже period_end
     # — не применяем (ещё не наступила точка отсчёта).
+    # Fallback: если opening_balance не задан — используем сумму партнёрских
+    # инвестиций (введённых вручную в ДДС) как стартовый капитал, чтобы
+    # пользователь не видел "откр. остаток = 0" пока не настроит баланс.
+    # Чтобы не удваивать: когда partner идёт в opening, inflows_partner=0.
     opening = 0.0
+    opening_from_fallback = False
+    ob_set = False
     try:
         ob = proj_meta.get("opening_balance")
-        if ob is not None:
+        if ob is not None and str(ob).strip() != "":
             ob_f = float(ob)
             bd_str = (proj_meta.get("balance_date") or "").strip()[:10]
             bd = None
@@ -773,10 +779,19 @@ def compute_cashflow(project: str, period: tuple[date, date]) -> CashFlowReport:
                     bd = None
             if bd is None or bd <= period_end:
                 opening = ob_f
+                ob_set = True
     except (TypeError, ValueError):
         pass
 
-    closing = (opening + op_profit_cash + usdt_total_brl + partner_total
+    if not ob_set and partner_total > 0:
+        opening = partner_total
+        opening_from_fallback = True
+
+    # Если opening = partner_total (fallback), то не учитываем их ещё раз
+    # как inflows_partner — иначе двойной счёт.
+    partner_total_for_inflows = 0.0 if opening_from_fallback else partner_total
+
+    closing = (opening + op_profit_cash + usdt_total_brl + partner_total_for_inflows
                - supplier_total - other_expenses_total)
 
     return CashFlowReport(
@@ -786,7 +801,7 @@ def compute_cashflow(project: str, period: tuple[date, date]) -> CashFlowReport:
         inflows_operating=op_profit_cash,
         inflows_count=int(pnl.vendas_count or 0),
         inflows_financing=usdt_total_brl,
-        inflows_partner=partner_total,
+        inflows_partner=partner_total_for_inflows,
         outflows_operating=supplier_total,
         outflows_other=other_expenses_total,
         closing_balance=closing,
