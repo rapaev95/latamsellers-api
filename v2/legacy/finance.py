@@ -1026,10 +1026,46 @@ def compute_balance(
 
     saldo = inflows_total - outflows_total
 
-    # ── Просроченная аренда (pending, не в outflows) ──
-    pending_usd = sum(float(p.get("amount_usd") or p.get("usd") or 0)
-                      for p in (rental.get("payments") or [])
-                      if str(p.get("status", "")).lower() == "pending")
+    # ── Просроченная аренда: AP только то что ДОЛЖНЫ сейчас ──
+    # Правила (по датам, сортированным asc):
+    #  1) Последний paid-платёж + step = paid_until (до какой даты покрыто).
+    #  2) Pending платежи с датой <= paid_until — УЖЕ ПОКРЫТЫ (оплата охватывает
+    #     их период), игнорируем.
+    #  3) Pending с датой > today — будущие обязательства, НЕ AP (нет долга).
+    #  4) Всё что посередине (paid_until < date <= today) — реальный overdue AP.
+    from datetime import datetime as _dt_pending, timedelta as _td_pending
+    _payments_raw = (rental.get("payments") or [])
+    # Нормализуем и сортируем по date asc
+    _payments: list[tuple[date, str, float]] = []  # (date, status, amount_usd)
+    for p in _payments_raw:
+        try:
+            pd = _dt_pending.strptime(str(p.get("date", ""))[:10], "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            continue
+        st = str(p.get("status", "pending")).lower()
+        amt = float(p.get("amount_usd") or p.get("usd") or 0)
+        _payments.append((pd, st, amt))
+    _payments.sort(key=lambda x: x[0])
+
+    # Последняя оплаченная дата + шаг периода = paid_until
+    from .reports import _step_date_by_months as _step_dm
+    _period = str(rental.get("period", "month")).lower()
+    _step_months = 3 if _period.startswith("quart") else 1
+    _last_paid = max((d for d, st, _ in _payments if st == "paid"), default=None)
+    _paid_until: date | None = None
+    if _last_paid is not None:
+        nps = _step_dm(_last_paid, _step_months)
+        _paid_until = nps - _td_pending(days=1)
+
+    pending_usd = 0.0
+    for pd, st, amt in _payments:
+        if st != "pending":
+            continue
+        if _paid_until is not None and pd <= _paid_until:
+            continue  # уже покрыт paid-периодом
+        if pd > as_of:
+            continue  # будущая — не AP
+        pending_usd += amt
     pending_brl = pending_usd * 5.46  # курс fallback
     saldo_final = saldo - pending_brl
 
