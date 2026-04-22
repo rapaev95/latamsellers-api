@@ -270,6 +270,7 @@ def assess_stock_for_project(
     units_from_catalog = 0
     units_from_fallback = 0
     missing_skus: list[str] = []
+    missing_details: list[dict[str, Any]] = []   # [{sku, mlb, units}] for UI
     missing_units = 0
 
     avg: float | None
@@ -323,7 +324,13 @@ def assess_stock_for_project(
             units_from_fallback += q
             by_supplier["fallback"] += q * avg
         else:
-            missing_skus.append(str(sku).strip())
+            sku_clean = str(sku).strip()
+            missing_skus.append(sku_clean)
+            missing_details.append({
+                "sku": sku_clean,
+                "mlb": sku_mlbs.get(sku) or sku_mlbs.get(key) or "",
+                "units": q,
+            })
             missing_units += q
 
     ext = int(stock_units_external or 0)
@@ -341,6 +348,7 @@ def assess_stock_for_project(
         "units_from_catalog": units_from_catalog,
         "units_from_fallback": units_from_fallback,
         "missing_skus": sorted(set(missing_skus)),
+        "missing_sku_details": sorted(missing_details, key=lambda d: -d["units"]),
         "missing_units": missing_units,
     }
 

@@ -140,6 +140,8 @@ class BalanceReport:
     stock_value_brl: float = 0.0
     stock_missing_skus: list = field(default_factory=list)
     stock_missing_units: int = 0
+    # [{sku, mlb, units}] — для UI (ML-ссылка + CTA на /finance/sku-mapping)
+    stock_missing_sku_details: list = field(default_factory=list)
     stock_by_supplier_type: dict = field(default_factory=dict)
 
 
@@ -719,6 +721,7 @@ def compute_balance(project: str, as_of: date, basis: str = "accrual") -> Balanc
     stock_value_brl = float(assess.get("stock_value_brl") or 0)
     stock_missing_skus = list(assess.get("missing_skus") or [])
     stock_missing_units = int(assess.get("missing_units") or 0)
+    stock_missing_sku_details = list(assess.get("missing_sku_details") or [])
     stock_by_supplier_type = dict(assess.get("by_supplier_type") or {})
 
     if stock_units > 0 and stock_value_brl > 0:
@@ -776,8 +779,44 @@ def compute_balance(project: str, as_of: date, basis: str = "accrual") -> Balanc
     # 6. Full Express — пока нет парсера
     out_full_express = 0.0
 
-    # 7. Mercadoria = оценка склада
-    out_mercadoria = stock_value_brl
+    # 7. Mercadoria = фактические платежи поставщикам (из ДДС/banking + manual_supplier)
+    # НЕ stock_value: чтобы не дублировать (stock_value = оставшийся актив,
+    # supplier cash = то что юзер реально заплатил поставщикам). Stock value
+    # при этом идёт в balance как отдельный актив (stock_value_brl).
+    try:
+        from .reports import aggregate_classified_by_project as _agg_cls
+        import pandas as _pd_bal
+        from datetime import datetime as _dt_bal
+        live = _agg_cls(project)
+        supplier_total = 0.0
+        for tx in (live.get("transactions") or []):
+            cat = str(tx.get("Категория", "") or "").lower()
+            if cat != "supplier":
+                continue
+            ds = str(tx.get("Data", ""))
+            try:
+                td = _pd_bal.to_datetime(ds, dayfirst=True).date()
+            except Exception:
+                continue
+            if td > as_of:
+                continue
+            try:
+                val = abs(float(tx.get("Valor", 0) or 0))
+            except (ValueError, TypeError):
+                val = 0.0
+            supplier_total += val
+        # Manual supplier entries
+        for item in (proj_meta.get("manual_supplier") or []):
+            try:
+                tx_date = _dt_bal.strptime(str(item.get("date", "")), "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                continue
+            if tx_date > as_of:
+                continue
+            supplier_total += abs(_entry_valor_brl(item))
+        out_mercadoria = round(supplier_total, 2)
+    except Exception:
+        out_mercadoria = 0.0
 
     # ── baseline_overrides в projects_db.json перекрывают любое значение ──
     # (для legacy-проектов с утверждёнными цифрами, например ARTUR)
@@ -835,5 +874,6 @@ def compute_balance(project: str, as_of: date, basis: str = "accrual") -> Balanc
         stock_value_brl=stock_value_brl,
         stock_missing_skus=stock_missing_skus,
         stock_missing_units=stock_missing_units,
+        stock_missing_sku_details=stock_missing_sku_details,
         stock_by_supplier_type=stock_by_supplier_type,
     )

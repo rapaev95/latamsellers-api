@@ -88,6 +88,8 @@ class BalanceReportOut(BaseModel):
     stock_value_brl: float = 0
     stock_missing_skus: list[str] = []
     stock_missing_units: int = 0
+    # [{sku, mlb, units}] — для UI (ML-ссылка + deep link на /finance/sku-mapping).
+    stock_missing_sku_details: list[dict[str, Any]] = []
     stock_by_supplier_type: dict[str, Any] = {}
 
 
@@ -503,9 +505,16 @@ class RentalPaymentsListOut(BaseModel):
 # ── Publicidade invoices (manual Mercado Ads faturas, 12-12 billing cycle) ──
 
 class PublicidadeInvoiceIn(BaseModel):
-    """Вход: одна дата фатуры ML (день закрытия цикла) + валор. Окно считается автоматически."""
-    date: str            # ISO YYYY-MM-DD — день закрытия цикла ML (anchor)
-    valor: float         # invoice amount in BRL
+    """Вход: либо полная дата (anchor), либо только месяц — тогда день берётся из project.billing_cycle_day.
+
+    Правила:
+      - если есть `date` (YYYY-MM-DD) — используется как anchor.
+      - иначе если есть `month` (YYYY-MM) — anchor = month + project.billing_cycle_day.
+      - если cycle_day не настроен и есть только month → 400.
+    """
+    date: str | None = None          # ISO YYYY-MM-DD — anchor (legacy/ручной ввод)
+    month: str | None = None         # ISO YYYY-MM — месяц фатуры, день подставится из проекта
+    valor: float                     # invoice amount in BRL
     note: str = ""
 
 
@@ -516,10 +525,19 @@ class PublicidadeInvoiceOut(BaseModel):
     note: str = ""
 
 
+class PubCsvWindow(BaseModel):
+    from_: str = Field(..., alias="from")   # ISO YYYY-MM-DD
+    to: str                                  # ISO YYYY-MM-DD
+
+    model_config = {"populate_by_name": True}
+
+
 class PublicidadeInvoicesListOut(BaseModel):
     project: str
     invoices: list[PublicidadeInvoiceOut]
     launch_date: Optional[str] = None
+    billing_cycle_day: Optional[int] = None          # день закрытия цикла (1..28)
+    publicidade_csv_window: Optional[PubCsvWindow] = None
 
 
 # ── Publicidade reconciliation ───────────────────────────────────────────────
@@ -548,3 +566,34 @@ class PublicidadeReconciliationOut(BaseModel):
     uncovered_days_csv: int
     uncovered_days_fatura: int
     total_days: int
+
+
+# ── Coverage timeline (publicidade + armazenagem, per-day как сегменты) ─────
+
+class CoverageRange(BaseModel):
+    from_: str = Field(..., alias="from")
+    to: str
+    model_config = {"populate_by_name": True}
+
+
+class CoveragePublicidade(BaseModel):
+    csv_segments: list[CoverageRange]
+    fatura_segments: list[CoverageRange]
+    uncovered_segments: list[CoverageRange]
+    csv_raw_range: Optional[CoverageRange] = None
+    csv_window: Optional[CoverageRange] = None
+
+
+class CoverageArmazenagem(BaseModel):
+    csv_segments: list[CoverageRange]
+    uncovered_segments: list[CoverageRange]
+    csv_raw_range: Optional[CoverageRange] = None
+
+
+class CoverageOut(BaseModel):
+    project: str
+    period_from: str
+    period_to: str
+    launch_date: Optional[str] = None
+    publicidade: CoveragePublicidade
+    armazenagem: CoverageArmazenagem

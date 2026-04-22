@@ -2780,6 +2780,22 @@ def get_publicidade_by_period(project: str, period_from, period_to, only: str = 
         except (ValueError, TypeError):
             launch_date = None
 
+    # publicidade_csv_window — пользовательское сужение диапазона CSV.
+    # Дни вне окна [window_from, window_to] не считаются покрытыми CSV,
+    # fatura получает приоритет в этих днях.
+    _win = _proj_meta.get("publicidade_csv_window") or None
+    csv_window_from = None
+    csv_window_to = None
+    if isinstance(_win, dict):
+        try:
+            if _win.get("from"):
+                csv_window_from = _dt.strptime(str(_win["from"])[:10], "%Y-%m-%d").date()
+            if _win.get("to"):
+                csv_window_to = _dt.strptime(str(_win["to"])[:10], "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            csv_window_from = None
+            csv_window_to = None
+
     # Разделяем rows: CSV и fatura, отфильтрованные по проекту (ARTHUR fix)
     csv_files: dict = {}           # fname → {desde, ate, total_days, rows}
     fatura_by_file: dict = {}      # fname → fatura row (unique per fatura)
@@ -2860,11 +2876,17 @@ def get_publicidade_by_period(project: str, period_from, period_to, only: str = 
         if launch_date and cur < launch_date:
             cur = cur + _td(days=1)
             continue
-        # Приоритет 1 — CSV (самый узкий файл)
+        # Приоритет 1 — CSV (самый узкий файл).
+        # Если задано publicidade_csv_window — за его пределами CSV игнорируется.
+        in_csv_window = True
+        if csv_window_from and cur < csv_window_from:
+            in_csv_window = False
+        if csv_window_to and cur > csv_window_to:
+            in_csv_window = False
         csv_candidates = [
             (fname, m) for fname, m in csv_meta.items()
             if m["desde"] <= cur <= m["ate"]
-        ]
+        ] if in_csv_window else []
         if csv_candidates:
             csv_candidates.sort(key=lambda fm: fm[1]["total_days"])
             fname, m = csv_candidates[0]
@@ -2986,6 +3008,215 @@ def get_publicidade_by_period(project: str, period_from, period_to, only: str = 
         "uncovered_days": uncovered,
         "total_days": total_days_in_period,
         "by_sku": sorted(by_sku.values(), key=lambda r: -r["investimento"]),
+    }
+
+
+def _segments_from_days(days: list) -> list[dict]:
+    """Свернуть отсортированный список date-объектов в непрерывные сегменты
+    [{from, to}]. Пропуски в один день рвут сегмент.
+    """
+    from datetime import timedelta as _td
+    if not days:
+        return []
+    days = sorted(days)
+    segments: list[dict] = []
+    start = days[0]
+    prev = days[0]
+    for d in days[1:]:
+        if (d - prev).days == 1:
+            prev = d
+            continue
+        segments.append({"from": start.isoformat(), "to": prev.isoformat()})
+        start = d
+        prev = d
+    segments.append({"from": start.isoformat(), "to": prev.isoformat()})
+    return segments
+
+
+def get_coverage(project: str, period_from, period_to) -> dict:
+    """Вернуть per-day coverage для publicidade и armazenagem в виде сегментов.
+
+    Response:
+      {
+        publicidade: {
+          csv_segments:     [{from, to}]  # дни, где реально используется CSV (с учётом window)
+          fatura_segments:  [{from, to}]  # дни, покрытые fatura
+          uncovered_segments: [{from, to}]
+          csv_raw_range:    {from, to} | None  # весь диапазон CSV-данных (до сужения)
+          csv_window:       {from, to} | None  # пользовательское сужение
+        },
+        armazenagem: {
+          csv_segments:     [{from, to}]
+          uncovered_segments: [{from, to}]
+          csv_raw_range:    {from, to} | None
+        },
+        launch_date: ISO | None,
+        period_from, period_to: ISO
+      }
+    """
+    from datetime import timedelta as _td
+    from datetime import datetime as _dt
+    from .config import load_projects as _lp
+
+    _proj_meta = (_lp() or {}).get(project.upper(), {}) or {}
+    launch_str = _proj_meta.get("launch_date")
+    launch_date = None
+    if launch_str:
+        try:
+            launch_date = _dt.strptime(launch_str, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            launch_date = None
+
+    # ── Publicidade ────────────────────────────────────────────────────────
+    rows = parse_publicidade_reports()
+    csv_files: dict = {}
+    fatura_by_file: dict = {}
+    for r in rows:
+        if r["project"] != project:
+            continue
+        is_fatura = bool(r.get("is_fatura")) or r["file_name"].startswith("manual:")
+        if is_fatura:
+            fatura_by_file[r["file_name"]] = r
+        else:
+            csv_files.setdefault(r["file_name"], []).append(r)
+
+    # CSV raw range (без сужения) — min/max по всем CSV-дням
+    csv_days_raw: set = set()
+    for frows in csv_files.values():
+        for r in frows:
+            d_from = r["desde"]
+            d_to = r["ate"]
+            cur = d_from
+            while cur <= d_to:
+                csv_days_raw.add(cur)
+                cur += _td(days=1)
+    csv_raw_range = None
+    if csv_days_raw:
+        csv_raw_range = {
+            "from": min(csv_days_raw).isoformat(),
+            "to": max(csv_days_raw).isoformat(),
+        }
+
+    # Окно сужения от пользователя
+    win = _proj_meta.get("publicidade_csv_window") or None
+    csv_window_from = None
+    csv_window_to = None
+    if isinstance(win, dict):
+        try:
+            if win.get("from"):
+                csv_window_from = _dt.strptime(str(win["from"])[:10], "%Y-%m-%d").date()
+            if win.get("to"):
+                csv_window_to = _dt.strptime(str(win["to"])[:10], "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            csv_window_from = None
+            csv_window_to = None
+    csv_window_out = None
+    if csv_window_from and csv_window_to:
+        csv_window_out = {
+            "from": csv_window_from.isoformat(),
+            "to": csv_window_to.isoformat(),
+        }
+
+    # Fatura windows: [anchor-29, anchor]
+    fatura_windows: list = []
+    for r in fatura_by_file.values():
+        anchor = r.get("anchor_date") or r.get("ate")
+        if not anchor:
+            continue
+        w_end = anchor
+        w_start = anchor - _td(days=FATURA_BILLING_DAYS - 1)
+        if launch_date and w_start < launch_date:
+            w_start = launch_date
+        if w_start > w_end:
+            continue
+        fatura_windows.append((w_start, w_end))
+
+    pub_csv_days: list = []
+    pub_fatura_days: list = []
+    pub_uncovered_days: list = []
+
+    cur = period_from
+    while cur <= period_to:
+        if launch_date and cur < launch_date:
+            cur += _td(days=1)
+            continue
+        # CSV с учётом window
+        in_win = True
+        if csv_window_from and cur < csv_window_from:
+            in_win = False
+        if csv_window_to and cur > csv_window_to:
+            in_win = False
+        if in_win and cur in csv_days_raw:
+            pub_csv_days.append(cur)
+            cur += _td(days=1)
+            continue
+        # Fatura
+        covered_by_fatura = any(ws <= cur <= we for ws, we in fatura_windows)
+        if covered_by_fatura:
+            pub_fatura_days.append(cur)
+            cur += _td(days=1)
+            continue
+        pub_uncovered_days.append(cur)
+        cur += _td(days=1)
+
+    # ── Armazenagem ────────────────────────────────────────────────────────
+    arm_csv_days: list = []
+    arm_uncovered_days: list = []
+    arm_raw_dates: set = set()
+    try:
+        df = load_armazenagem_report()
+    except Exception:
+        df = None
+    if df is not None and not df.empty:
+        daily_cols = df.attrs.get("__daily_cols") or []
+        # Берём только даты, где есть хотя бы один SKU проекта со значением > 0
+        proj_df = df[df["__project"] == project] if "__project" in df.columns else df.iloc[0:0]
+        for col in daily_cols:
+            try:
+                dd, mm, yyyy = col.split("/")
+                d = _dt(int(yyyy), int(mm), int(dd)).date()
+            except (ValueError, TypeError):
+                continue
+            if proj_df.empty:
+                continue
+            if (proj_df[col] > 0).any():
+                arm_raw_dates.add(d)
+
+    arm_raw_range = None
+    if arm_raw_dates:
+        arm_raw_range = {
+            "from": min(arm_raw_dates).isoformat(),
+            "to": max(arm_raw_dates).isoformat(),
+        }
+
+    cur = period_from
+    while cur <= period_to:
+        if launch_date and cur < launch_date:
+            cur += _td(days=1)
+            continue
+        if cur in arm_raw_dates:
+            arm_csv_days.append(cur)
+        else:
+            arm_uncovered_days.append(cur)
+        cur += _td(days=1)
+
+    return {
+        "project": project.upper(),
+        "period_from": period_from.isoformat(),
+        "period_to": period_to.isoformat(),
+        "launch_date": launch_date.isoformat() if launch_date else None,
+        "publicidade": {
+            "csv_segments": _segments_from_days(pub_csv_days),
+            "fatura_segments": _segments_from_days(pub_fatura_days),
+            "uncovered_segments": _segments_from_days(pub_uncovered_days),
+            "csv_raw_range": csv_raw_range,
+            "csv_window": csv_window_out,
+        },
+        "armazenagem": {
+            "csv_segments": _segments_from_days(arm_csv_days),
+            "uncovered_segments": _segments_from_days(arm_uncovered_days),
+            "csv_raw_range": arm_raw_range,
+        },
     }
 
 

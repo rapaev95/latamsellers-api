@@ -196,6 +196,8 @@ _PROJECT_EDITABLE_KEYS = frozenset({
     "manual_publicidade", "ff_manual",
     "storage_mode", "aluguel_mensal",
     "tax_regime", "simples_anexo",  # Brazilian tax regime + Simples anexo
+    "billing_cycle_day",             # int 1..28 — день закрытия цикла Mercado Ads
+    "publicidade_csv_window",        # {from: ISO, to: ISO} | None — сужение CSV-окна
 })
 
 _VALID_TAX_REGIMES = frozenset({"", "simples_nacional", "lucro_presumido"})
@@ -263,6 +265,30 @@ def update_project(
             if s not in _VALID_SIMPLES_ANEXOS:
                 continue
             p[key] = s or None
+            continue
+        if key == "billing_cycle_day":
+            if val is None or val == "":
+                p[key] = None
+            else:
+                try:
+                    d = int(val)
+                    p[key] = d if 1 <= d <= 28 else None
+                except (TypeError, ValueError):
+                    p[key] = None
+            continue
+        if key == "publicidade_csv_window":
+            # None | {"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}
+            if val is None or val == "":
+                p[key] = None
+            elif isinstance(val, dict):
+                f = str(val.get("from") or "").strip()[:10]
+                t = str(val.get("to") or "").strip()[:10]
+                if f and t:
+                    p[key] = {"from": f, "to": t}
+                else:
+                    p[key] = None
+            else:
+                p[key] = None
             continue
         p[key] = val
 

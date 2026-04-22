@@ -35,6 +35,7 @@ from v2.schemas.finance import (
     MonthlyPlanOut, RecurringSuggestionsOut,
     PublicidadeInvoiceIn, PublicidadeInvoicesListOut,
     PublicidadeReconciliationOut,
+    CoverageOut,
     RentalPaymentIn, RentalPaymentsListOut,
 )
 from v2.storage import uploads_storage
@@ -1249,9 +1250,21 @@ def _publicidade_list_response(project: str) -> dict[str, Any]:
     items = list_publicidade_invoices(project)
     proj_meta = (load_projects() or {}).get(project.upper(), {}) or {}
     launch_date = proj_meta.get("launch_date") or None
+    cycle_day = proj_meta.get("billing_cycle_day")
+    try:
+        cycle_day = int(cycle_day) if cycle_day is not None else None
+    except (TypeError, ValueError):
+        cycle_day = None
+    window = proj_meta.get("publicidade_csv_window") or None
+    if isinstance(window, dict) and window.get("from") and window.get("to"):
+        window_out = {"from": str(window["from"])[:10], "to": str(window["to"])[:10]}
+    else:
+        window_out = None
     return {
         "project": project.upper(),
         "launch_date": launch_date,
+        "billing_cycle_day": cycle_day,
+        "publicidade_csv_window": window_out,
         "invoices": [
             {
                 "index": i,
@@ -1286,17 +1299,44 @@ def add_publicidade(
 ) -> dict[str, Any]:
     """Append one fatura entry to a project's manual_publicidade list.
 
-    Схема (новая): {date, valor, note}. Фатура = anchor-дата закрытия цикла ML.
+    Схема:
+      - `date` (YYYY-MM-DD) — явный anchor (legacy путь или ручное переопределение)
+      - `month` (YYYY-MM) — месяц фатуры, день берётся из project.billing_cycle_day
     Окно [date-29, date] и daily rate = valor/30 считаются в `get_publicidade_by_period`.
     """
     _bind_user(user)
     from v2.legacy.reports import add_publicidade_invoice as _add
+    from v2.legacy.config import load_projects
 
-    date_str = entry.date.strip()
+    date_str = (entry.date or "").strip()
+    month_str = (entry.month or "").strip()
+
+    if not date_str and month_str:
+        # Выводим дату из month + project.billing_cycle_day
+        proj_meta = (load_projects() or {}).get(project.upper(), {}) or {}
+        cycle_day = proj_meta.get("billing_cycle_day")
+        try:
+            cycle_day = int(cycle_day) if cycle_day is not None else None
+        except (TypeError, ValueError):
+            cycle_day = None
+        if not cycle_day or not (1 <= cycle_day <= 28):
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "cycle_day_not_set", "message": "project.billing_cycle_day is required when only month is provided"},
+            )
+        try:
+            datetime.strptime(month_str, "%Y-%m")
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "bad_month_format", "message": "expected YYYY-MM"},
+            )
+        date_str = f"{month_str}-{cycle_day:02d}"
+
     if not date_str:
         raise HTTPException(
             status_code=400,
-            detail={"error": "bad_date", "message": "date must be ISO YYYY-MM-DD"},
+            detail={"error": "bad_date", "message": "provide `date` (YYYY-MM-DD) or `month` (YYYY-MM)"},
         )
     try:
         datetime.strptime(date_str, "%Y-%m-%d")
@@ -1519,6 +1559,33 @@ def get_publicidade_reconciliation(
         "uncovered_days_fatura": int(fatura_data.get("uncovered_days") or 0),
         "total_days": int(csv_data.get("total_days") or 0),
     }
+
+
+@router.get("/coverage", response_model=CoverageOut)
+def get_coverage_endpoint(
+    project: str = Query(...),
+    period_from: str = Query(..., alias="from"),
+    period_to: str = Query(..., alias="to"),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Покрытие источниками данных (publicidade + armazenagem) за период.
+
+    Возвращает сегменты дней, покрытых CSV / fatura / uncovered — для таймлайна.
+    `csv_raw_range` — весь реальный охват CSV (до сужения слайдером),
+    `csv_window` — пользовательское сужение из project.publicidade_csv_window.
+    """
+    _bind_user(user)
+    from v2.legacy.reports import get_coverage
+
+    try:
+        pf = datetime.strptime(period_from, "%Y-%m-%d").date()
+        pt = datetime.strptime(period_to, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bad_date_format_expected_YYYY-MM-DD")
+    if pf > pt:
+        raise HTTPException(status_code=400, detail="period_from_after_period_to")
+
+    return get_coverage(project.upper(), pf, pt)
 
 
 # ── Planned Payments / DDS Planning ─────────────────────────────────────────
