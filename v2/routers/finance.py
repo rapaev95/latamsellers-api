@@ -33,10 +33,14 @@ from v2.schemas.finance import (
     ManualCashflowEntryIn, ManualCashflowEntriesOut,
     PlannedPaymentIn, PlannedPaymentsOut, PlannedPaymentMutOut,
     MonthlyPlanOut, RecurringSuggestionsOut,
+    MarkPaidIn,
     PublicidadeInvoiceIn, PublicidadeInvoicesListOut,
     PublicidadeReconciliationOut,
     CoverageOut,
     RentalPaymentIn, RentalPaymentsListOut,
+    LoanIn, LoanOut, LoansListOut, LoanMutOut,
+    DividendIn, DividendOut, DividendsListOut, DividendMutOut,
+    APListOut,
 )
 from v2.storage import uploads_storage
 
@@ -134,7 +138,7 @@ def get_reports(
 
     # Lazy imports — only pay the cost when /reports is actually called
     from v2.legacy.finance import compute_pnl, compute_cashflow, compute_balance
-    from v2.legacy.reports import load_vendas_ml_report
+    from v2.legacy.reports import load_vendas_ml_report, has_1yr_bank_statements
 
     out: dict[str, Any] = {
         "project": project,
@@ -166,10 +170,16 @@ def get_reports(
             cumul_start = rp_start
     cumul_start = cumul_start or pf
 
+    # Проверяем, есть ли ≥12 мес. банк-выписок — это разрешает применить
+    # прогрессивный Simples Anexo I (RBT12). Иначе compute_das откатится
+    # на faixa 1 nominal. Флаг `ml_only_revenue` на проекте даёт такое же
+    # разрешение (см. legacy/tax_brazil.compute_das).
+    has_1yr = has_1yr_bank_statements()
+
     results = _run_parallel_with_timeout({
-        "pnl": lambda: compute_pnl(project, (pf, pt), basis=basis),
+        "pnl": lambda: compute_pnl(project, (pf, pt), basis=basis, has_1yr_bank_data=has_1yr),
         "cashflow": lambda: compute_cashflow(project, (cumul_start, today)),
-        "balance": lambda: compute_balance(project, today, basis=basis),
+        "balance": lambda: compute_balance(project, today, basis=basis, has_1yr_bank_data=has_1yr),
     })
 
     pnl_res, pnl_err = results["pnl"]
@@ -1664,3 +1674,141 @@ def get_recurring_suggestions(
     from v2.legacy.planning import detect_recurring_from_bank_sync
     items = detect_recurring_from_bank_sync(user.id, min_occurrences)
     return {"suggestions": items, "min_occurrences": min_occurrences}
+
+
+# ── Loans (Balance sheet Liabilities) ───────────────────────────────────────
+
+@router.get("/loans", response_model=LoansListOut)
+def list_loans_endpoint(
+    project: str = Query(...),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    _bind_user(user)
+    from v2.legacy.capital import load_loans, loans_balance
+    items = load_loans(project)
+    return {
+        "project": project.upper(),
+        "loans": items,
+        "total_outstanding_brl": loans_balance(project, None),
+    }
+
+
+@router.post("/loans", response_model=LoanMutOut)
+def create_loan(
+    body: LoanIn,
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    _bind_user(user)
+    from v2.legacy.capital import add_loan
+    row = add_loan(body.model_dump())
+    return {"updated": True, "loan": row}
+
+
+@router.put("/loans/{loan_id}", response_model=LoanMutOut)
+def put_loan(
+    loan_id: int,
+    body: LoanIn,
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    _bind_user(user)
+    from v2.legacy.capital import update_loan, load_loans
+    ok = update_loan(loan_id, body.model_dump())
+    if not ok:
+        raise HTTPException(status_code=404, detail="loan_not_found")
+    row = next((it for it in load_loans() if int(it.get("id") or -1) == loan_id), None)
+    return {"updated": True, "loan": row}
+
+
+@router.delete("/loans/{loan_id}", response_model=LoanMutOut)
+def remove_loan(
+    loan_id: int,
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    _bind_user(user)
+    from v2.legacy.capital import delete_loan
+    ok = delete_loan(loan_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="loan_not_found")
+    return {"deleted": True}
+
+
+# ── Dividends (Equity reductions) ───────────────────────────────────────────
+
+@router.get("/dividends", response_model=DividendsListOut)
+def list_dividends_endpoint(
+    project: str = Query(...),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    _bind_user(user)
+    from v2.legacy.capital import load_dividends, dividends_total
+    items = load_dividends(project)
+    return {
+        "project": project.upper(),
+        "dividends": items,
+        "total_amount_brl": dividends_total(project, None),
+    }
+
+
+@router.post("/dividends", response_model=DividendMutOut)
+def create_dividend(
+    body: DividendIn,
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    _bind_user(user)
+    from v2.legacy.capital import add_dividend
+    row = add_dividend(body.model_dump())
+    return {"updated": True, "dividend": row}
+
+
+@router.delete("/dividends/{dividend_id}", response_model=DividendMutOut)
+def remove_dividend(
+    dividend_id: int,
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    _bind_user(user)
+    from v2.legacy.capital import delete_dividend
+    ok = delete_dividend(dividend_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="dividend_not_found")
+    return {"deleted": True}
+
+
+# ── Accounts Payable (feeds from planned_payments) ──────────────────────────
+
+@router.get("/accounts-payable", response_model=APListOut)
+def list_accounts_payable(
+    project: str = Query(...),
+    as_of: Optional[str] = Query(None, description="ISO YYYY-MM-DD; default: today"),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Unpaid expense planned_payments with date <= as_of. Feeds Balance sheet."""
+    _bind_user(user)
+    from v2.legacy.planning import list_unpaid_ap, unpaid_ap_total
+    as_of_date = _parse_iso(as_of) or date.today()
+    items = list_unpaid_ap(project, as_of_date)
+    return {
+        "project": project.upper(),
+        "as_of": as_of_date.isoformat(),
+        "items": items,
+        "total_brl": unpaid_ap_total(project, as_of_date),
+    }
+
+
+@router.post("/planned-payments/{payment_id}/mark-paid", response_model=PlannedPaymentMutOut)
+def mark_planned_paid_endpoint(
+    payment_id: int,
+    body: MarkPaidIn,
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Toggle the paid status on a planned_payment row. UI: «Marcar como paga»."""
+    _bind_user(user)
+    from v2.legacy.planning import mark_paid, load_payments
+    if body.paid is False:
+        stamp = False  # clear flag → marks unpaid
+    else:
+        stamp = body.paid_at  # None → stamp now; explicit ISO → that timestamp
+    ok = mark_paid(payment_id, stamp)
+    if not ok:
+        raise HTTPException(status_code=404, detail="payment_not_found")
+    row = next((p for p in load_payments() if int(p.get("id") or -1) == payment_id), None)
+    return {"updated": True, "payment": row}

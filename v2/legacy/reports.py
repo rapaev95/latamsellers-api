@@ -5150,3 +5150,52 @@ def estonia_opiu_monthly_to_dataframe(opiu_est: dict) -> pd.DataFrame:
             rows.append({"Mes": month, "Invoices": 0, "Bruto": 0,
                          "Comissao (receita)": 0, "DAS (imposto)": 0, "Lucro mes": 0})
     return pd.DataFrame(rows)
+
+# ── Bank-statement coverage gate (for progressive DAS) ─────────────────────
+
+def has_1yr_bank_statements(user_id: int | None = None) -> bool:
+    """True if the user has uploaded bank extracts spanning >= 12 months.
+
+    Gates the progressive Simples Nacional DAS in compute_das(): without 12+
+    months of banking history, RBT12 cannot be reconstructed from extrato and
+    we fall back to faixa 1 nominal to avoid under-stating the tax.
+
+    Bank source_keys checked: extrato_mp, extrato_nubank, extrato_c6_brl,
+    extrato_c6_usd. `file_bytes IS NOT NULL` guards against soft-deleted rows.
+    """
+    from datetime import datetime, timedelta, timezone
+    from .db_storage import _get_db, _put_db, _current_user_id
+    uid = user_id or _current_user_id()
+    if uid is None:
+        return False
+    conn = _get_db()
+    if conn is None:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT MIN(created_at)
+              FROM uploads
+             WHERE user_id = %s
+               AND source_key IN (
+                   'extrato_mp', 'extrato_nubank',
+                   'extrato_c6_brl', 'extrato_c6_usd'
+               )
+               AND file_bytes IS NOT NULL
+            """,
+            (uid,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        if not row or row[0] is None:
+            return False
+        min_dt = row[0]
+        if min_dt.tzinfo is None:
+            min_dt = min_dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - min_dt) >= timedelta(days=365)
+    except Exception:
+        return False
+    finally:
+        _put_db(conn)
+
