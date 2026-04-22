@@ -1129,6 +1129,11 @@ def compute_balance(
                 inv_date = None
         if inv_date is None or inv_date > as_of:
             continue
+        # "Тестовая закупка" для usdt_investments — тот же флаг что и для
+        # partner_contributions: остаётся в ДДС как inflow_usdt_brl, но не
+        # считается инвестицией для MOIC/NAV.
+        if bool(inv.get("test_only")):
+            continue
         amt_brl = float(inv.get("brl", 0) or 0)
         if amt_brl > 0:
             contributions.append({"date": inv_date, "brl": amt_brl, "kind": "usdt"})
