@@ -279,8 +279,12 @@ def compute_pnl(
     r_gross = r_net = r_tv = r_cnc = 0.0
     d_count = 0
     r_count = 0
-    # SKU → qty (только delivered; returned вернулся на склад, не COGS)
+    # SKU → qty (только delivered; returned вернулся на склад, не COGS).
+    # Плюс SKU → MLB mapping: нужен для MLB-fallback lookup в catalog, когда
+    # внутренние коды SKU (sumka5-1, w02-1) не совпадают с Dados-Fiscais SKU
+    # (HB50173-9), но оба ссылаются на одно ML-объявление.
     sku_qty: dict[str, int] = {}
+    sku_mlbs: dict[str, str] = {}
     period_start, period_end = period
     if df is not None and not df.empty:
         for _, row in df.iterrows():
@@ -310,6 +314,13 @@ def compute_pnl(
                         _u = 0
                     if _u > 0:
                         sku_qty[_sku] = sku_qty.get(_sku, 0) + _u
+                        # MLB mapping для fallback
+                        if _sku not in sku_mlbs:
+                            _mlb = str(row.get("# de anúncio")
+                                       or row.get("# de anuncio")
+                                       or "").strip()
+                            if _mlb:
+                                sku_mlbs[_sku] = _mlb
             else:
                 r_gross += g
                 r_net += n
@@ -441,11 +452,16 @@ def compute_pnl(
     operating_profit = revenue_net - opex_total
 
     # ── COGS из Dados Fiscais (sku_catalog.unit_cost_brl) ────────────────
-    # Для каждого SKU доставленных единиц: если есть unit_cost_brl в каталоге
-    # → умножаем на qty; иначе добавляем SKU в cogs_missing_skus. Поле
-    # `avg_cost_per_unit_brl` на проекте используется как fallback для SKUs
-    # без явной стоимости (legacy-проекты вроде ARTUR).
-    from .sku_catalog import load_catalog, normalize_sku
+    # Porядок lookup cost для каждого SKU (тот же что в assess_stock_for_project
+    # на балансе, чтобы ОПиУ и Balance показывали согласованный missing-список):
+    #   1) catalog[normalize_sku(sku)] — прямое совпадение кода
+    #   2) catalog_mlb_index[normalize_mlb(sku_mlbs[sku])] — fallback через MLB
+    #      (закрывает кейс "sumka5-1 в vendas / HB50173 в Dados Fiscais").
+    #   3) avg_cost_per_unit_brl на проекте (legacy fallback для ARTUR).
+    #   4) SKU попадает в cogs_missing_skus.
+    from .sku_catalog import (
+        build_catalog_index, build_catalog_mlb_index, normalize_sku, _normalize_mlb,
+    )
     proj_meta = get_project_meta(project)
     legacy_avg_cost = proj_meta.get("avg_cost_per_unit_brl")
     try:
@@ -453,28 +469,37 @@ def compute_pnl(
     except (ValueError, TypeError):
         legacy_avg_cost = None
 
-    catalog_index: dict[str, dict] = {}
-    try:
-        for it in load_catalog():
-            key = normalize_sku(str(it.get("sku") or ""))
-            if key:
-                catalog_index[key] = it
-    except Exception:
-        pass
+    catalog_index = build_catalog_index()
+    catalog_mlb_index = build_catalog_mlb_index()
 
     cogs_total = 0.0
     cogs_missing_skus: list[str] = []
     cogs_missing_units = 0
     unit_cost_per_sku: dict[str, float] = {}
     for sku, qty in sku_qty.items():
+        # Step 1: прямой lookup по SKU
         key = normalize_sku(sku)
-        cat = catalog_index.get(key) or {}
-        raw_cost = cat.get("unit_cost_brl")
+        row = catalog_index.get(key) or {}
+        raw_cost = row.get("unit_cost_brl")
         try:
             unit_cost = float(raw_cost) if raw_cost is not None else None
         except (ValueError, TypeError):
             unit_cost = None
         if not unit_cost or unit_cost <= 0:
+            unit_cost = None
+            # Step 2: MLB fallback
+            mlb_norm = _normalize_mlb(sku_mlbs.get(sku, ""))
+            if mlb_norm:
+                mrow = catalog_mlb_index.get(mlb_norm) or {}
+                raw_mlb_cost = mrow.get("unit_cost_brl")
+                try:
+                    mlb_cost = float(raw_mlb_cost) if raw_mlb_cost is not None else None
+                except (ValueError, TypeError):
+                    mlb_cost = None
+                if mlb_cost and mlb_cost > 0:
+                    unit_cost = mlb_cost
+        if not unit_cost or unit_cost <= 0:
+            # Step 3: legacy avg_cost_per_unit_brl
             unit_cost = legacy_avg_cost if (legacy_avg_cost and legacy_avg_cost > 0) else None
         if unit_cost and unit_cost > 0:
             cogs_total += unit_cost * qty
