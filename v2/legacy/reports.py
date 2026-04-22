@@ -1525,6 +1525,22 @@ def _load_vendas_from_db_sync(user_id: int) -> "pd.DataFrame | None":
 _VENDAS_DF_CACHE: dict = {}  # {(user_id, fingerprint): (timestamp, df)}
 _VENDAS_DF_TTL = 120  # seconds
 
+# Кеш помесячной P&L-матрицы: ключ (user_id, project, fingerprint) — тот же
+# fingerprint что и у vendas, т.к. матрица строится из vendas + publicidade +
+# armazenagem. TTL 300s — расчёт дорогой по CPU.
+_MATRIX_CACHE: dict = {}     # {(user_id, project, fingerprint): (timestamp, result)}
+_MATRIX_CACHE_TTL = 300
+
+
+def invalidate_matrix_cache(user_id: int | None = None) -> None:
+    """Сбросить кеш matrix для пользователя (или всех если user_id=None)."""
+    if user_id is None:
+        _MATRIX_CACHE.clear()
+        return
+    for k in list(_MATRIX_CACHE.keys()):
+        if k[0] == user_id:
+            _MATRIX_CACHE.pop(k, None)
+
 
 def _vendas_fingerprint_db(user_id: int) -> str | None:
     """Cheap probe of the newest vendas upload for this user — used as cache key
@@ -1552,13 +1568,18 @@ def _vendas_fingerprint_db(user_id: int) -> str | None:
 
 
 def invalidate_vendas_cache(user_id: int | None = None) -> None:
-    """Clear cached DataFrame for one user (or all users if user_id is None)."""
+    """Clear cached DataFrame for one user (or all users if user_id is None).
+
+    Также сбрасывает matrix-кеш, т.к. он построен поверх vendas.
+    """
     if user_id is None:
         _VENDAS_DF_CACHE.clear()
+        _MATRIX_CACHE.clear()
         return
     for k in list(_VENDAS_DF_CACHE.keys()):
         if k[0] == user_id:
             _VENDAS_DF_CACHE.pop(k, None)
+    invalidate_matrix_cache(user_id)
 
 
 def load_vendas_ml_report() -> "pd.DataFrame | None":
@@ -2166,6 +2187,31 @@ def delete_publicidade_invoice(project: str, index: int) -> bool:
     return True
 
 
+def update_publicidade_invoice(project: str, index: int, patch: dict) -> bool:
+    """Обновить поля фатуры по индексу. Принимаемые поля: date, valor, note."""
+    from .config import load_projects, save_projects, _invalidate_projects_cache
+    projects = load_projects() or {}
+    pid = project.upper()
+    lst = (projects.get(pid) or {}).get("manual_publicidade")
+    if not isinstance(lst, list) or index < 0 or index >= len(lst):
+        return False
+    entry = dict(lst[index])
+    if "date" in patch and patch["date"]:
+        entry["date"] = str(patch["date"])[:10]
+    if "valor" in patch and patch["valor"] is not None:
+        try:
+            entry["valor"] = float(patch["valor"])
+        except (TypeError, ValueError):
+            pass
+    if "note" in patch:
+        entry["note"] = str(patch["note"] or "")
+    lst[index] = entry
+    projects[pid]["manual_publicidade"] = lst
+    save_projects(projects)
+    _invalidate_projects_cache()
+    return True
+
+
 _ORPHAN_DB_KEY = "f2_orphan_assignments"
 
 
@@ -2723,8 +2769,10 @@ def parse_publicidade_reports() -> list[dict]:
                 continue
             note = item.get("note", "")
             # Фатура представлена как одна anchor-дата; окно вычисляется в get_publicidade_by_period.
+            # В file_name включаем anchor-дату, чтобы разные фатуры одного проекта
+            # с одинаковой (или пустой) note не затирали друг друга в dict-ах.
             result.append({
-                "file_name": f"manual:{proj_name}:{note}",
+                "file_name": f"manual:{proj_name}:{anchor.isoformat()}:{note}",
                 "desde": anchor,        # сжатое представление: desde = ate = anchor
                 "ate": anchor,
                 "project": proj_name,
@@ -2828,36 +2876,49 @@ def get_publicidade_by_period(project: str, period_from, period_to, only: str = 
             "rows": frows,
         }
 
-    # Метаданные фатур: окно [anchor - 29, anchor]
+    # Метаданные фатур: окно [prev_anchor+1, anchor] — сшиваем последовательные
+    # фатуры без разрывов (ML-циклы 28/29/30/31 день в зависимости от месяца).
+    # Первая fatura получает стандартное 30-дневное окно [anchor-29, anchor].
+    # daily_rate = valor / window_days (не фиксированное /30) чтобы корректно
+    # растянуть сумму по реальному числу дней окна.
     fatura_meta: dict = {}
-    for fname, r in fatura_by_file.items():
-        anchor = r.get("anchor_date") or r.get("ate")
-        if not anchor:
-            continue
+    fatura_items = [
+        (fname, r, r.get("anchor_date") or r.get("ate"))
+        for fname, r in fatura_by_file.items()
+    ]
+    fatura_items = [x for x in fatura_items if x[2] is not None]
+    fatura_items.sort(key=lambda x: x[2])  # по anchor
+    prev_anchor = None
+    for fname, r, anchor in fatura_items:
         window_end = anchor
-        window_start = anchor - _td(days=FATURA_BILLING_DAYS - 1)
+        if prev_anchor is not None:
+            window_start = prev_anchor + _td(days=1)
+        else:
+            window_start = anchor - _td(days=FATURA_BILLING_DAYS - 1)
         if launch_date and window_start < launch_date:
             window_start = launch_date
         if window_start > window_end:
-            # Всё окно до launch_date — вклад 0
             fatura_meta[fname] = {
                 "desde": window_start,
                 "ate": window_end,
                 "anchor": anchor,
                 "total_days": FATURA_BILLING_DAYS,
-                "daily_rate": 0.0,   # заморозка: всё окно пред-запуска
+                "daily_rate": 0.0,
                 "row": r,
                 "skipped_reason": "окно фатуры до launch_date",
             }
+            prev_anchor = anchor
             continue
+        total_days = (window_end - window_start).days + 1
         fatura_meta[fname] = {
             "desde": window_start,
             "ate": window_end,
             "anchor": anchor,
-            "total_days": FATURA_BILLING_DAYS,
-            "daily_rate": r["investimento"] / FATURA_BILLING_DAYS,
+            "total_days": total_days,
+            "daily_rate": r["investimento"] / total_days if total_days > 0 else 0.0,
             "row": r,
         }
+        prev_anchor = anchor
 
     # Фильтрация по only
     if only == "csv":
@@ -2909,6 +2970,22 @@ def get_publicidade_by_period(project: str, period_from, period_to, only: str = 
         # Непокрыт
         uncovered += 1
         cur = cur + _td(days=1)
+
+    # Пост-обработка: если проект помечен publicidade_fill_avg — заполняем
+    # непокрытые дни средним дневным rate (по всем уже покрытым дням).
+    fill_avg = bool(_proj_meta.get("publicidade_fill_avg") or False)
+    if fill_avg and day_value:
+        avg_rate = sum(day_value.values()) / max(1, len(day_value))
+        cur = period_from
+        while cur <= period_to:
+            if launch_date and cur < launch_date:
+                cur = cur + _td(days=1)
+                continue
+            if cur not in day_source:
+                day_source[cur] = "__avg_fill__"
+                day_value[cur] = avg_rate
+                uncovered = max(0, uncovered - 1)
+            cur = cur + _td(days=1)
 
     # Агрегация по файлу
     file_days_used: dict = {}
@@ -3117,19 +3194,31 @@ def get_coverage(project: str, period_from, period_to) -> dict:
             "to": csv_window_to.isoformat(),
         }
 
-    # Fatura windows: [anchor-29, anchor]
+    # Fatura windows. По умолчанию — [anchor-29, anchor] (30 дней).
+    # Но если есть предыдущая fatura — тянем начало текущей от (prev_anchor+1),
+    # чтобы сшить месячные циклы без разрывов/перекрытий (28/29/30/31-дневные
+    # месяцы ML закрывает в один и тот же день, без "пустых" суток между ними).
+    anchors_sorted = sorted(
+        (r.get("anchor_date") or r.get("ate")) for r in fatura_by_file.values()
+        if (r.get("anchor_date") or r.get("ate"))
+    )
     fatura_windows: list = []
-    for r in fatura_by_file.values():
-        anchor = r.get("anchor_date") or r.get("ate")
-        if not anchor:
-            continue
+    prev_anchor = None
+    for anchor in anchors_sorted:
         w_end = anchor
-        w_start = anchor - _td(days=FATURA_BILLING_DAYS - 1)
+        if prev_anchor is not None:
+            # Сшиваем: эта fatura начинается на следующий день после предыдущей
+            w_start = prev_anchor + _td(days=1)
+        else:
+            # Первая fatura — стандартное 30-дневное окно назад
+            w_start = anchor - _td(days=FATURA_BILLING_DAYS - 1)
         if launch_date and w_start < launch_date:
             w_start = launch_date
         if w_start > w_end:
+            prev_anchor = anchor
             continue
         fatura_windows.append((w_start, w_end))
+        prev_anchor = anchor
 
     pub_csv_days: list = []
     pub_fatura_days: list = []
@@ -3200,6 +3289,22 @@ def get_coverage(project: str, period_from, period_to) -> dict:
             arm_uncovered_days.append(cur)
         cur += _td(days=1)
 
+    # Флаги "усреднить непокрытые дни": если true, uncovered_segments
+    # превращаются в avg_segments (с точки зрения UI — отдельный цвет;
+    # с точки зрения P&L — дни получают средний rate, см. compute_pnl).
+    pub_fill_avg = bool(_proj_meta.get("publicidade_fill_avg") or False)
+    arm_fill_avg = bool(_proj_meta.get("armazenagem_fill_avg") or False)
+
+    pub_avg_days: list = []
+    if pub_fill_avg and pub_uncovered_days:
+        pub_avg_days = pub_uncovered_days
+        pub_uncovered_days = []
+
+    arm_avg_days: list = []
+    if arm_fill_avg and arm_uncovered_days:
+        arm_avg_days = arm_uncovered_days
+        arm_uncovered_days = []
+
     return {
         "project": project.upper(),
         "period_from": period_from.isoformat(),
@@ -3209,13 +3314,17 @@ def get_coverage(project: str, period_from, period_to) -> dict:
             "csv_segments": _segments_from_days(pub_csv_days),
             "fatura_segments": _segments_from_days(pub_fatura_days),
             "uncovered_segments": _segments_from_days(pub_uncovered_days),
+            "avg_segments": _segments_from_days(pub_avg_days),
             "csv_raw_range": csv_raw_range,
             "csv_window": csv_window_out,
+            "fill_avg": pub_fill_avg,
         },
         "armazenagem": {
             "csv_segments": _segments_from_days(arm_csv_days),
             "uncovered_segments": _segments_from_days(arm_uncovered_days),
+            "avg_segments": _segments_from_days(arm_avg_days),
             "csv_raw_range": arm_raw_range,
+            "fill_avg": arm_fill_avg,
         },
     }
 
@@ -3468,8 +3577,12 @@ def load_armazenagem_report() -> "pd.DataFrame | None":
 
 
 def get_armazenagem_by_period(project: str, period_from, period_to) -> dict:
-    """Сумма дневных стоимостей armazenagem для проекта в дни period."""
-    from datetime import datetime as _dt
+    """Сумма дневных стоимостей armazenagem для проекта в дни period.
+
+    Если в проекте стоит armazenagem_fill_avg=True — непокрытые дни
+    периода заполняются средним дневным rate (Σ / days_covered).
+    """
+    from datetime import datetime as _dt, timedelta as _td2
     df = load_armazenagem_report()
     if df is None or df.empty:
         return {"total": 0.0, "days_in_period": 0, "skus_count": 0, "source_file": ""}
@@ -3495,6 +3608,25 @@ def get_armazenagem_by_period(project: str, period_from, period_to) -> dict:
     for c in relevant_cols:
         if c in sub.columns:
             total += float(pd.to_numeric(sub[c], errors="coerce").fillna(0).sum())
+
+    # Усреднение непокрытых дней
+    from .config import load_projects as _lp
+    _pm = (_lp() or {}).get(project.upper(), {}) or {}
+    if bool(_pm.get("armazenagem_fill_avg") or False) and relevant_cols:
+        avg_rate = total / max(1, len(relevant_cols))
+        total_days_in_period = (period_to - period_from).days + 1
+        # Учёт launch_date — до запуска не дорисовываем
+        _ls = _pm.get("launch_date")
+        launch_d = None
+        if _ls:
+            try:
+                launch_d = _dt.strptime(str(_ls)[:10], "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                launch_d = None
+        effective_start = max(period_from, launch_d) if launch_d else period_from
+        effective_days = max(0, (period_to - effective_start).days + 1)
+        uncovered_days = max(0, effective_days - len(relevant_cols))
+        total = total + avg_rate * uncovered_days
 
     return {
         "total": total,
@@ -4393,7 +4525,40 @@ def build_monthly_pnl_matrix(project: str) -> dict:
         "years": ["2025", "2026"],
         "rows": [{"label": ..., "section": ..., "values": {month: float}, "total": float}],
     }
+
+    Кешируется per-user per-project по fingerprint последнего vendas-upload;
+    инвалидируется при новом upload автоматически (другой fingerprint → cache miss)
+    или по TTL (5 мин).
     """
+    import time as _time
+    try:
+        from .db_storage import _current_user_id
+        uid = _current_user_id()
+    except Exception:
+        uid = None
+    fp = None
+    if uid is not None:
+        try:
+            fp = _vendas_fingerprint_db(uid)
+        except Exception:
+            fp = None
+    cache_key = (uid, project.upper(), fp) if uid is not None and fp is not None else None
+    if cache_key is not None:
+        hit = _MATRIX_CACHE.get(cache_key)
+        if hit is not None:
+            ts, cached = hit
+            if (_time.time() - ts) < _MATRIX_CACHE_TTL:
+                return cached
+            _MATRIX_CACHE.pop(cache_key, None)
+
+    result = _build_monthly_pnl_matrix_impl(project)
+    if cache_key is not None:
+        _MATRIX_CACHE[cache_key] = (_time.time(), result)
+    return result
+
+
+def _build_monthly_pnl_matrix_impl(project: str) -> dict:
+    """Актуальный расчёт матрицы (вызывается через кеш-обёртку build_monthly_pnl_matrix)."""
     import calendar
     from datetime import date as _date
     import re as _re

@@ -1371,6 +1371,8 @@ def add_publicidade(
             detail={"error": "bad_date_format", "message": "expected YYYY-MM-DD"},
         )
 
+    if entry.valor is None:
+        raise HTTPException(status_code=400, detail={"error": "valor_required"})
     payload = {"date": date_str, "valor": float(entry.valor), "note": entry.note or ""}
     ok = _add(project, payload)
     if not ok:
@@ -1389,6 +1391,56 @@ def remove_publicidade(
     from v2.legacy.reports import delete_publicidade_invoice as _del
 
     ok = _del(project, index)
+    if not ok:
+        raise HTTPException(status_code=404, detail="entry_not_found")
+    return _publicidade_list_response(project)
+
+
+@router.patch("/publicidade/invoices", response_model=PublicidadeInvoicesListOut)
+def patch_publicidade(
+    entry: PublicidadeInvoiceIn,
+    project: str = Query(...),
+    index: int = Query(..., ge=0, description="Array index to update"),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Обновить поля существующей фатуры (valor / note / date / month).
+    Поля опциональны — что передано, то обновится."""
+    _bind_user(user)
+    from v2.legacy.reports import update_publicidade_invoice as _upd
+    from v2.legacy.config import load_projects
+
+    patch: dict[str, Any] = {}
+    if entry.valor is not None:
+        patch["valor"] = float(entry.valor)
+    if entry.note is not None:
+        patch["note"] = entry.note
+
+    date_str = (entry.date or "").strip()
+    month_str = (entry.month or "").strip()
+    if date_str:
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail={"error": "bad_date_format"})
+        patch["date"] = date_str
+    elif month_str:
+        proj_meta = (load_projects() or {}).get(project.upper(), {}) or {}
+        cycle_day = proj_meta.get("billing_cycle_day")
+        try:
+            cycle_day = int(cycle_day) if cycle_day is not None else None
+        except (TypeError, ValueError):
+            cycle_day = None
+        if cycle_day and 1 <= cycle_day <= 28:
+            try:
+                datetime.strptime(month_str, "%Y-%m")
+                patch["date"] = f"{month_str}-{cycle_day:02d}"
+            except ValueError:
+                raise HTTPException(status_code=400, detail={"error": "bad_month_format"})
+
+    if not patch:
+        raise HTTPException(status_code=400, detail={"error": "no_fields_to_update"})
+
+    ok = _upd(project, index, patch)
     if not ok:
         raise HTTPException(status_code=404, detail="entry_not_found")
     return _publicidade_list_response(project)

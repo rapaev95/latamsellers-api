@@ -569,11 +569,13 @@ class PublicidadeInvoiceIn(BaseModel):
       - если есть `date` (YYYY-MM-DD) — используется как anchor.
       - иначе если есть `month` (YYYY-MM) — anchor = month + project.billing_cycle_day.
       - если cycle_day не настроен и есть только month → 400.
+
+    Для PATCH: все поля опциональны (что прислал, то обновится).
     """
-    date: str | None = None          # ISO YYYY-MM-DD — anchor (legacy/ручной ввод)
-    month: str | None = None         # ISO YYYY-MM — месяц фатуры, день подставится из проекта
-    valor: float                     # invoice amount in BRL
-    note: str = ""
+    date: Optional[str] = None          # ISO YYYY-MM-DD — anchor (legacy/ручной ввод)
+    month: Optional[str] = None         # ISO YYYY-MM — месяц фатуры, день подставится из проекта
+    valor: Optional[float] = None       # invoice amount in BRL (optional для PATCH)
+    note: Optional[str] = None
 
 
 class PublicidadeInvoiceOut(BaseModel):
@@ -638,14 +640,18 @@ class CoveragePublicidade(BaseModel):
     csv_segments: list[CoverageRange]
     fatura_segments: list[CoverageRange]
     uncovered_segments: list[CoverageRange]
+    avg_segments: list[CoverageRange] = []      # дни, заполненные средним (если flag on)
     csv_raw_range: Optional[CoverageRange] = None
     csv_window: Optional[CoverageRange] = None
+    fill_avg: bool = False                       # текущее состояние чекбокса
 
 
 class CoverageArmazenagem(BaseModel):
     csv_segments: list[CoverageRange]
     uncovered_segments: list[CoverageRange]
+    avg_segments: list[CoverageRange] = []
     csv_raw_range: Optional[CoverageRange] = None
+    fill_avg: bool = False
 
 
 class CoverageOut(BaseModel):

@@ -198,6 +198,8 @@ _PROJECT_EDITABLE_KEYS = frozenset({
     "tax_regime", "simples_anexo",  # Brazilian tax regime + Simples anexo
     "billing_cycle_day",             # int 1..28 — день закрытия цикла Mercado Ads
     "publicidade_csv_window",        # {from: ISO, to: ISO} | None — сужение CSV-окна
+    "publicidade_fill_avg",          # bool — усреднить непокрытые дни рекламы
+    "armazenagem_fill_avg",          # bool — усреднить непокрытые дни хранения
     # Balance sheet inputs (ручной ввод через UI CapitalObligationsPanel):
     "initial_equity_brl",            # float — стартовые вложения собственника
     "das_override_pct",              # float 0..100 | None — ручной процент DAS
@@ -293,6 +295,9 @@ def update_project(
                     p[key] = None
             else:
                 p[key] = None
+            continue
+        if key in ("publicidade_fill_avg", "armazenagem_fill_avg"):
+            p[key] = bool(val)
             continue
         p[key] = val
 
