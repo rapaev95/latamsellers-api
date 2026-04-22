@@ -36,6 +36,11 @@ class PnLReportOut(BaseModel):
     net_profit: Optional[float] = None
     vendas_count: int = 0
     margin_pct: float = 0
+    # COGS diagnostics for the UI — SKUs without unit_cost_brl in sku_catalog
+    # (user needs to load Dados Fiscais or fill them manually on /finance/sku-mapping).
+    cogs_missing_skus: list[str] = []
+    cogs_missing_units: int = 0
+    unit_cost_per_sku: dict[str, float] = {}
     # DAS/Simples/LP metadata for UI badge (regime, anexo, faixa, effective %).
     # Shape: см. compute_das() в v2/legacy/tax_brazil.py.
     tax_info: Optional[dict] = None
@@ -63,9 +68,39 @@ class CashFlowReportOut(BaseModel):
 # ── Баланс ───────────────────────────────────────────────────────────────────
 
 class BalanceReportOut(BaseModel):
+    """Full accounting balance: Assets = Liabilities + Equity. `balance_delta`
+    surfaces rounding / missing-data gaps to the UI.
+
+    Legacy flow-based fields (inflow_* / outflow_*) are kept for backwards
+    compatibility with existing /pnl-matrix callers — they duplicate the new
+    structured fields and will be removed in a follow-up version.
+    """
     model_config = {"extra": "ignore"}
 
     project: str
+    as_of: Optional[str] = None              # ISO YYYY-MM-DD
+
+    # ── Assets ───────────────────────────────────────────────────────────
+    cash_brl: float = 0                      # opening + Σ cashflow until as_of
+    accounts_receivable_brl: float = 0       # always 0 in A1 model (vendas ≡ cash)
+    inventory_brl: float = 0                 # stock × unit_cost (= stock_value_brl)
+    assets_total: float = 0
+
+    # ── Liabilities ──────────────────────────────────────────────────────
+    accounts_payable_brl: float = 0          # Σ unpaid overdue planned_payments
+    loans_balance_brl: float = 0             # Σ f2_loans.outstanding_brl
+    liabilities_total: float = 0
+
+    # ── Equity ───────────────────────────────────────────────────────────
+    initial_equity_brl: float = 0            # project.initial_equity_brl
+    accumulated_profit_brl: float = 0        # Σ net_profit (launch → as_of)
+    dividends_paid_brl: float = 0            # Σ f2_dividends
+    equity_total: float = 0
+
+    # ── Reconciliation ───────────────────────────────────────────────────
+    balance_delta_brl: float = 0             # assets − (liab + equity). |Δ| > 100 → warn
+
+    # ── Legacy flow fields (kept for back-compat) ────────────────────────
     inflow_usdt_brl: float = 0
     inflow_usdt_usd: float = 0
     inflow_sales_net: float = 0
@@ -414,6 +449,7 @@ class PlannedPayment(BaseModel):
     category: str = ""
     note: str = ""
     project: Optional[str] = None
+    paid_at: Optional[str] = None           # ISO timestamp — null = pending (AP feed)
     created_at: Optional[str] = None
 
 
@@ -426,6 +462,13 @@ class PlannedPaymentIn(BaseModel):
     category: str = ""
     note: str = ""
     project: Optional[str] = None
+
+
+class MarkPaidIn(BaseModel):
+    """Toggle-paid body: `paid=true` stamps now (or uses supplied `paid_at`);
+    `paid=false` clears the flag (payment goes back to AP)."""
+    paid: bool = True
+    paid_at: Optional[str] = None           # optional explicit ISO timestamp
 
 
 class PlannedPaymentsOut(BaseModel):
@@ -597,3 +640,66 @@ class CoverageOut(BaseModel):
     launch_date: Optional[str] = None
     publicidade: CoveragePublicidade
     armazenagem: CoverageArmazenagem
+
+
+# ── Capital & Obligations (loans / dividends / AP feed) ─────────────────────
+
+class LoanIn(BaseModel):
+    project: str
+    name: str
+    principal_brl: float = 0
+    outstanding_brl: float = 0
+    monthly_payment_brl: float = 0
+    rate_pct: float = 0
+    start_date: Optional[str] = None        # ISO YYYY-MM-DD
+    closed_at: Optional[str] = None         # null = active
+    note: str = ""
+
+
+class LoanOut(LoanIn):
+    id: int
+    created_at: Optional[str] = None
+
+
+class LoansListOut(BaseModel):
+    project: str
+    loans: list[LoanOut] = []
+    total_outstanding_brl: float = 0
+
+
+class LoanMutOut(BaseModel):
+    updated: bool = False
+    deleted: bool = False
+    loan: Optional[LoanOut] = None
+
+
+class DividendIn(BaseModel):
+    project: str
+    date: str                                # ISO YYYY-MM-DD
+    amount_brl: float
+    note: str = ""
+
+
+class DividendOut(DividendIn):
+    id: int
+    created_at: Optional[str] = None
+
+
+class DividendsListOut(BaseModel):
+    project: str
+    dividends: list[DividendOut] = []
+    total_amount_brl: float = 0
+
+
+class DividendMutOut(BaseModel):
+    updated: bool = False
+    deleted: bool = False
+    dividend: Optional[DividendOut] = None
+
+
+class APListOut(BaseModel):
+    """Accounts Payable feed — unpaid planned_payments with date <= as_of."""
+    project: str
+    as_of: str                               # ISO YYYY-MM-DD
+    items: list[PlannedPayment] = []
+    total_brl: float = 0

@@ -201,34 +201,106 @@ def resolve_tax_settings(
     return merged
 
 
-def compute_das(project_meta: dict, bruto_month: float, rbt12: float) -> dict[str, Any]:
+def compute_das(
+    project_meta: dict,
+    bruto_month: float,
+    rbt12: float,
+    has_1yr_bank_data: bool = False,
+) -> dict[str, Any]:
     """Single DAS entry point.
 
-    Reads `tax_regime`, `simples_anexo`, `company_state` from project_meta.
-    Returns unified dict consumed by compute_pnl, balance, matrix, и клиентом
-    для рендера бейджа.
-
-    Backward compatibility: if tax_regime is empty/None, falls back to legacy
-    4.5% (matches historical behaviour for projects that predate this feature).
+    Priority order:
+      1. `das_override_pct` — explicit user override (any regime).
+      2. Simples Nacional progressive — applied when either flag is true:
+         - `ml_only_revenue=True` (seller doesn't have off-ML income → RBT12
+           from ML vendas is complete).
+         - `has_1yr_bank_data=True` (≥12 months of bank statements uploaded →
+           RBT12 can be reconstructed from extrato).
+         Otherwise the progressive rate would under-estimate DAS (missing
+         revenue in RBT12), so we fall back to faixa 1 nominal as a safe
+         baseline and flag `method="faixa_1_fallback"` for the UI.
+      3. Lucro Presumido — state-dependent ICMS (unchanged from before).
+      4. No regime → faixa 1 Anexo I (4%). The old legacy 4.5% was retired
+         as per the 2026 audit; keeping the floor at 4% matches the real
+         starting Simples rate and avoids silently overstating tax.
     """
-    regime = (project_meta.get("tax_regime") or "").lower().strip()
     bruto_month = max(0.0, float(bruto_month or 0))
     rbt12 = max(0.0, float(rbt12 or 0))
 
-    if regime == "simples_nacional":
+    # ── (1) Explicit override ────────────────────────────────────────────
+    override_raw = project_meta.get("das_override_pct")
+    if override_raw is not None and override_raw != "":
+        try:
+            pct = float(override_raw)
+            if pct < 0:
+                pct = 0.0
+            if pct > 100:
+                pct = 100.0
+            return {
+                "das_brl": round(bruto_month * pct / 100.0, 2),
+                "effective_pct": pct,
+                "regime": "override",
+                "method": "override",
+                "anexo": None,
+                "faixa": None,
+                "aliquota_nominal": None,
+                "parcela_deduzir": None,
+                "icms_pct": None,
+                "state": None,
+                "rbt12": rbt12,
+                "display_pt": f"DAS (override {pct:.2f}%)",
+                "display_ru": f"DAS (override {pct:.2f}%)",
+                "exceed_limit": False,
+                "inheritance": project_meta.get("_tax_inheritance"),
+            }
+        except (ValueError, TypeError):
+            pass  # fall through to regime-based logic
+
+    regime = (project_meta.get("tax_regime") or "").lower().strip()
+    ml_only = bool(project_meta.get("ml_only_revenue"))
+    allow_progressive = ml_only or has_1yr_bank_data
+
+    # ── (2) Simples Nacional ─────────────────────────────────────────────
+    if regime == "simples_nacional" or regime == "":
         anexo = (project_meta.get("simples_anexo") or "I").strip().upper()
         if anexo not in ANEXOS:
             anexo = "I"
+        tiers = ANEXOS[anexo]
+
+        if not allow_progressive:
+            # No reliable RBT12 → use faixa 1 nominal as a safe floor.
+            # Flagged as "faixa_1_fallback" so the UI can nudge the user to
+            # (a) toggle ml_only_revenue or (b) upload 12mo bank statements.
+            t = tiers[0]
+            eff = t["aliquota_nominal"]
+            das_brl = round(bruto_month * eff / 100.0, 2)
+            return {
+                "das_brl": das_brl,
+                "effective_pct": eff,
+                "regime": regime or "simples_nacional",
+                "method": "faixa_1_fallback",
+                "anexo": anexo,
+                "faixa": t["faixa"],
+                "aliquota_nominal": t["aliquota_nominal"],
+                "parcela_deduzir": t["parcela_deduzir"],
+                "icms_pct": None,
+                "state": None,
+                "rbt12": rbt12,
+                "display_pt": f"Simples Anexo {anexo} · Faixa 1 ({eff:.2f}%) · mínimo (sem RBT12 confiável)",
+                "display_ru": f"Simples Annex {anexo} · Фаикса 1 ({eff:.2f}%) · минимум (нет надежной RBT12)",
+                "exceed_limit": False,
+                "inheritance": project_meta.get("_tax_inheritance"),
+            }
+
         simples = compute_simples_effective(rbt12, anexo)
         eff = simples["effective_pct"]
         das_brl = round(bruto_month * eff / 100.0, 2)
         faixa = simples["faixa"]
-        display_pt = f"Simples Anexo {anexo} · Faixa {faixa} ({eff:.2f}%)"
-        display_ru = f"Simples Annex {anexo} · Фаикса {faixa} ({eff:.2f}%)"
         return {
             "das_brl": das_brl,
             "effective_pct": eff,
-            "regime": "simples_nacional",
+            "regime": regime or "simples_nacional",
+            "method": "simples_progressive",
             "anexo": anexo,
             "faixa": faixa,
             "aliquota_nominal": simples["aliquota_nominal"],
@@ -236,23 +308,23 @@ def compute_das(project_meta: dict, bruto_month: float, rbt12: float) -> dict[st
             "icms_pct": None,
             "state": None,
             "rbt12": rbt12,
-            "display_pt": display_pt,
-            "display_ru": display_ru,
+            "display_pt": f"Simples Anexo {anexo} · Faixa {faixa} ({eff:.2f}%)",
+            "display_ru": f"Simples Annex {anexo} · Фаикса {faixa} ({eff:.2f}%)",
             "exceed_limit": simples["exceed_limit"],
             "inheritance": project_meta.get("_tax_inheritance"),
         }
 
+    # ── (3) Lucro Presumido ──────────────────────────────────────────────
     if regime == "lucro_presumido":
         lp = compute_lucro_presumido_effective(project_meta.get("company_state"))
         eff = lp["effective_pct"]
         das_brl = round(bruto_month * eff / 100.0, 2)
         state = lp["state"] or "—"
-        display_pt = f"Lucro Presumido {lp['base_pct']}% + ICMS {lp['icms_pct']:.1f}% ({state})"
-        display_ru = f"Lucro Presumido {lp['base_pct']}% + ICMS {lp['icms_pct']:.1f}% ({state})"
         return {
             "das_brl": das_brl,
             "effective_pct": eff,
             "regime": "lucro_presumido",
+            "method": "lucro_presumido",
             "anexo": None,
             "faixa": None,
             "aliquota_nominal": None,
@@ -260,28 +332,29 @@ def compute_das(project_meta: dict, bruto_month: float, rbt12: float) -> dict[st
             "icms_pct": lp["icms_pct"],
             "state": lp["state"],
             "rbt12": rbt12,
-            "display_pt": display_pt,
-            "display_ru": display_ru,
+            "display_pt": f"Lucro Presumido {lp['base_pct']}% + ICMS {lp['icms_pct']:.1f}% ({state})",
+            "display_ru": f"Lucro Presumido {lp['base_pct']}% + ICMS {lp['icms_pct']:.1f}% ({state})",
             "exceed_limit": False,
             "inheritance": project_meta.get("_tax_inheritance"),
         }
 
-    # Legacy fallback — behaviour identical to pre-feature code.
-    eff = 4.5
-    das_brl = round(bruto_month * eff / 100.0, 2)
+    # Unknown regime → treat as unconfigured Simples Anexo I faixa 1
+    t = ANEXO_I_TIERS[0]
+    eff = t["aliquota_nominal"]
     return {
-        "das_brl": das_brl,
+        "das_brl": round(bruto_month * eff / 100.0, 2),
         "effective_pct": eff,
-        "regime": "legacy",
-        "anexo": None,
-        "faixa": None,
-        "aliquota_nominal": None,
-        "parcela_deduzir": None,
+        "regime": "unconfigured",
+        "method": "faixa_1_fallback",
+        "anexo": "I",
+        "faixa": t["faixa"],
+        "aliquota_nominal": t["aliquota_nominal"],
+        "parcela_deduzir": t["parcela_deduzir"],
         "icms_pct": None,
         "state": None,
         "rbt12": rbt12,
-        "display_pt": "Legado Simples 4.5%",
-        "display_ru": "Legacy Simples 4.5%",
+        "display_pt": f"Simples Anexo I · Faixa 1 ({eff:.2f}%) · regime não configurado",
+        "display_ru": f"Simples Annex I · Фаикса 1 ({eff:.2f}%) · режим не настроен",
         "exceed_limit": False,
         "inheritance": project_meta.get("_tax_inheritance"),
     }

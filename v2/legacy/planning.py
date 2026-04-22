@@ -34,7 +34,11 @@ def _next_id(payments: list[dict]) -> int:
 
 
 def add_payment(entry: dict) -> dict:
-    """Append a payment with auto-id and created_at. Returns the stored row."""
+    """Append a payment with auto-id and created_at. Returns the stored row.
+
+    `paid_at` (ISO timestamp) — null when the payment is still pending.
+    Overdue unpaid expenses feed into the Balance sheet as Accounts Payable.
+    """
     payments = load_payments()
     row = {
         "id": _next_id(payments),
@@ -46,6 +50,7 @@ def add_payment(entry: dict) -> dict:
         "category": str(entry.get("category", "")),
         "note": str(entry.get("note", "")),
         "project": entry.get("project"),
+        "paid_at": entry.get("paid_at") or None,
         "created_at": datetime.now().isoformat(),
     }
     if row["direction"] not in DIRECTION_OPTS:
@@ -68,7 +73,7 @@ def delete_payment(payment_id: int) -> bool:
 
 def update_payment(payment_id: int, updates: dict) -> bool:
     allowed = {"date", "amount", "direction", "recurrence", "contragent",
-               "category", "note", "project"}
+               "category", "note", "project", "paid_at"}
     payments = load_payments()
     found = False
     for p in payments:
@@ -82,6 +87,53 @@ def update_payment(payment_id: int, updates: dict) -> bool:
         return False
     _save_payments(payments)
     return True
+
+
+def mark_paid(payment_id: int, paid_at: Any = None) -> bool:
+    """Toggle the paid state: set `paid_at` to ISO timestamp (or clear it).
+
+    Pass `paid_at=None` to mark as unpaid again. Omit to stamp with now().
+    """
+    if paid_at is None:
+        stamp = datetime.now().isoformat(timespec="seconds")
+    elif paid_at is False or paid_at == "":
+        stamp = None  # clear — caller wants to mark pending
+    else:
+        stamp = str(paid_at)
+    return update_payment(payment_id, {"paid_at": stamp})
+
+
+def list_unpaid_ap(project: str, as_of: date) -> list[dict]:
+    """AP feed for the Balance sheet: expense-direction payments with
+    `date <= as_of` and `paid_at IS NULL`. Returns rows sorted by date asc.
+
+    Recurring payments are expanded elsewhere (monthly plan view). For AP we
+    only care about the concrete dated rows the user put in — no expansion.
+    """
+    pj = (project or "").upper()
+    rows: list[dict] = []
+    for p in load_payments():
+        if str(p.get("direction") or "").lower() != "expense":
+            continue
+        if pj and str(p.get("project") or "").upper() != pj:
+            continue
+        if p.get("paid_at"):
+            continue  # already paid — not an obligation
+        try:
+            d = _parse_date(p.get("date"))
+        except Exception:
+            continue
+        if d > as_of:
+            continue  # future — not yet overdue
+        rows.append(p)
+    rows.sort(key=lambda x: str(x.get("date") or ""))
+    return rows
+
+
+def unpaid_ap_total(project: str, as_of: date) -> float:
+    """Sum of |amount| for unpaid expenses with `date <= as_of`."""
+    return round(sum(abs(float(p.get("amount") or 0))
+                     for p in list_unpaid_ap(project, as_of)), 2)
 
 
 # ── Monthly expansion ──────────────────────────────────────────────────────

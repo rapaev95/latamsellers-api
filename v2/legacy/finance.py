@@ -81,12 +81,17 @@ class PnLReport:
     revenue_net: float              # NET из collection MP
     operating_expenses: list[PnLLine]
     operating_profit: float         # net - sum(opex), без COGS
-    cogs: float | None              # None если нет cost_per_unit
-    net_profit: float | None        # operating_profit - cogs
+    cogs: float = 0.0               # Σ(unit_cost_brl × qty) по проданным SKU
+    net_profit: float = 0.0         # operating_profit - cogs
     vendas_count: int = 0
     margin_pct: float = 0.0
-    # Расчётные данные по DAS (Simples Nacional / Lucro Presumido / legacy)
-    # — faixa, aliquot effective, ICMS. Используется UI для бейджа рядом
+    # COGS diagnostics — SKUs без unit_cost_brl в каталоге (призыв: загрузить
+    # Dados Fiscais или заполнить на /finance/sku-mapping).
+    cogs_missing_skus: list[str] = field(default_factory=list)
+    cogs_missing_units: int = 0
+    unit_cost_per_sku: dict[str, float] = field(default_factory=dict)
+    # Расчётные данные по DAS (Simples Nacional / Lucro Presumido / override)
+    # — faixa, aliquot effective, ICMS, method. Используется UI для бейджа рядом
     # со строкой DAS в operating_expenses.
     tax_info: dict | None = None
 
@@ -110,33 +115,58 @@ class CashFlowReport:
 
 @dataclass
 class BalanceReport:
-    """Flow-based balance: Входы − Выходы = Сальдо (как в утверждённом ARTUR CSV)."""
+    """Accounting balance: Assets = Liabilities + Equity. `balance_delta`
+    surfaces any gap so UI can prompt the user to fill missing rows
+    (initial_equity, loans, unrecorded cash, overdue payables…).
+
+    Legacy `inflow_*`/`outflow_*` flow fields are kept for backwards-
+    compatibility with existing /pnl-matrix and UI code; they duplicate
+    data exposed through the structured `cash_brl` / `inventory_brl` /
+    `assets_total` fields and will be retired in a follow-up sweep.
+    """
     project: str
     as_of: date
-    # ВХОДЫ
-    inflow_usdt_brl: float
-    inflow_usdt_usd: float
-    inflow_sales_net: float
-    inflow_sales_count: int
-    inflows_total: float
-    # ВЫХОДЫ
-    outflow_mercadoria: float       # товар (закупка)
-    outflow_publicidade: float
-    outflow_devolucoes: float       # возвраты + логистика
-    outflow_full_express: float
-    outflow_das: float
-    outflow_armazenagem: float
-    outflow_aluguel: float
-    outflows_total: float
-    # САЛЬДО
-    saldo: float                    # inflows - outflows
-    pending_rental_usd: float
-    pending_rental_brl: float
-    saldo_final: float              # saldo - pending_rental
-    # Метаданные
-    cost_per_unit: float | None
-    stock_units: int
-    # Оценка стока (каталог SKU + опционально avg_cost_per_unit_brl)
+
+    # ── Assets ───────────────────────────────────────────────────────────
+    cash_brl: float = 0.0
+    accounts_receivable_brl: float = 0.0   # 0 in A1 model (vendas ≡ cash)
+    inventory_brl: float = 0.0             # stock_value_brl
+    assets_total: float = 0.0
+
+    # ── Liabilities ──────────────────────────────────────────────────────
+    accounts_payable_brl: float = 0.0      # Σ unpaid overdue planned_payments
+    loans_balance_brl: float = 0.0         # Σ f2_loans.outstanding_brl
+    liabilities_total: float = 0.0
+
+    # ── Equity ───────────────────────────────────────────────────────────
+    initial_equity_brl: float = 0.0
+    accumulated_profit_brl: float = 0.0    # Σ net_profit (launch → as_of)
+    dividends_paid_brl: float = 0.0
+    equity_total: float = 0.0
+
+    # ── Reconciliation ───────────────────────────────────────────────────
+    balance_delta_brl: float = 0.0         # assets − (liab + equity)
+
+    # ── Legacy flow-based fields (back-compat) ───────────────────────────
+    inflow_usdt_brl: float = 0.0
+    inflow_usdt_usd: float = 0.0
+    inflow_sales_net: float = 0.0
+    inflow_sales_count: int = 0
+    inflows_total: float = 0.0
+    outflow_mercadoria: float = 0.0
+    outflow_publicidade: float = 0.0
+    outflow_devolucoes: float = 0.0
+    outflow_full_express: float = 0.0
+    outflow_das: float = 0.0
+    outflow_armazenagem: float = 0.0
+    outflow_aluguel: float = 0.0
+    outflows_total: float = 0.0
+    saldo: float = 0.0
+    pending_rental_usd: float = 0.0
+    pending_rental_brl: float = 0.0
+    saldo_final: float = 0.0
+    cost_per_unit: float | None = None
+    stock_units: int = 0
     stock_value_brl: float = 0.0
     stock_missing_skus: list = field(default_factory=list)
     stock_missing_units: int = 0
@@ -195,7 +225,12 @@ def get_project_start_date(project: str) -> date | None:
 # COMPUTE
 # ─────────────────────────────────────────────
 
-def compute_pnl(project: str, period: tuple[date, date], basis: str = "accrual") -> PnLReport:
+def compute_pnl(
+    project: str,
+    period: tuple[date, date],
+    basis: str = "accrual",
+    has_1yr_bank_data: bool = False,
+) -> PnLReport:
     """
     Строит P&L из Vendas ML (bruto) + collection MP (net) + утверждённых
     расходных статей (publicidade, devoluções, full_express, das, armazenagem,
@@ -244,6 +279,8 @@ def compute_pnl(project: str, period: tuple[date, date], basis: str = "accrual")
     r_gross = r_net = r_tv = r_cnc = 0.0
     d_count = 0
     r_count = 0
+    # SKU → qty (только delivered; returned вернулся на склад, не COGS)
+    sku_qty: dict[str, int] = {}
     period_start, period_end = period
     if df is not None and not df.empty:
         for _, row in df.iterrows():
@@ -264,6 +301,15 @@ def compute_pnl(project: str, period: tuple[date, date], basis: str = "accrual")
                 d_net += n
                 d_tv += tv
                 d_count += 1
+                # COGS feed: накопим SKU×Unidades по доставленным
+                _sku = str(row.get("SKU") or "").strip()
+                if _sku:
+                    try:
+                        _u = int(float(str(row.get("Unidades") or 0).strip()))
+                    except (ValueError, TypeError):
+                        _u = 0
+                    if _u > 0:
+                        sku_qty[_sku] = sku_qty.get(_sku, 0) + _u
             else:
                 r_gross += g
                 r_net += n
@@ -313,7 +359,16 @@ def compute_pnl(project: str, period: tuple[date, date], basis: str = "accrual")
     # Наследуем режим от других проектов той же компании (same company_cnpj).
     # Services-проекты форсят Anexo III (см. resolve_tax_settings).
     effective_meta = resolve_tax_settings(proj_meta_for_tax, _load_projects() or {})
-    das_info = _compute_das(effective_meta, revenue_gross if revenue_gross > 0 else 0.0, rbt12)
+    # `has_1yr_bank_data` прокидывается из /reports endpoint (проверяет
+    # `uploads` на наличие extrato_* с MIN(created_at) ≤ now-12mo). Если
+    # ни `ml_only_revenue`, ни 12-мес выписка не заданы — compute_das
+    # откатится на faixa 1 nominal как безопасный минимум.
+    das_info = _compute_das(
+        effective_meta,
+        revenue_gross if revenue_gross > 0 else 0.0,
+        rbt12,
+        has_1yr_bank_data=bool(has_1yr_bank_data),
+    )
     das_val = das_info["das_brl"]
 
     # Publicidade — из отчётов publicidade (auto + manual) с фильтром по периоду
@@ -385,14 +440,52 @@ def compute_pnl(project: str, period: tuple[date, date], basis: str = "accrual")
     opex_total = sum(line.amount_brl for line in operating_expenses)
     operating_profit = revenue_net - opex_total
 
+    # ── COGS из Dados Fiscais (sku_catalog.unit_cost_brl) ────────────────
+    # Для каждого SKU доставленных единиц: если есть unit_cost_brl в каталоге
+    # → умножаем на qty; иначе добавляем SKU в cogs_missing_skus. Поле
+    # `avg_cost_per_unit_brl` на проекте используется как fallback для SKUs
+    # без явной стоимости (legacy-проекты вроде ARTUR).
+    from .sku_catalog import load_catalog, normalize_sku
     proj_meta = get_project_meta(project)
-    cost_per_unit = proj_meta.get("avg_cost_per_unit_brl")
-    cogs: float | None = None
-    net_profit: float | None = None
-    # COGS требует данных по проданным единицам и себесу — оставляем None,
-    # пока эти поля не заполнены. Никаких эвристик "56,2% от bruto" в P&L.
+    legacy_avg_cost = proj_meta.get("avg_cost_per_unit_brl")
+    try:
+        legacy_avg_cost = float(legacy_avg_cost) if legacy_avg_cost is not None else None
+    except (ValueError, TypeError):
+        legacy_avg_cost = None
 
-    margin = (operating_profit / revenue_net * 100) if revenue_net else 0.0
+    catalog_index: dict[str, dict] = {}
+    try:
+        for it in load_catalog():
+            key = normalize_sku(str(it.get("sku") or ""))
+            if key:
+                catalog_index[key] = it
+    except Exception:
+        pass
+
+    cogs_total = 0.0
+    cogs_missing_skus: list[str] = []
+    cogs_missing_units = 0
+    unit_cost_per_sku: dict[str, float] = {}
+    for sku, qty in sku_qty.items():
+        key = normalize_sku(sku)
+        cat = catalog_index.get(key) or {}
+        raw_cost = cat.get("unit_cost_brl")
+        try:
+            unit_cost = float(raw_cost) if raw_cost is not None else None
+        except (ValueError, TypeError):
+            unit_cost = None
+        if not unit_cost or unit_cost <= 0:
+            unit_cost = legacy_avg_cost if (legacy_avg_cost and legacy_avg_cost > 0) else None
+        if unit_cost and unit_cost > 0:
+            cogs_total += unit_cost * qty
+            unit_cost_per_sku[sku] = round(float(unit_cost), 4)
+        else:
+            cogs_missing_skus.append(sku)
+            cogs_missing_units += int(qty)
+    cogs_total = round(cogs_total, 2)
+    net_profit = round(operating_profit - cogs_total, 2)
+
+    margin = (net_profit / revenue_net * 100) if revenue_net else 0.0
 
     return PnLReport(
         project=project,
@@ -402,10 +495,13 @@ def compute_pnl(project: str, period: tuple[date, date], basis: str = "accrual")
         revenue_net=revenue_net,
         operating_expenses=operating_expenses,
         operating_profit=operating_profit,
-        cogs=cogs,
+        cogs=cogs_total,
         net_profit=net_profit,
         vendas_count=vendas_count,
         margin_pct=margin,
+        cogs_missing_skus=cogs_missing_skus,
+        cogs_missing_units=cogs_missing_units,
+        unit_cost_per_sku=unit_cost_per_sku,
         tax_info=das_info,
     )
 
@@ -675,7 +771,12 @@ def compute_cashflow(project: str, period: tuple[date, date]) -> CashFlowReport:
     )
 
 
-def compute_balance(project: str, as_of: date, basis: str = "accrual") -> BalanceReport:
+def compute_balance(
+    project: str,
+    as_of: date,
+    basis: str = "accrual",
+    has_1yr_bank_data: bool = False,
+) -> BalanceReport:
     """Flow-based balance: Входы (USDT + NET продажи) − Выходы = Сальдо.
 
     Outflows считаются из РЕАЛЬНЫХ источников данных пользователя:
@@ -699,7 +800,7 @@ def compute_balance(project: str, as_of: date, basis: str = "accrual") -> Balanc
 
     # Продажи NET за весь период до as_of (через compute_pnl)
     period = (date(2025, 1, 1), as_of)
-    pnl = compute_pnl(project, period, basis=basis)
+    pnl = compute_pnl(project, period, basis=basis, has_1yr_bank_data=has_1yr_bank_data)
     inflow_sales_net = pnl.revenue_net
     inflow_sales_count = pnl.vendas_count
 
@@ -849,9 +950,71 @@ def compute_balance(project: str, as_of: date, basis: str = "accrual") -> Balanc
     pending_brl = pending_usd * 5.46  # курс fallback
     saldo_final = saldo - pending_brl
 
+    # ─────────────────────────────────────────────────────────────────────
+    # НОВАЯ бухгалтерская часть: Assets = Liabilities + Equity
+    # ─────────────────────────────────────────────────────────────────────
+    from .capital import loans_balance as _loans_balance, dividends_total as _dividends_total
+    from .planning import unpaid_ap_total as _unpaid_ap_total
+
+    # Assets
+    # cash_brl = saldo (inflows − outflows): это чистая позиция по кассе
+    # после всех операций. stock_value остаётся в inventory. AR=0 по A1.
+    cash_brl = round(saldo, 2)
+    inventory_brl = round(stock_value_brl, 2)
+    accounts_receivable_brl = 0.0
+    assets_total = round(cash_brl + accounts_receivable_brl + inventory_brl, 2)
+
+    # Liabilities — AP из planned_payments (непогашенные, overdue), loans
+    # из f2_loans (активные), pending rental — считаем тоже AP.
+    try:
+        accounts_payable_brl = round(_unpaid_ap_total(project, as_of) + pending_brl, 2)
+    except Exception:
+        accounts_payable_brl = round(pending_brl, 2)
+    try:
+        loans_balance_brl = round(_loans_balance(project, as_of), 2)
+    except Exception:
+        loans_balance_brl = 0.0
+    liabilities_total = round(accounts_payable_brl + loans_balance_brl, 2)
+
+    # Equity — initial + accumulated_profit − dividends. accumulated_profit
+    # = net_profit за весь период (launch → as_of) — используем тот же pnl
+    # инстанс что и выше (не зовём compute_pnl повторно).
+    initial_equity_brl = 0.0
+    try:
+        initial_equity_brl = round(float(proj_meta.get("initial_equity_brl") or 0), 2)
+    except (ValueError, TypeError):
+        initial_equity_brl = 0.0
+    accumulated_profit_brl = round(float(getattr(pnl, "net_profit", 0) or 0), 2)
+    try:
+        dividends_paid_brl = round(_dividends_total(project, as_of), 2)
+    except Exception:
+        dividends_paid_brl = 0.0
+    equity_total = round(
+        initial_equity_brl + accumulated_profit_brl - dividends_paid_brl, 2
+    )
+
+    balance_delta_brl = round(assets_total - (liabilities_total + equity_total), 2)
+
     return BalanceReport(
         project=project,
         as_of=as_of,
+        # Assets
+        cash_brl=cash_brl,
+        accounts_receivable_brl=accounts_receivable_brl,
+        inventory_brl=inventory_brl,
+        assets_total=assets_total,
+        # Liabilities
+        accounts_payable_brl=accounts_payable_brl,
+        loans_balance_brl=loans_balance_brl,
+        liabilities_total=liabilities_total,
+        # Equity
+        initial_equity_brl=initial_equity_brl,
+        accumulated_profit_brl=accumulated_profit_brl,
+        dividends_paid_brl=dividends_paid_brl,
+        equity_total=equity_total,
+        # Reconciliation
+        balance_delta_brl=balance_delta_brl,
+        # Legacy (back-compat)
         inflow_usdt_brl=inflow_usdt_brl,
         inflow_usdt_usd=inflow_usdt_usd,
         inflow_sales_net=inflow_sales_net,
