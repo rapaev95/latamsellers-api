@@ -34,6 +34,7 @@ from v2.schemas.finance import (
     PlannedPaymentIn, PlannedPaymentsOut, PlannedPaymentMutOut,
     MonthlyPlanOut, RecurringSuggestionsOut,
     PublicidadeInvoiceIn, PublicidadeInvoicesListOut,
+    PublicidadeReconciliationOut,
     RentalPaymentIn, RentalPaymentsListOut,
 )
 from v2.storage import uploads_storage
@@ -1471,6 +1472,53 @@ def remove_rental(
     if not ok:
         raise HTTPException(status_code=404, detail="payment_not_found")
     return _rental_payments_response(project, auto_generate=False)
+
+
+# ── Publicidade reconciliation ──────────────────────────────────────────────
+
+@router.get("/publicidade/reconciliation", response_model=PublicidadeReconciliationOut)
+def get_publicidade_reconciliation(
+    project: str = Query(...),
+    period_from: str = Query(..., alias="from"),
+    period_to: str = Query(..., alias="to"),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Сверка расхода publicidade за период: CSV vs fatura.
+
+    Вызывает `get_publicidade_by_period` дважды — отфильтрованно по типу источника,
+    чтобы показать юзеру два числа и Δ. CSV = реальный дневной расход ML Ads.
+    Fatura = то, что ML выставил/юзер закрыл как итог месяца.
+    """
+    _bind_user(user)
+    from v2.legacy.reports import get_publicidade_by_period
+
+    try:
+        pf = datetime.strptime(period_from, "%Y-%m-%d").date()
+        pt = datetime.strptime(period_to, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bad_date_format_expected_YYYY-MM-DD")
+    if pf > pt:
+        raise HTTPException(status_code=400, detail="period_from_after_period_to")
+
+    proj_upper = project.upper()
+    csv_data = get_publicidade_by_period(proj_upper, pf, pt, only="csv")
+    fatura_data = get_publicidade_by_period(proj_upper, pf, pt, only="fatura")
+
+    csv_total = float(csv_data.get("total") or 0)
+    fatura_total = float(fatura_data.get("total") or 0)
+    return {
+        "project": proj_upper,
+        "period_from": period_from,
+        "period_to": period_to,
+        "csv_total": round(csv_total, 2),
+        "csv_files_used": csv_data.get("files_used") or [],
+        "fatura_total": round(fatura_total, 2),
+        "fatura_files_used": fatura_data.get("files_used") or [],
+        "delta": round(fatura_total - csv_total, 2),
+        "uncovered_days_csv": int(csv_data.get("uncovered_days") or 0),
+        "uncovered_days_fatura": int(fatura_data.get("uncovered_days") or 0),
+        "total_days": int(csv_data.get("total_days") or 0),
+    }
 
 
 # ── Planned Payments / DDS Planning ─────────────────────────────────────────
