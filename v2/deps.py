@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import unquote
 
@@ -16,6 +16,25 @@ class CurrentUser:
     id: int
     email: str
     name: str
+    role: str = "user"                    # "user" | "admin" | "superadmin"
+    tiers: list[str] = field(default_factory=list)   # paywall tiers: finance/calculator/escalar
+    blocked: bool = False
+
+
+def _parse_tiers(raw) -> list[str]:
+    """tiers в БД — jsonb (list[str]) или null."""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(t) for t in raw if t]
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(t) for t in parsed if t]
+        except (ValueError, TypeError):
+            pass
+    return []
 
 
 async def current_user(
@@ -26,6 +45,7 @@ async def current_user(
 
     Cookie value is JSON `{id, email, name}` (httpOnly, sameSite=lax, host-only).
     Validates user_id against `users` table — stale cookie → 401.
+    Returns role, tiers, blocked so callers can gate paywall / admin routes.
     """
     raw = request.cookies.get("ls_auth")
     if not raw:
@@ -49,14 +69,24 @@ async def current_user(
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, email, name FROM users WHERE id = $1",
+            "SELECT id, email, name, role, tiers, blocked FROM users WHERE id = $1",
             user_id,
         )
 
     if row is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="unknown_user")
 
-    return CurrentUser(id=row["id"], email=row["email"], name=row["name"] or "")
+    if row["blocked"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user_blocked")
+
+    return CurrentUser(
+        id=row["id"],
+        email=row["email"],
+        name=row["name"] or "",
+        role=(row["role"] or "user"),
+        tiers=_parse_tiers(row["tiers"]),
+        blocked=bool(row["blocked"]),
+    )
 
 
 async def maybe_current_user(
