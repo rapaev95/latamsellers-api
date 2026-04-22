@@ -1140,6 +1140,11 @@ def compute_balance(
             continue
         if d_t > as_of:
             continue
+        # "Тестовая закупка" (test_only=true) остаётся в ДДС как inflow,
+        # но не считается инвестицией для MOIC. Пример: положил 3K на тест
+        # → 40K на основное. В invested/NAV идёт только 40K.
+        if bool(item.get("test_only")):
+            continue
         amt_brl = _entry_valor_brl(item)
         if amt_brl > 0:
             contributions.append({"date": d_t, "brl": amt_brl, "kind": "partner"})

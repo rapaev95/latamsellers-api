@@ -459,6 +459,12 @@ class ManualCashflowEntryIn(BaseModel):
     # Inter-project loans: who's on the other side. Required for loan_given / loan_received.
     # Backend writes a mirror entry in the counterparty project, linked by auto-generated loan_id.
     counterparty_project: Optional[str] = None
+    # Partner contribution flag: "тестовая закупка, не считать как инвестицию".
+    # Only applies to kind=partner_contributions. When True, the entry stays in
+    # ДДС as an inflow (cash came into the project), but compute_balance skips
+    # it from total_invested_brl — so MOIC, прирост, % годовых, все считаются
+    # без этих тестовых денег. Default False = old behaviour.
+    test_only: Optional[bool] = False
 
     model_config = {"populate_by_name": True}
 

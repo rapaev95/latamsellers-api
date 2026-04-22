@@ -1150,6 +1150,11 @@ def add_cashflow_entry(
     payload: dict[str, Any] = {"date": entry.date, "valor": float(entry.valor), "note": entry.note or ""}
     if entry.kind == "partner_contributions" and entry.from_ is not None:
         payload["from"] = entry.from_
+    if entry.kind == "partner_contributions":
+        # "Тестовая" закупка — остаётся в ДДС как inflow, но исключается из
+        # invested/MOIC в compute_balance. Всегда записываем true/false чтобы
+        # PATCH мог снять флаг (иначе старое значение застрянет).
+        payload["test_only"] = bool(entry.test_only)
     if entry.kind == "manual_expenses" and entry.category is not None:
         payload["category"] = entry.category or "expense"
     if entry.kind == "manual_supplier" and entry.source is not None:
@@ -1233,6 +1238,11 @@ def update_cashflow_entry(
     payload: dict[str, Any] = {"date": entry.date, "valor": float(entry.valor), "note": entry.note or ""}
     if entry.kind == "partner_contributions" and entry.from_ is not None:
         payload["from"] = entry.from_
+    if entry.kind == "partner_contributions":
+        # "Тестовая" закупка — остаётся в ДДС как inflow, но исключается из
+        # invested/MOIC в compute_balance. Всегда записываем true/false чтобы
+        # PATCH мог снять флаг (иначе старое значение застрянет).
+        payload["test_only"] = bool(entry.test_only)
     if entry.kind == "manual_expenses" and entry.category is not None:
         payload["category"] = entry.category or "expense"
     if entry.kind == "manual_supplier" and entry.source is not None:
