@@ -1622,7 +1622,11 @@ def get_publicidade_reconciliation(
     fatura_data = get_publicidade_by_period(proj_upper, pf, pt, only="fatura")
 
     csv_total = float(csv_data.get("total") or 0)
-    fatura_total = float(fatura_data.get("total") or 0)
+    # `fatura_total` = сумма ВСЕХ введённых фатур проекта (не только попадающих
+    # в reconciliation-период). Так пользователь видит полную сумму ручного ввода.
+    from v2.legacy.reports import list_publicidade_invoices
+    all_invoices = list_publicidade_invoices(proj_upper)
+    fatura_total = sum(float((inv or {}).get("valor", 0) or 0) for inv in all_invoices)
     return {
         "project": proj_upper,
         "period_from": period_from,
