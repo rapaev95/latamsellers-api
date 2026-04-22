@@ -4600,6 +4600,12 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
     rev_envios: dict = {}
     rev_cancel: dict = {}
     rev_net: dict = {}
+    # Только __bucket == "returned" — как фильтр «возврат» в выгрузке Vendas ML.
+    rev_cancel_returned: dict = {}
+    rev_net_returned: dict = {}
+    # Явные колонки ML по доставке (только delivered — как строка «Доплата envios»).
+    receita_envio_del: dict = {}
+    tarifa_envio_del: dict = {}
     delivered_cnt: dict = {}
     returned_cnt: dict = {}
     ad_cnt: dict = {}
@@ -4625,12 +4631,18 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
         if bucket == "delivered":
             envios = max(g + tv - n, 0.0)  # тождество
             rev_envios[mk] = rev_envios.get(mk, 0.0) - envios  # как расход
+            re_env = _num(row.get("Receita por envio (BRL)"))
+            te_env = _num(row.get("Tarifas de envio (BRL)"))
+            receita_envio_del[mk] = receita_envio_del.get(mk, 0.0) + re_env
+            tarifa_envio_del[mk] = tarifa_envio_del.get(mk, 0.0) + te_env
             delivered_cnt[mk] = delivered_cnt.get(mk, 0) + 1
             if str(row.get("Venda por publicidade", "")).strip().lower() == "sim":
                 ad_cnt[mk] = ad_cnt.get(mk, 0) + 1
                 ad_net[mk] = ad_net.get(mk, 0.0) + n
         else:
             returned_cnt[mk] = returned_cnt.get(mk, 0) + 1
+            rev_cancel_returned[mk] = rev_cancel_returned.get(mk, 0.0) + cnc
+            rev_net_returned[mk] = rev_net_returned.get(mk, 0.0) + n
 
     months = sorted(months_set)
     if not months:
@@ -4768,7 +4780,53 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
         _row("pnl_rev_gross", "REVENUE", rev_gross, key="rev_gross"),
         _row("pnl_tarifa_venda", "REVENUE", rev_tarifa, key="tarifa_venda"),
         _row("pnl_envios", "REVENUE", rev_envios, key="envios"),
+        {
+            "key": "envio_receita_ml_col",
+            "label": "pnl_envio_receita_ml_col",
+            "section": "REVENUE",
+            "values": {m: float(receita_envio_del.get(m, 0.0)) for m in months},
+            "total": sum(float(receita_envio_del.get(m, 0.0)) for m in months),
+            "is_info": True,
+        },
+        {
+            "key": "envio_tarifa_ml_col",
+            "label": "pnl_envio_tarifa_ml_col",
+            "section": "REVENUE",
+            "values": {m: float(tarifa_envio_del.get(m, 0.0)) for m in months},
+            "total": sum(float(tarifa_envio_del.get(m, 0.0)) for m in months),
+            "is_info": True,
+        },
+        {
+            "key": "envio_doplata_ml_cols",
+            "label": "pnl_envio_doplata_ml_cols",
+            "section": "REVENUE",
+            "values": {
+                m: float(receita_envio_del.get(m, 0.0)) + float(tarifa_envio_del.get(m, 0.0))
+                for m in months
+            },
+            "total": sum(
+                float(receita_envio_del.get(m, 0.0)) + float(tarifa_envio_del.get(m, 0.0))
+                for m in months
+            ),
+            "is_info": True,
+        },
         _row("pnl_cancelamentos", "REVENUE", rev_cancel, key="cancelamentos"),
+        {
+            "key": "returned_cancelamentos",
+            "label": "pnl_returned_cancelamentos",
+            "section": "REVENUE",
+            "values": {m: float(rev_cancel_returned.get(m, 0.0)) for m in months},
+            "total": sum(float(rev_cancel_returned.get(m, 0.0)) for m in months),
+            "is_info": True,
+        },
+        {
+            "key": "returned_total_brl",
+            "label": "pnl_returned_total_brl",
+            "section": "REVENUE",
+            "values": {m: float(rev_net_returned.get(m, 0.0)) for m in months},
+            "total": sum(float(rev_net_returned.get(m, 0.0)) for m in months),
+            "is_info": True,
+        },
         _row("pnl_net_revenue", "REVENUE", rev_net, key="net_revenue"),
         {
             "key": "ads_subtotal",
