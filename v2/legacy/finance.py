@@ -674,9 +674,19 @@ def compute_cashflow(project: str, period: tuple[date, date]) -> CashFlowReport:
 
 
 def compute_balance(project: str, as_of: date, basis: str = "accrual") -> BalanceReport:
-    """Flow-based balance в формате утверждённого ARTUR CSV:
-    Входы (USDT + продажи NET) − Выходы (товар, реклама, devoluções, ...)
-    = Сальдо. Минус просроченная аренда = САЛЬДО проекта.
+    """Flow-based balance: Входы (USDT + NET продажи) − Выходы = Сальдо.
+
+    Outflows считаются из РЕАЛЬНЫХ источников данных пользователя:
+    - mercadoria = stock_full × sku_catalog.unit_cost_brl (оценка склада)
+    - publicidade = get_publicidade_by_period(cumulative)
+    - armazenagem = get_armazenagem_by_period(cumulative)
+    - devoluções = PnL "Cancelamentos e devoluções" (из vendas cancelled)
+    - das = PnL.tax_info.das_brl (с учётом tax_regime)
+    - aluguel = rental.payments со статусом paid × rate_brl
+    - full_express = 0 (пока нет парсера; legacy override возможен)
+
+    baseline_overrides в projects_db — могут переопределить любое значение
+    (для legacy-проектов вроде ARTUR с утверждёнными цифрами).
     """
     proj_meta = get_project_meta(project)
 
@@ -693,35 +703,7 @@ def compute_balance(project: str, as_of: date, basis: str = "accrual") -> Balanc
 
     inflows_total = inflow_usdt_brl + inflow_sales_net
 
-    # ── ВЫХОДЫ ──
-    approved = get_approved_data(project) or {}
-    out_mercadoria = float(approved.get("mercadoria", 0) or 0)
-    out_publicidade = float(approved.get("publicidade", 0) or 0)
-    out_devolucoes = float(approved.get("devolucoes", 0) or 0)
-    out_full_express = float(approved.get("full_express", 0) or 0)
-    out_das = float(approved.get("das", 0) or 0)
-    if out_das == 0 and pnl.revenue_gross > 0:
-        # Используем DAS уже посчитанный в compute_pnl с учётом tax_regime.
-        # pnl.tax_info.das_brl всегда есть (включая legacy 4.5% fallback).
-        tinfo = pnl.tax_info if isinstance(pnl.tax_info, dict) else None
-        out_das = float((tinfo or {}).get("das_brl") or round(pnl.revenue_gross * 0.045, 2))
-    out_armazenagem = float(approved.get("armazenagem", 0) or 0)
-    out_aluguel = float(approved.get("aluguel", 0) or 0)
-
-    outflows_total = (out_mercadoria + out_publicidade + out_devolucoes
-                      + out_full_express + out_das + out_armazenagem + out_aluguel)
-
-    saldo = inflows_total - outflows_total
-
-    # ── Просроченная аренда ──
-    rental = proj_meta.get("rental") or {}
-    pending_usd = sum(float(p.get("usd", 0) or 0)
-                      for p in (rental.get("payments") or [])
-                      if p.get("status") == "pending")
-    pending_brl = pending_usd * 5.46  # курс из утверждённого baseline ($1350 → R$ 7369.38)
-    saldo_final = saldo - pending_brl
-
-    # Сток: каталог SKU (_data/sku_catalog.json) + опционально avg_cost_per_unit_brl
+    # ── STOCK (раньше было ПОСЛЕ outflows — переносим сюда: mercadoria = stock_value) ──
     stock_data = (load_stock_full().get(project, {}) or {})
     stock_units_ml = int(stock_data.get("total_units", 0) or 0)
     stock_units_external = int(proj_meta.get("stock_units_external", 0) or 0)
@@ -745,6 +727,87 @@ def compute_balance(project: str, as_of: date, basis: str = "accrual") -> Balanc
             cost_per_unit = float(legacy_avg) if legacy_avg is not None else None
         except (TypeError, ValueError):
             cost_per_unit = None
+
+    # ── ВЫХОДЫ (из реальных источников) ──
+
+    # 1. Publicidade — весь cumulative период из фатур/CSV
+    try:
+        from .reports import get_publicidade_by_period as _pub_by_period
+        pub_data = _pub_by_period(project, period[0], as_of)
+        out_publicidade = float(pub_data.get("total") or 0)
+    except Exception:
+        out_publicidade = 0.0
+
+    # 2. Armazenagem — cumulative из отчётов хранения
+    try:
+        from .reports import get_armazenagem_by_period as _arm_by_period
+        arm_data = _arm_by_period(project, period[0], as_of)
+        out_armazenagem = float(arm_data.get("total") or 0)
+    except Exception:
+        out_armazenagem = 0.0
+
+    # 3. Devoluções — из PnL cancellations line (накопленная сумма в period)
+    out_devolucoes = 0.0
+    for line in (pnl.operating_expenses or []):
+        lbl = str(getattr(line, "label", "") or "").lower()
+        if "cancel" in lbl or "devolu" in lbl:
+            # PnL expenses идут с отрицательным знаком → берём abs
+            out_devolucoes += abs(float(getattr(line, "amount_brl", 0) or 0))
+
+    # 4. DAS — из tax_info (уже считается в compute_pnl)
+    tinfo = pnl.tax_info if isinstance(pnl.tax_info, dict) else None
+    out_das = float((tinfo or {}).get("das_brl") or 0)
+    if out_das == 0 and pnl.revenue_gross > 0:
+        out_das = round(pnl.revenue_gross * 0.045, 2)  # legacy fallback
+
+    # 5. Aluguel — фактически оплаченные rental платежи
+    rental = proj_meta.get("rental") or {}
+    out_aluguel = 0.0
+    for p in (rental.get("payments") or []):
+        if str(p.get("status", "")).lower() != "paid":
+            continue
+        usd = float(p.get("amount_usd") or p.get("usd") or 0)
+        rate = float(p.get("rate_brl") or 0)
+        if rate <= 0:
+            rate = 5.46
+        out_aluguel += usd * rate
+
+    # 6. Full Express — пока нет парсера
+    out_full_express = 0.0
+
+    # 7. Mercadoria = оценка склада
+    out_mercadoria = stock_value_brl
+
+    # ── baseline_overrides в projects_db.json перекрывают любое значение ──
+    # (для legacy-проектов с утверждёнными цифрами, например ARTUR)
+    overrides = proj_meta.get("baseline_overrides") or {}
+    if isinstance(overrides, dict):
+        if "mercadoria" in overrides and overrides["mercadoria"] not in (None, "", 0):
+            out_mercadoria = float(overrides["mercadoria"])
+        if "publicidade" in overrides and overrides["publicidade"] not in (None, "", 0):
+            out_publicidade = float(overrides["publicidade"])
+        if "devolucoes" in overrides and overrides["devolucoes"] not in (None, "", 0):
+            out_devolucoes = float(overrides["devolucoes"])
+        if "full_express" in overrides and overrides["full_express"] not in (None, "", 0):
+            out_full_express = float(overrides["full_express"])
+        if "das" in overrides and overrides["das"] not in (None, "", 0):
+            out_das = float(overrides["das"])
+        if "armazenagem" in overrides and overrides["armazenagem"] not in (None, "", 0):
+            out_armazenagem = float(overrides["armazenagem"])
+        if "aluguel" in overrides and overrides["aluguel"] not in (None, "", 0):
+            out_aluguel = float(overrides["aluguel"])
+
+    outflows_total = (out_mercadoria + out_publicidade + out_devolucoes
+                      + out_full_express + out_das + out_armazenagem + out_aluguel)
+
+    saldo = inflows_total - outflows_total
+
+    # ── Просроченная аренда (pending, не в outflows) ──
+    pending_usd = sum(float(p.get("amount_usd") or p.get("usd") or 0)
+                      for p in (rental.get("payments") or [])
+                      if str(p.get("status", "")).lower() == "pending")
+    pending_brl = pending_usd * 5.46  # курс fallback
+    saldo_final = saldo - pending_brl
 
     return BalanceReport(
         project=project,

@@ -4522,75 +4522,97 @@ def _stock_full_title_column(df: pd.DataFrame) -> str | None:
 
 def load_stock_full() -> dict:
     """
-    Load stock_full XLSX from _data/, parse all sheets and aggregate by project.
+    Load stock_full XLSX and aggregate by project.
+
+    - LS_STORAGE_MODE=db: reads files from `uploads WHERE source_key='stock_full'`
+      for the current user, parses each via `parse_stock_full_bytes` and aggregates.
+    - FS fallback (LS_STORAGE_MODE=fs OR db-mode returned nothing): reads
+      `_data/{month}/stock_full*.xlsx` + `~/Downloads/stock_general_full*.xlsx`.
+
     Returns: {project: {"total_units": N, "by_sku": {sku: qty}, "sku_titles": {sku: str}}}
     """
+    import os as _os
     from pathlib import Path
 
-    # Find newest stock file
-    stock_files = []
-    for month in MONTHS:
-        for path in (DATA_DIR / month).glob("stock_full*.xlsx") if (DATA_DIR / month).exists() else []:
-            stock_files.append(path)
-    # Also check Downloads or root
-    legacy_paths = list(Path.home().glob("Downloads/stock_general_full*.xlsx"))
-    stock_files.extend(legacy_paths)
+    all_skus: dict[str, int] = {}
+    sku_titles: dict[str, str] = {}
 
-    if not stock_files:
-        return {}
-
-    newest = max(stock_files, key=lambda p: p.stat().st_mtime)
-
-    try:
-        xl = pd.ExcelFile(newest)
-    except Exception:
-        return {}
-
-    # Aggregate units across all sheets (Boa qualidade, Para impulsionar, etc)
-    all_skus: dict[str, int] = {}  # sku → total qty
-    sku_titles: dict[str, str] = {}  # sku → название (первое непустое)
-    for sheet in xl.sheet_names:
-        if sheet == "Resumo":
-            continue
-        try:
-            df = pd.read_excel(xl, sheet_name=sheet, header=5)
-            df = df[df.get("SKU").notna()] if "SKU" in df.columns else df
-            if "SKU" not in df.columns:
-                continue
-
-            # Find quantity column — typically "Unidades de boa qualidade.1" or similar
-            qty_col = None
-            for c in df.columns:
-                cl = str(c).lower()
-                if ("unidades" in cl or "estoque" in cl) and ".1" in str(c):
-                    qty_col = c
-                    break
-            if qty_col is None:
-                for c in df.columns:
-                    if "unidades" in str(c).lower() or "qtd" in str(c).lower():
-                        qty_col = c
-                        break
-            if qty_col is None:
-                continue
-
-            title_col = _stock_full_title_column(df)
-
-            for _, row in df.iterrows():
-                sku = str(row.get("SKU", "")).strip()
-                if not sku or sku == "nan":
-                    continue
+    storage_mode = _os.environ.get("LS_STORAGE_MODE", "fs").strip().lower()
+    if storage_mode == "db":
+        from .db_storage import _current_user_id
+        uid = _current_user_id()
+        if uid is not None:
+            from v2.parsers.stock_full import parse_stock_full_bytes
+            for _fn, blob in _load_files_from_db_sync(uid, "stock_full"):
                 try:
-                    qty = float(row.get(qty_col, 0) or 0)
-                except (ValueError, TypeError):
-                    qty = 0
-                if qty > 0:
-                    all_skus[sku] = all_skus.get(sku, 0) + int(qty)
-                    if title_col and sku not in sku_titles:
-                        tit = str(row.get(title_col, "") or "").strip()
-                        if tit and tit.lower() != "nan":
-                            sku_titles[sku] = tit[:220]
-        except Exception:
-            continue
+                    parsed = parse_stock_full_bytes(blob)
+                except Exception:
+                    continue
+                for sku, entry in parsed.items():
+                    sku_key = (sku or "").strip()
+                    if not sku_key:
+                        continue
+                    qty = int(entry.total or 0)
+                    if qty <= 0:
+                        continue
+                    all_skus[sku_key] = all_skus.get(sku_key, 0) + qty
+                    if entry.title and sku_key not in sku_titles:
+                        sku_titles[sku_key] = (entry.title or "")[:220]
+
+    # FS fallback: если db-mode ничего не дал ИЛИ fs-mode по умолчанию
+    if not all_skus:
+        stock_files = []
+        for month in MONTHS:
+            if (DATA_DIR / month).exists():
+                stock_files.extend((DATA_DIR / month).glob("stock_full*.xlsx"))
+        legacy_paths = list(Path.home().glob("Downloads/stock_general_full*.xlsx"))
+        stock_files.extend(legacy_paths)
+
+        if stock_files:
+            newest = max(stock_files, key=lambda p: p.stat().st_mtime)
+            try:
+                xl = pd.ExcelFile(newest)
+            except Exception:
+                xl = None
+            if xl is not None:
+                for sheet in xl.sheet_names:
+                    if sheet == "Resumo":
+                        continue
+                    try:
+                        df = pd.read_excel(xl, sheet_name=sheet, header=5)
+                        df = df[df.get("SKU").notna()] if "SKU" in df.columns else df
+                        if "SKU" not in df.columns:
+                            continue
+                        qty_col = None
+                        for c in df.columns:
+                            cl = str(c).lower()
+                            if ("unidades" in cl or "estoque" in cl) and ".1" in str(c):
+                                qty_col = c
+                                break
+                        if qty_col is None:
+                            for c in df.columns:
+                                if "unidades" in str(c).lower() or "qtd" in str(c).lower():
+                                    qty_col = c
+                                    break
+                        if qty_col is None:
+                            continue
+                        title_col = _stock_full_title_column(df)
+                        for _, row in df.iterrows():
+                            sku = str(row.get("SKU", "")).strip()
+                            if not sku or sku == "nan":
+                                continue
+                            try:
+                                qty = float(row.get(qty_col, 0) or 0)
+                            except (ValueError, TypeError):
+                                qty = 0
+                            if qty > 0:
+                                all_skus[sku] = all_skus.get(sku, 0) + int(qty)
+                                if title_col and sku not in sku_titles:
+                                    tit = str(row.get(title_col, "") or "").strip()
+                                    if tit and tit.lower() != "nan":
+                                        sku_titles[sku] = tit[:220]
+                    except Exception:
+                        continue
 
     # Group by project
     result: dict[str, dict] = {}
