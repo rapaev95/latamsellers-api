@@ -4536,6 +4536,7 @@ def load_stock_full() -> dict:
 
     all_skus: dict[str, int] = {}
     sku_titles: dict[str, str] = {}
+    sku_mlbs: dict[str, str] = {}  # sku → MLB (из колонки "Código do Anúncio" stock_full)
 
     storage_mode = _os.environ.get("LS_STORAGE_MODE", "fs").strip().lower()
     if storage_mode == "db":
@@ -4558,6 +4559,8 @@ def load_stock_full() -> dict:
                     all_skus[sku_key] = all_skus.get(sku_key, 0) + qty
                     if entry.title and sku_key not in sku_titles:
                         sku_titles[sku_key] = (entry.title or "")[:220]
+                    if entry.mlb and sku_key not in sku_mlbs:
+                        sku_mlbs[sku_key] = entry.mlb
 
     # FS fallback: если db-mode ничего не дал ИЛИ fs-mode по умолчанию
     if not all_skus:
@@ -4619,15 +4622,19 @@ def load_stock_full() -> dict:
     for sku, qty in all_skus.items():
         proj = get_project_by_sku(sku, "")
         if proj not in result:
-            result[proj] = {"total_units": 0, "by_sku": {}, "sku_titles": {}}
+            result[proj] = {"total_units": 0, "by_sku": {}, "sku_titles": {}, "sku_mlbs": {}}
         result[proj]["total_units"] += qty
         result[proj]["by_sku"][sku] = result[proj]["by_sku"].get(sku, 0) + qty
 
     for proj, block in result.items():
         titles_map = {}
+        mlbs_map = {}
         for s in block["by_sku"]:
             titles_map[s] = sku_titles.get(s, "")
+            if s in sku_mlbs:
+                mlbs_map[s] = sku_mlbs[s]
         block["sku_titles"] = titles_map
+        block["sku_mlbs"] = mlbs_map
 
     return result
 

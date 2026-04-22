@@ -188,6 +188,54 @@ def build_catalog_index() -> dict[str, dict[str, Any]]:
     return idx
 
 
+def _normalize_mlb(v: Any) -> str:
+    """Нормализует MLB из любого источника к digits-only для мэтчинга.
+
+    stock_full.xlsx хранит MLB как float-строку `4516196937.0` (legacy формат),
+    Dados Fiscais — как `MLB5649425304`. Чтобы сопоставить: убираем `.0`-суффикс,
+    префикс 'MLB', любой нецифровой символ; убираем ведущие нули.
+    """
+    s = str(v or "").strip().upper()
+    if not s:
+        return ""
+    # remove trailing ".0" (float-cast of integer from Excel)
+    if s.endswith(".0"):
+        s = s[:-2]
+    # drop everything that isn't digit
+    digits = "".join(c for c in s if c.isdigit())
+    return digits.lstrip("0")
+
+
+def build_catalog_mlb_index() -> dict[str, dict[str, Any]]:
+    """Индекс каталога по **нормализованному MLB**. Используется как fallback
+    для SKU-лукапа, когда внутренние коды стока (sumka5-1) не совпадают с SKU
+    в каталоге (HB50173-5), но MLB-объявление одно и то же."""
+    idx: dict[str, dict[str, Any]] = {}
+    for it in load_catalog():
+        row = _coerce_item(it)
+        if row is None:
+            continue
+        mlb_norm = _normalize_mlb(row.get("mlb"))
+        if not mlb_norm:
+            continue
+        # If multiple catalog items share an MLB, the one with unit_cost wins
+        existing = idx.get(mlb_norm)
+        new_entry = {
+            "supplier_type": row["supplier_type"],
+            "unit_cost_brl": row["unit_cost_brl"],
+            "supplier_state": row.get("supplier_state", ""),
+            "lead_time_days": row.get("lead_time_days"),
+            "note": row["note"],
+        }
+        if existing is None:
+            idx[mlb_norm] = new_entry
+            continue
+        # keep entry that has real cost
+        if (existing.get("unit_cost_brl") or 0) == 0 and (new_entry.get("unit_cost_brl") or 0) > 0:
+            idx[mlb_norm] = new_entry
+    return idx
+
+
 def get_sku_row(sku: str) -> dict[str, Any] | None:
     return build_catalog_index().get(normalize_sku(sku))
 
@@ -197,15 +245,25 @@ def assess_stock_for_project(
     by_sku: dict[str, int] | None,
     stock_units_external: int,
     avg_cost_per_unit_brl: float | None,
+    sku_mlbs: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
-    Оценка стоимости стока: явные цены из каталога; без цены — avg_cost_per_unit_brl
-    (если задан); иначе SKU попадают в missing_*.
+    Оценка стоимости стока. Порядок лукапа cost для каждого SKU:
+      1) catalog[sku] — прямое совпадение кода
+      2) catalog[mlb-norm] — fallback через MLB из stock_full (если `sku_mlbs` задан);
+         это закрывает случай когда у юзера внутренние коды (sumka5-1, w02-1) в
+         stock_full, а каталог содержит SKU из Dados Fiscais (HB50173-9) — оба
+         ссылаются на одну и ту же карточку ML, MLB-нормализация их соединяет.
+      3) avg_cost_per_unit_brl — если явно задан для проекта
+      4) SKU попадает в missing_*
+
     project зарезервирован для будущих фильтров.
     """
     _ = project
     by_sku = by_sku or {}
+    sku_mlbs = sku_mlbs or {}
     idx = build_catalog_index()
+    mlb_idx = build_catalog_mlb_index()
 
     total_val = 0.0
     by_supplier: dict[str, float] = {"import": 0.0, "local": 0.0, "fallback": 0.0}
@@ -238,11 +296,25 @@ def assess_stock_for_project(
                     cost = c
             except (TypeError, ValueError):
                 pass
+        # Fallback: MLB-based lookup через stock_full entry.mlb
+        if cost is None:
+            mlb_raw = sku_mlbs.get(sku) or sku_mlbs.get(key) or ""
+            mlb_norm = _normalize_mlb(mlb_raw)
+            if mlb_norm:
+                mlb_row = mlb_idx.get(mlb_norm)
+                if mlb_row and mlb_row.get("unit_cost_brl") is not None:
+                    try:
+                        c = float(mlb_row["unit_cost_brl"])
+                        if c > 0:
+                            cost = c
+                            row = mlb_row  # use matched catalog row для supplier_type
+                    except (TypeError, ValueError):
+                        pass
         if cost is not None:
             line = q * cost
             total_val += line
             units_from_catalog += q
-            st = row["supplier_type"]
+            st = (row or {}).get("supplier_type") or "local"
             if st not in by_supplier:
                 st = "local"
             by_supplier[st] = by_supplier.get(st, 0) + line

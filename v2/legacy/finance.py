@@ -714,6 +714,7 @@ def compute_balance(project: str, as_of: date, basis: str = "accrual") -> Balanc
         stock_data.get("by_sku"),
         stock_units_external,
         legacy_avg,
+        sku_mlbs=stock_data.get("sku_mlbs"),
     )
     stock_value_brl = float(assess.get("stock_value_brl") or 0)
     stock_missing_skus = list(assess.get("missing_skus") or [])
