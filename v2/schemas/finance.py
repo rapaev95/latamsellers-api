@@ -6,9 +6,10 @@ to avoid silent renames.
 """
 from __future__ import annotations
 
+from datetime import date
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ── ОПиУ ────────────────────────────────────────────────────────────────────
@@ -78,7 +79,15 @@ class BalanceReportOut(BaseModel):
     model_config = {"extra": "ignore"}
 
     project: str
-    as_of: Optional[str] = None              # ISO YYYY-MM-DD
+    as_of: Optional[str] = None              # ISO YYYY-MM-DD (coerce from date)
+
+    @field_validator("as_of", mode="before")
+    @classmethod
+    def _coerce_as_of(cls, v):
+        # BalanceReport dataclass хранит as_of как date, схема — как str.
+        if isinstance(v, date):
+            return v.isoformat()
+        return v
 
     # ── Assets ───────────────────────────────────────────────────────────
     cash_brl: float = 0                      # opening + Σ cashflow until as_of
