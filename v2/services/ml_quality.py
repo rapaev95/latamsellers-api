@@ -162,17 +162,18 @@ async def fetch_one(
     http: httpx.AsyncClient,
     access_token: str,
     item_id: str,
-) -> Optional[dict]:
-    """One call to /item/{id}/performance. Returns normalized dict or None on failure.
+) -> tuple[Optional[dict], Optional[dict]]:
+    """One call to /item/{id}/performance.
 
-    None means "skip upsert for this item" — 404, auth issue, transport error.
-    We deliberately do not distinguish here to keep the caller simple; the
-    bulk worker counts failures.
+    Returns (row, error_info):
+      - row=dict, error=None  → success, upsert this row
+      - row=None, error=dict  → failure, contains {status, body_preview}
+
+    Callers can aggregate error_info to diagnose why bulk fails.
     """
     mlb = normalize_item_id(item_id)
     if not mlb:
-        log.debug("skip invalid item_id: %r", item_id)
-        return None
+        return None, {"status": 0, "body": f"invalid_item_id: {item_id!r}"}
     try:
         r = await http.get(
             f"{ML_API_BASE}/item/{mlb}/performance",
@@ -180,11 +181,8 @@ async def fetch_one(
             timeout=20.0,
         )
     except Exception as err:  # noqa: BLE001
-        log.warning("performance GET %s failed: %s", mlb, err)
-        return None
+        return None, {"status": 0, "body": f"network: {err}"}
     if r.status_code == 404:
-        # Some items (e.g. draft or unsupported categories) have no performance.
-        # Still write a row with null score so UI can show "—".
         return {
             "item_id": mlb,
             "score": None,
@@ -193,19 +191,15 @@ async def fetch_one(
             "calculated_at": None,
             "warnings": [],
             "opportunities": [],
-        }
+        }, None
     if r.status_code != 200:
-        log.warning("performance GET %s → %s: %s", mlb, r.status_code, r.text[:200])
-        return None
+        return None, {"status": r.status_code, "body": r.text[:300]}
     try:
         data = r.json() or {}
-    except Exception:  # noqa: BLE001
-        return None
+    except Exception as err:  # noqa: BLE001
+        return None, {"status": 200, "body": f"json_parse: {err}"}
 
     warnings, opportunities = _flatten_buckets(data.get("buckets") or [])
-    # Prefer localized level_wording ('Profissional', 'Normal', 'Básico', ...) over
-    # the internal level code ('good'/'regular'/'bad') — it's what the user sees
-    # in ML Seller Center and is fed straight to our UI badge.
     level_display = data.get("level_wording") or data.get("level")
     return {
         "item_id": mlb,
@@ -215,7 +209,7 @@ async def fetch_one(
         "calculated_at": data.get("calculated_at"),
         "warnings": warnings,
         "opportunities": opportunities,
-    }
+    }, None
 
 
 # ── Bulk refresh ──────────────────────────────────────────────────────────────
@@ -286,24 +280,41 @@ async def refresh_user_quality(
     fetched = 0
     saved = 0
     failed = 0
+    status_counts: dict[str, int] = {}
+    sample_errors: list[dict] = []
 
     async with httpx.AsyncClient() as http:
         for iid in unique_ids:
-            row = await fetch_one(http, access_token, iid)
+            row, err = await fetch_one(http, access_token, iid)
             fetched += 1
             if row is None:
                 failed += 1
+                key = str(err.get("status") if err else "unknown")
+                status_counts[key] = status_counts.get(key, 0) + 1
+                if err and len(sample_errors) < 3:
+                    sample_errors.append({"item_id": iid, **err})
             else:
                 try:
                     async with pool.acquire() as conn:
                         await _upsert_quality(conn, user_id, row)
                     saved += 1
-                except Exception as err:  # noqa: BLE001
-                    log.exception("upsert quality %s failed: %s", iid, err)
+                except Exception as upsert_err:  # noqa: BLE001
+                    log.exception("upsert quality %s failed: %s", iid, upsert_err)
                     failed += 1
+                    key = "upsert_error"
+                    status_counts[key] = status_counts.get(key, 0) + 1
+                    if len(sample_errors) < 3:
+                        sample_errors.append({"item_id": iid, "body": str(upsert_err)})
             await asyncio.sleep(RATE_SLEEP)
 
-    return {"fetched": fetched, "saved": saved, "failed": failed, "skipped": dropped_invalid}
+    return {
+        "fetched": fetched,
+        "saved": saved,
+        "failed": failed,
+        "skipped": dropped_invalid,
+        "status_counts": status_counts,
+        "sample_errors": sample_errors,
+    }
 
 
 # ── Cache readback (for /products join) ───────────────────────────────────────

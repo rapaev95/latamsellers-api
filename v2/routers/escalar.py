@@ -237,4 +237,7 @@ async def refresh_products_quality(
         "fetched": result["fetched"],
         "saved": result["saved"],
         "failed": result["failed"],
+        "skipped": result.get("skipped", 0),
+        "statusCounts": result.get("status_counts", {}),
+        "sampleErrors": result.get("sample_errors", []),
     }
