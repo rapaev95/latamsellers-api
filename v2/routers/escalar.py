@@ -6,6 +6,7 @@ from typing import Optional, Union
 from fastapi import APIRouter, Depends, Query
 
 from v2.deps import CurrentUser, current_user, get_pool
+from v2.legacy import db_storage as legacy_db
 from v2.parsers import db_loader
 from v2.schemas.escalar import EscalarProductsOut, SnoozeIn, SnoozeOut
 from v2.services import abc, ml_backfill as ml_backfill_svc, ml_oauth as ml_oauth_svc, ml_quality as ml_quality_svc, ml_visits as ml_visits_svc, projects
@@ -45,6 +46,10 @@ async def get_products(
 
     days_v = _parse_days(days)
     _step("after parse_days")
+    # Bind user_id into legacy db_storage context-var — abc.aggregate calls
+    # legacy.sku_catalog.load_catalog() for NCM/Origem/EAN/CSOSN, which is
+    # per-user. Without this bind the fiscal fields come back empty.
+    legacy_db.set_current_user_id(user.id)
     snoozed = set(await user_storage.get(pool, user.id, SNOOZE_KEY) or [])
     _step(f"after snoozed load ({len(snoozed)} items)")
     resolver = await projects.load_resolver(pool, user.id)
