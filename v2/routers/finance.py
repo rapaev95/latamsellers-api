@@ -1893,3 +1893,68 @@ def mark_planned_paid_endpoint(
         raise HTTPException(status_code=404, detail="payment_not_found")
     row = next((p for p in load_payments() if int(p.get("id") or -1) == payment_id), None)
     return {"updated": True, "payment": row}
+
+
+@router.post("/backfill-fs-to-db")
+async def backfill_fs_to_db(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Import every FS-stored vendas / armazenagem / stock_full file into the
+    `uploads` table for the current user.
+
+    Finance reports have always read from the shared filesystem (legacy).
+    Escalar's ABC aggregator uses the per-user `uploads` table (DB mode).
+    This endpoint bridges the gap: call it once, then /escalar/products will
+    see the same data Finance already shows.
+
+    Idempotent — dedup by content_sha256 on partial unique index.
+    """
+    from pathlib import Path
+    from v2.parsers.vendas_ml import VENDAS_DIR, is_vendas_ml_file
+    from v2.parsers.armazenagem import ARMAZENAGEM_DIRS, _is_armazenamento_file
+    from v2.parsers.stock_full import list_stock_full_files
+
+    if pool is None:
+        raise HTTPException(status_code=500, detail="db_pool_unavailable")
+
+    async def _ingest_dir(directory: Path, source_key: str, predicate) -> int:
+        if not directory.exists():
+            return 0
+        n = 0
+        for entry in sorted(directory.iterdir()):
+            if not entry.is_file() or not predicate(entry.name):
+                continue
+            data = entry.read_bytes()
+            await uploads_storage.put_file(
+                pool,
+                user_id=user.id,
+                source_key=source_key,
+                filename=entry.name,
+                file_bytes=data,
+            )
+            n += 1
+        return n
+
+    vendas = await _ingest_dir(VENDAS_DIR, "vendas_ml", is_vendas_ml_file)
+    armazenagem = 0
+    for d in ARMAZENAGEM_DIRS:
+        armazenagem += await _ingest_dir(d, "armazenagem_full", _is_armazenamento_file)
+
+    stock_full = 0
+    for p in list_stock_full_files():
+        data = p.read_bytes()
+        await uploads_storage.put_file(
+            pool,
+            user_id=user.id,
+            source_key="stock_full",
+            filename=p.name,
+            file_bytes=data,
+        )
+        stock_full += 1
+
+    return {
+        "vendas_ml": vendas,
+        "armazenagem_full": armazenagem,
+        "stock_full": stock_full,
+    }
