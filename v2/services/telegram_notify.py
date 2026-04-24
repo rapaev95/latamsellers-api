@@ -23,15 +23,28 @@ def _escape(text: str) -> str:
     return (text or "").translate(_MD_ESCAPE)
 
 
-def _format_message(label: str, description: str, actions: list[dict[str, Any]], notice_id: str) -> str:
+def _format_message(label: str, description: str, actions: Any, notice_id: str) -> str:
     parts: list[str] = []
     if label:
         parts.append(f"*{_escape(label)}*")
     if description:
         parts.append(_escape(description))
 
+    # actions MAY be: list[dict], list[str], a JSON-string, or None.
+    # Normalize to a list before iterating, then skip any item that isn't a dict.
+    if isinstance(actions, str):
+        try:
+            import json as _json
+            actions = _json.loads(actions)
+        except Exception:  # noqa: BLE001
+            actions = []
+    if not isinstance(actions, list):
+        actions = []
+
     action_lines: list[str] = []
-    for a in actions or []:
+    for a in actions:
+        if not isinstance(a, dict):
+            continue
         url = a.get("url") or a.get("link")
         if not url:
             continue
