@@ -70,48 +70,156 @@ def _extract_ml_url(notice_id: str, topic: Optional[str]) -> Optional[str]:
     return None
 
 
+def _fmt_date(iso: Any) -> Optional[str]:
+    if not iso or not isinstance(iso, str):
+        return None
+    # '2026-04-24T13:46:27.484Z' → '24/04 13:46'
+    try:
+        from datetime import datetime
+        s = iso.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        return dt.strftime("%d/%m %H:%M")
+    except Exception:  # noqa: BLE001
+        return iso[:16]
+
+
+def _fmt_money(amount: Any, currency: Any = "BRL") -> Optional[str]:
+    if amount is None:
+        return None
+    try:
+        f = float(amount)
+    except (TypeError, ValueError):
+        return None
+    cur = str(currency or "BRL")
+    if cur == "BRL":
+        return f"R$ {f:.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"{cur} {f:.2f}"
+
+
 def _enrich_from_raw(raw: Any, topic: Optional[str]) -> list[str]:
-    """Pull human-readable details from the full ML payload — amount, buyer, title, status."""
+    """Pull human-readable details from the full ML payload so the TG message
+    is self-contained (user doesn't need to click the link for basic info).
+    """
     if not isinstance(raw, dict):
         return []
     lines: list[str] = []
     key = (topic or "").lower()
-    # Orders — show total + buyer nickname + status
+
+    # ── ORDERS / SALES ────────────────────────────────────────────────────
     if key in ("orders_v2", "orders"):
         total = raw.get("total_amount") or raw.get("paid_amount")
         currency = raw.get("currency_id") or "BRL"
-        buyer = (raw.get("buyer") or {}).get("nickname") if isinstance(raw.get("buyer"), dict) else None
+        money = _fmt_money(total, currency)
+        if money:
+            lines.append(f"💵 {money}")
+
+        items = raw.get("order_items") or []
+        if items and isinstance(items, list):
+            parts: list[str] = []
+            for it in items[:3]:  # max 3 items
+                if not isinstance(it, dict):
+                    continue
+                inner = it.get("item") or {}
+                if not isinstance(inner, dict):
+                    continue
+                title = inner.get("title")
+                qty = it.get("quantity")
+                if title:
+                    suffix = f" × {qty}" if qty and qty != 1 else ""
+                    parts.append(f"{title}{suffix}")
+            if parts:
+                lines.append("📦 " + "\n📦 ".join(parts))
+
+        buyer = raw.get("buyer")
+        if isinstance(buyer, dict):
+            nick = buyer.get("nickname") or buyer.get("first_name")
+            if nick:
+                lines.append(f"👤 @{nick}")
+
         status = raw.get("status")
-        if total is not None:
-            lines.append(f"Valor: {currency} {total}")
-        if buyer:
-            lines.append(f"Comprador: @{buyer}")
         if status:
-            lines.append(f"Status: {status}")
-    # Items — show title + status
+            status_emoji = {"paid": "✅", "cancelled": "❌", "pending": "⏳"}.get(status, "")
+            lines.append(f"{status_emoji} {status}".strip())
+
+        when = _fmt_date(raw.get("date_created") or raw.get("date_closed"))
+        if when:
+            lines.append(f"🕐 {when}")
+
+    # ── ITEMS (status changes) ────────────────────────────────────────────
     elif key == "items":
         title = raw.get("title")
-        status = raw.get("status")
-        sub = raw.get("sub_status")
         if title:
-            lines.append(str(title))
+            lines.append(f"📦 {title}")
+        status = raw.get("status")
         if status:
-            lines.append(f"Status: {status}")
+            status_emoji = {"active": "🟢", "paused": "⏸️", "closed": "🔴", "under_review": "🟡"}.get(status, "")
+            lines.append(f"{status_emoji} Status: {status}".strip())
+        sub = raw.get("sub_status")
         if sub:
-            lines.append(f"Sub-status: {sub if isinstance(sub, str) else ', '.join(sub) if isinstance(sub, list) else sub}")
-    # Questions — show question text + item title
+            sub_str = sub if isinstance(sub, str) else (", ".join(str(s) for s in sub) if isinstance(sub, list) else str(sub))
+            if sub_str:
+                lines.append(f"⚠️ {sub_str}")
+        price = raw.get("price")
+        if price is not None:
+            lines.append(f"💵 {_fmt_money(price, raw.get('currency_id') or 'BRL')}")
+
+    # ── QUESTIONS ─────────────────────────────────────────────────────────
     elif key == "questions":
         text_q = raw.get("text")
         if text_q:
-            lines.append(str(text_q))
-    # Claims — show reason + stage
+            # Show up to 300 chars of the question
+            q = str(text_q)
+            lines.append(f"💬 {q[:300]}{'…' if len(q) > 300 else ''}")
+        item = raw.get("item") or {}
+        if isinstance(item, dict):
+            title = item.get("title")
+            if title:
+                lines.append(f"📦 {title}")
+        from_user = raw.get("from") or {}
+        if isinstance(from_user, dict):
+            nick = from_user.get("nickname")
+            if nick:
+                lines.append(f"👤 @{nick}")
+        when = _fmt_date(raw.get("date_created"))
+        if when:
+            lines.append(f"🕐 {when}")
+
+    # ── CLAIMS ────────────────────────────────────────────────────────────
     elif key == "claims":
+        claim_type = raw.get("type")
+        if claim_type:
+            lines.append(f"📄 Tipo: {claim_type}")
         reason = raw.get("reason_id") or (raw.get("reason") or {}).get("id")
-        stage = raw.get("stage")
         if reason:
-            lines.append(f"Motivo: {reason}")
+            lines.append(f"❗ Motivo: {reason}")
+        stage = raw.get("stage")
         if stage:
-            lines.append(f"Etapa: {stage}")
+            lines.append(f"🔄 Etapa: {stage}")
+        status = raw.get("status")
+        if status:
+            lines.append(f"📊 Status: {status}")
+        resource = raw.get("resource") or raw.get("resource_id")
+        if resource:
+            lines.append(f"🔗 Pedido: {resource}")
+        when = _fmt_date(raw.get("date_created"))
+        if when:
+            lines.append(f"🕐 {when}")
+
+    # ── MESSAGES (post-sale chat) ─────────────────────────────────────────
+    elif key == "messages":
+        text = raw.get("text") or raw.get("message") or (raw.get("body") or {}).get("text") if isinstance(raw.get("body"), dict) else raw.get("text")
+        if text:
+            t = str(text)
+            lines.append(f"💬 {t[:300]}{'…' if len(t) > 300 else ''}")
+        from_user = raw.get("from") or {}
+        if isinstance(from_user, dict):
+            nick = from_user.get("nickname") or from_user.get("user_id")
+            if nick:
+                lines.append(f"👤 {nick}")
+        when = _fmt_date(raw.get("message_date") or raw.get("date_created"))
+        if when:
+            lines.append(f"🕐 {when}")
+
     return lines
 
 
