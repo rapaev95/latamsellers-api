@@ -9,7 +9,7 @@ from v2.deps import CurrentUser, current_user, get_pool
 from v2.legacy import db_storage as legacy_db
 from v2.parsers import db_loader
 from v2.schemas.escalar import EscalarProductsOut, SnoozeIn, SnoozeOut
-from v2.services import abc, ml_backfill as ml_backfill_svc, ml_oauth as ml_oauth_svc, ml_quality as ml_quality_svc, ml_visits as ml_visits_svc, projects
+from v2.services import abc, ml_account_health as ml_account_health_svc, ml_backfill as ml_backfill_svc, ml_oauth as ml_oauth_svc, ml_quality as ml_quality_svc, ml_visits as ml_visits_svc, projects
 from v2.settings import get_settings
 from v2.storage import user_storage
 
@@ -419,3 +419,39 @@ async def refresh_products_visits(
         "statusCounts": result.get("status_counts", {}),
         "sampleErrors": result.get("sample_errors", []),
     }
+
+
+# ── Account health (reputation + questions count + recent orders) ─────────────
+# Cached in ml_account_health — reads return instantly, UI auto-refreshes via
+# POST when stale (>6h). Replaces the old Next.js live-fetch that hit ML on
+# every dashboard open.
+
+@router.get("/account-health")
+async def get_account_health(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Return cached health snapshot. Fields match the legacy /api/escalar/health
+    shape so the Next proxy swap is transparent to the frontend."""
+    if pool is None:
+        return {"error": "no_db", "cached": False}
+    await ml_account_health_svc.ensure_schema(pool)
+    cache = await ml_account_health_svc.get_cached(pool, user.id)
+    if cache is None:
+        return {"cached": False}
+    return {"cached": True, **cache}
+
+
+@router.post("/account-health/refresh")
+async def refresh_account_health(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Force refresh from ML (3 parallel calls → upsert one row)."""
+    if pool is None:
+        return {"error": "no_db"}
+    await ml_account_health_svc.ensure_schema(pool)
+    fresh = await ml_account_health_svc.refresh_user_health(pool, user.id)
+    if fresh is None:
+        return {"error": "ml_oauth_required"}
+    return {"refreshed": True, **fresh}
