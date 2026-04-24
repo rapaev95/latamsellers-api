@@ -187,6 +187,33 @@ async def backfill_notices(
     return {"fetched": result["fetched"], "saved": result["saved"]}
 
 
+@router.post("/notices/mark-all-read")
+async def mark_all_notices_read(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Bulk-clear the queue: mark every pending notice as sent without
+    actually sending it. Useful after a big backfill that filled the queue
+    with old platform notices the user doesn't want flooding their TG.
+    """
+    if pool is None:
+        return {"error": "db_pool_unavailable"}
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            WITH cleared AS (
+                UPDATE ml_notices
+                   SET telegram_sent_at = NOW()
+                 WHERE user_id = $1 AND telegram_sent_at IS NULL
+                RETURNING 1
+            )
+            SELECT COUNT(*) AS n FROM cleared
+            """,
+            user.id,
+        )
+    return {"cleared": int(row["n"] if row else 0)}
+
+
 @router.post("/notices/dispatch-now")
 async def dispatch_notices_now(
     user: CurrentUser = Depends(current_user),

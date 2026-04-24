@@ -169,6 +169,34 @@ async def _dispatch_to_telegram(
         chat_id = str(settings["telegram_chat_id"])
         language = settings["language"] or "pt"
 
+        # Skip low-value platform notices (invoices, price_suggestion, etc.) —
+        # they come from /communications/notices and flood the chat without
+        # useful context. Only send real seller events (orders/questions/
+        # claims/items/messages) + anything with a topic webhook topic attached.
+        NOISE_PREFIXES = (
+            "invoices:",
+            "price_suggestion:",
+            "payments:",
+            "stock-locations:",
+            "shipments:",
+            "fbm_stock_operations:",
+            "catalog_item_competition",
+            "catalog_suggestions",
+        )
+        # First pass: bulk-mark noisy notices as sent so they drop out of the
+        # queue without consuming a TG send slot. Idempotent — once cleared,
+        # future backfills won't duplicate them.
+        noise_where = " OR ".join([f"notice_id LIKE '{p}%'" for p in NOISE_PREFIXES])
+        if noise_where:
+            await conn.execute(
+                f"""
+                UPDATE ml_notices
+                   SET telegram_sent_at = NOW()
+                 WHERE user_id = $1 AND telegram_sent_at IS NULL AND ({noise_where})
+                """,
+                user_id,
+            )
+
         pending_rows = await conn.fetch(
             """
             SELECT notice_id, label, description, actions, tags, topic, raw
