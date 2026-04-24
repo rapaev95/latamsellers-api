@@ -58,6 +58,11 @@ class ABCProduct(BaseModel):
     opportunitiesCount: Optional[int] = None
     warnings: Optional[list[dict]] = None        # [{bucket, key, title, description}]
     opportunities: Optional[list[dict]] = None
+    # Item visits (from ML /items/{id}/visits/time_window, cached in ml_item_visits)
+    visits7d: Optional[int] = None
+    visits30d: Optional[int] = None
+    visitsDaily: Optional[list[dict]] = None     # [{date: "YYYY-MM-DD", total: int}]
+    visitsFetchedAt: Optional[str] = None
 
 
 class ABCMeta(BaseModel):
@@ -73,10 +78,19 @@ class ABCMeta(BaseModel):
     periodFrom: Optional[str] = None
     periodTo: Optional[str] = None
     snoozedSkus: list[str]
+    # Источник остатков для подписи в UI (stock_full | armazenagem | none)
+    stockSource: Optional[str] = None
+    stockFullSkus: Optional[int] = None
+    armazenagemSkus: Optional[int] = None
     # Most recent fetched_at across this user's ml_item_quality rows — used by UI
     # to decide if auto-refresh is needed (>24h old = stale).
     qualityFetchedAt: Optional[str] = None
     qualityCoverage: Optional[int] = None  # how many items have quality vs total
+    # Same for visits cache (ml_item_visits).
+    visitsFetchedAt: Optional[str] = None
+    visitsCoverage: Optional[int] = None
+    # Temporary diagnostic — remove once visits UI is verified.
+    visitsDebug: Optional[dict] = None
 
 
 class EscalarProductsOut(BaseModel):
