@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime
 from typing import Any, Optional
 
 import asyncpg
@@ -238,13 +239,32 @@ def _coerce_str(v) -> Optional[str]:
     return str(v)
 
 
+def _coerce_datetime(v) -> Optional[datetime]:
+    """Parse ISO-8601 string (with or without trailing 'Z') into datetime.
+
+    asyncpg's timestamptz codec refuses raw strings — must be a datetime
+    instance. ML returns e.g. '2026-04-24T13:46:27.484Z'.
+    """
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v
+    try:
+        s = str(v).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
 async def _upsert_quality(conn: asyncpg.Connection, user_id: int, row: dict) -> None:
     await conn.execute(
         """
         INSERT INTO ml_item_quality
           (user_id, item_id, score, level, status, calculated_at,
            warnings, opportunities, fetched_at)
-        VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::jsonb, $8::jsonb, NOW())
+        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, NOW())
         ON CONFLICT (user_id, item_id) DO UPDATE SET
           score = EXCLUDED.score,
           level = EXCLUDED.level,
@@ -259,7 +279,7 @@ async def _upsert_quality(conn: asyncpg.Connection, user_id: int, row: dict) -> 
         _coerce_score(row.get("score")),
         _coerce_str(row.get("level")),
         _coerce_str(row.get("status")),
-        _coerce_str(row.get("calculated_at")),
+        _coerce_datetime(row.get("calculated_at")),
         json.dumps(row.get("warnings") or [], default=str),
         json.dumps(row.get("opportunities") or [], default=str),
     )
