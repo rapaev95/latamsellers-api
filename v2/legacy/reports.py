@@ -4681,6 +4681,56 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
     returned_cnt: dict = {}
     ad_cnt: dict = {}
     ad_net: dict = {}
+    # COGS by month — qty × unit_cost_brl per vendas row (same lookup chain
+    # as compute_pnl: catalog[sku] → catalog_mlb[mlb] → avg_cost → miss).
+    cogs_by_month: dict = {}
+
+    # Загружаем sku_catalog один раз для cogs lookup (lookup для каждой vendas-строки).
+    try:
+        from .sku_catalog import (
+            build_catalog_index, build_catalog_mlb_index,
+            normalize_sku, _normalize_mlb,
+        )
+        _catalog_idx = build_catalog_index()
+        _catalog_mlb_idx = build_catalog_mlb_index()
+    except Exception:
+        _catalog_idx = {}
+        _catalog_mlb_idx = {}
+        normalize_sku = lambda s: str(s or "").strip().upper()
+        _normalize_mlb = lambda m: str(m or "").strip().upper()
+    _legacy_avg_cost = None
+    try:
+        _legacy_avg_cost_raw = proj_meta.get("avg_cost_per_unit_brl")
+        if _legacy_avg_cost_raw is not None:
+            _legacy_avg_cost = float(_legacy_avg_cost_raw)
+    except Exception:
+        _legacy_avg_cost = None
+
+    def _lookup_unit_cost(sku_raw: str, mlb_raw: str) -> float:
+        key = normalize_sku(str(sku_raw or ""))
+        row_cat = _catalog_idx.get(key) or {}
+        raw = row_cat.get("unit_cost_brl")
+        try:
+            c = float(raw) if raw is not None else None
+        except (ValueError, TypeError):
+            c = None
+        if c and c > 0:
+            return c
+        # MLB fallback
+        mlb_norm = _normalize_mlb(str(mlb_raw or ""))
+        if mlb_norm:
+            mrow = _catalog_mlb_idx.get(mlb_norm) or {}
+            raw_m = mrow.get("unit_cost_brl")
+            try:
+                cm = float(raw_m) if raw_m is not None else None
+            except (ValueError, TypeError):
+                cm = None
+            if cm and cm > 0:
+                return cm
+        # legacy avg
+        if _legacy_avg_cost and _legacy_avg_cost > 0:
+            return _legacy_avg_cost
+        return 0.0
 
     for _, row in sub.iterrows():
         d = _ymd(row.get("Data da venda"))
@@ -4707,6 +4757,21 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
             receita_envio_del[mk] = receita_envio_del.get(mk, 0.0) + re_env
             tarifa_envio_del[mk] = tarifa_envio_del.get(mk, 0.0) + te_env
             delivered_cnt[mk] = delivered_cnt.get(mk, 0) + 1
+            # COGS для доставленных: qty × unit_cost_brl
+            sku_raw = row.get("SKU do produto (seller_custom_field)") or row.get("SKU")
+            mlb_raw = row.get("Código do produto (item_id)") or row.get("MLB")
+            qty = 1  # в vendas_ml обычно 1 строка = 1 единица; если есть "Unidades", можно усилить
+            try:
+                qty_raw = row.get("Unidades")
+                if qty_raw is not None:
+                    qty = int(float(qty_raw) or 1)
+                    if qty <= 0:
+                        qty = 1
+            except (ValueError, TypeError):
+                qty = 1
+            unit_cost = _lookup_unit_cost(sku_raw, mlb_raw)
+            if unit_cost > 0:
+                cogs_by_month[mk] = cogs_by_month.get(mk, 0.0) + unit_cost * qty
             if str(row.get("Venda por publicidade", "")).strip().lower() == "sim":
                 ad_cnt[mk] = ad_cnt.get(mk, 0) + 1
                 ad_net[mk] = ad_net.get(mk, 0.0) + n
@@ -4811,6 +4876,21 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
         else:
             aluguel_by_month[mk] = round(aluguel_full * days_in_month / baseline_days, 2) if aluguel_full > 0 else 0.0
 
+    # ── Fulfillment pro-rata по заказам ──────────────────────────────────────
+    # Раньше: fulf_by_month[mk] = сумма fulfillment-трат в этот месяц (cash model).
+    # Проблема: пользователь платит lump sum-ами → расход прыгает по месяцам.
+    # Новая модель (пер-заказ):
+    #   per_order_cost = Σ fulfillment_cumul / Σ orders_cumul
+    #   fulf_by_month[mk] = per_order_cost × orders_month[mk]
+    # Общий итог за весь период совпадает, но распределение ровнее.
+    _total_fulf = sum(fulf_by_month.values())
+    _total_orders = sum(delivered_cnt.values()) + sum(returned_cnt.values())
+    if _total_orders > 0 and _total_fulf > 0:
+        _per_order_fulf = _total_fulf / _total_orders
+        for _mk in months:
+            _orders_m = delivered_cnt.get(_mk, 0) + returned_cnt.get(_mk, 0)
+            fulf_by_month[_mk] = round(_per_order_fulf * _orders_m, 2)
+
     def _row(label: str, section: str, by_month: dict, sign: int = 1, key: str = "") -> dict:
         values = {m: sign * float(by_month.get(m, 0.0)) for m in months}
         return {
@@ -4821,13 +4901,20 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
             "total": sum(values.values()),
         }
 
-    # Деривативы — учитываем все 4 расхода
+    # op_profit = revenue_net − opex (без COGS), как в compute_pnl.operating_profit.
+    # net_profit = op_profit − COGS (отдельный ряд).
     op_profit = {
         m: rev_net.get(m, 0.0)
            - publi_by_month.get(m, 0.0)
            - armaz_by_month.get(m, 0.0)
+           - fulf_by_month.get(m, 0.0)
            - das_by_month.get(m, 0.0)
            - aluguel_by_month.get(m, 0.0)
+        for m in months
+    }
+    # Net profit per month (после COGS). Опционально показывается рядом с op_profit.
+    net_profit_m = {
+        m: op_profit[m] - cogs_by_month.get(m, 0.0)
         for m in months
     }
     margin = {
@@ -4915,6 +5002,7 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
             "total": sum(ad_net.values()),
             "is_info": True,
         },
+        _row("pnl_cogs", "EXPENSES", cogs_by_month, sign=-1, key="cogs"),
         _row("pnl_publicidade", "EXPENSES", publi_by_month, sign=-1, key="publicidade"),
         _row("pnl_armazenagem", "EXPENSES", armaz_by_month, sign=-1, key="armazenagem"),
         _row("pnl_fulfillment", "EXPENSES", fulf_by_month, sign=-1, key="fulfillment"),
@@ -4929,6 +5017,14 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
             "section": "SUMMARY",
             "values": op_profit,
             "total": sum(op_profit.values()),
+            "is_total": True,
+        },
+        {
+            "key": "net_profit",
+            "label": "pnl_net_profit",
+            "section": "SUMMARY",
+            "values": net_profit_m,
+            "total": sum(net_profit_m.values()),
             "is_total": True,
         },
         {
