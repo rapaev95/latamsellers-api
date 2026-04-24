@@ -69,22 +69,56 @@ CREATE TABLE IF NOT EXISTS ml_item_quality (
 CREATE INDEX IF NOT EXISTS idx_ml_quality_user ON ml_item_quality(user_id);
 """
 
+# Legacy cleanup: before normalize_item_id() stripped '.0' suffixes, we stored
+# rows with item_id like 'MLB123.0' that never matched anything on the lookup
+# side. Delete them so refresh can repopulate with clean keys.
+CLEANUP_LEGACY_SQL = "DELETE FROM ml_item_quality WHERE item_id LIKE '%.%'"
+
 
 async def ensure_schema(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
         await conn.execute(CREATE_SQL)
+        # Idempotent — becomes a no-op once cleaned. Safe to run every start.
+        try:
+            await conn.execute(CLEANUP_LEGACY_SQL)
+        except Exception as err:  # noqa: BLE001
+            log.warning("ml_item_quality legacy cleanup failed: %s", err)
 
 
 # ── ML API ────────────────────────────────────────────────────────────────────
 
-def _normalize_item_id(item_id: str) -> str:
-    """Accept both 'MLB123' and '123' — ML's /item/{id}/performance expects full MLB id."""
-    s = str(item_id).strip().upper()
+def normalize_item_id(item_id: str) -> str:
+    """Normalize ML item id to 'MLB<digits>' form.
+
+    Handles three real-world messy inputs:
+    - 'MLB1234' → 'MLB1234' (already canonical)
+    - '1234' → 'MLB1234' (pure numeric)
+    - '1234.0' → 'MLB1234' (CSV-parsed float artifact from pandas)
+    - 'MLB1234.0' → 'MLB1234' (same, with prefix)
+
+    ML's /item/{id}/performance rejects any trailing '.0' — so we strip the
+    decimal part defensively. Returns empty string for unparseable input.
+    """
+    s = str(item_id or "").strip().upper()
     if not s:
-        return s
-    if s.startswith("MLB"):
-        return s
-    return f"MLB{s}"
+        return ""
+    numeric = s[3:] if s.startswith("MLB") else s
+    # Strip float formatting: '1234.0' → '1234'. Only if the part after '.' is
+    # all zeros (safe — real MLB ids don't contain '.').
+    if "." in numeric:
+        head, _, tail = numeric.partition(".")
+        if tail.strip("0") == "":
+            numeric = head
+        else:
+            # Unexpected non-zero fraction — treat as invalid.
+            return ""
+    if not numeric.isdigit():
+        return ""
+    return f"MLB{numeric}"
+
+
+# Backwards-compat alias in case anything still calls the private name.
+_normalize_item_id = normalize_item_id
 
 
 def _flatten_buckets(buckets: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -124,7 +158,10 @@ async def fetch_one(
     We deliberately do not distinguish here to keep the caller simple; the
     bulk worker counts failures.
     """
-    mlb = _normalize_item_id(item_id)
+    mlb = normalize_item_id(item_id)
+    if not mlb:
+        log.debug("skip invalid item_id: %r", item_id)
+        return None
     try:
         r = await http.get(
             f"{ML_API_BASE}/item/{mlb}/performance",
@@ -206,9 +243,24 @@ async def refresh_user_quality(
     Throttles to ~5 req/sec per the module constant. Callers should pass unique
     itemIds already — we do a dedup + truncate here defensively.
     """
-    unique_ids = list(dict.fromkeys([str(x).strip() for x in item_ids if x]))[:limit]
+    # Normalize + dedup upfront so callers don't need to. Invalid ids are dropped.
+    seen: set[str] = set()
+    unique_ids: list[str] = []
+    dropped_invalid = 0
+    for raw in item_ids:
+        if not raw:
+            continue
+        mlb = normalize_item_id(raw)
+        if not mlb:
+            dropped_invalid += 1
+            continue
+        if mlb in seen:
+            continue
+        seen.add(mlb)
+        unique_ids.append(mlb)
+    unique_ids = unique_ids[:limit]
     if not unique_ids:
-        return {"fetched": 0, "saved": 0, "failed": 0, "skipped": 0}
+        return {"fetched": 0, "saved": 0, "failed": 0, "skipped": dropped_invalid}
 
     try:
         access_token, _expires_at, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user_id)
@@ -236,7 +288,7 @@ async def refresh_user_quality(
                     failed += 1
             await asyncio.sleep(RATE_SLEEP)
 
-    return {"fetched": fetched, "saved": saved, "failed": failed, "skipped": 0}
+    return {"fetched": fetched, "saved": saved, "failed": failed, "skipped": dropped_invalid}
 
 
 # ── Cache readback (for /products join) ───────────────────────────────────────

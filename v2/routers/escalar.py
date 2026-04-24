@@ -90,13 +90,12 @@ async def get_products(
             _log.warning("quality map load failed: %s", err)
 
     products_out = summary["products"]
+    quality_coverage = 0
     if quality_map:
-        quality_coverage = 0
         for p in products_out:
-            item_id = (p.get("itemId") or "").strip().upper()
-            if not item_id:
+            key = ml_quality_svc.normalize_item_id(p.get("itemId"))
+            if not key:
                 continue
-            key = item_id if item_id.startswith("MLB") else f"MLB{item_id}"
             q = quality_map.get(key)
             if not q:
                 continue
@@ -111,15 +110,10 @@ async def get_products(
             p["warnings"] = q["warnings"]
             p["opportunities"] = q["opportunities"]
 
-        meta = dict(summary["meta"])
-        meta["qualityFetchedAt"] = latest_fetched_at
-        meta["qualityCoverage"] = quality_coverage
-        summary_meta = meta
-    else:
-        meta = dict(summary["meta"])
-        meta["qualityFetchedAt"] = latest_fetched_at
-        meta["qualityCoverage"] = 0
-        summary_meta = meta
+    meta = dict(summary["meta"])
+    meta["qualityFetchedAt"] = latest_fetched_at
+    meta["qualityCoverage"] = quality_coverage
+    summary_meta = meta
 
     return {
         "products": products_out,
