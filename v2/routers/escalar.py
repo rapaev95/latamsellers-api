@@ -148,6 +148,20 @@ async def get_products(
     meta["qualityCoverage"] = quality_coverage
     meta["visitsFetchedAt"] = visits_latest_fetched_at
     meta["visitsCoverage"] = visits_coverage
+    # Diagnostic — surfaces whether the DB cache actually has rows and whether
+    # keys align with product itemIds. Temporary until visits UI is verified.
+    sample_db_keys = list(visits_map.keys())[:3] if visits_map else []
+    sample_product_keys = [
+        ml_quality_svc.normalize_item_id(p.get("itemId"))
+        for p in products_out[:3]
+        if p.get("itemId")
+    ]
+    meta["visitsDebug"] = {
+        "dbRows": len(visits_map),
+        "sampleDbKeys": sample_db_keys,
+        "sampleProductKeys": sample_product_keys,
+        "productsWithItemId": sum(1 for p in products_out if p.get("itemId")),
+    }
     summary_meta = meta
 
     return {
