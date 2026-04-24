@@ -34,7 +34,7 @@ async def load_user_vendas(pool: asyncpg.Pool, user_id: int) -> list[VendasRow]:
     # Newest first (fetch_files_by_source orders by created_at DESC) → dedupe
     # prefers the most recently uploaded copy when sale_ids collide.
     for sf in files:
-        for row in parse_vendas_bytes(sf.file_bytes):
+        for row in parse_vendas_bytes(sf.file_bytes, sf.filename):
             if row.sale_id and row.sale_id in seen:
                 continue
             if row.sale_id:

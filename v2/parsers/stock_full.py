@@ -14,6 +14,8 @@ import io
 import os
 import re
 from dataclasses import dataclass, field
+
+from v2.parsers.text_cells import excel_scalar_to_clean_str
 from pathlib import Path
 
 import pandas as pd
@@ -107,7 +109,7 @@ def parse_stock_full_bytes(file_bytes: bytes) -> dict[str, StockFullSku]:
 
         for _, row in df.iterrows():
             sku_raw = row.get("SKU", "")
-            sku = ("" if sku_raw is None else str(sku_raw)).strip()
+            sku = excel_scalar_to_clean_str(sku_raw)
             if not sku or sku.lower() == "nan":
                 continue
             try:
@@ -130,8 +132,7 @@ def parse_stock_full_bytes(file_bytes: bytes) -> dict[str, StockFullSku]:
                 if tit and tit.lower() != "nan":
                     entry.title = tit[:220]
             if not entry.mlb and mlb_col:
-                m = row.get(mlb_col, "")
-                m = ("" if m is None else str(m)).strip()
+                m = excel_scalar_to_clean_str(row.get(mlb_col, ""))
                 if m and m.lower() != "nan":
                     entry.mlb = m
 

@@ -14,8 +14,13 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Callable, Iterable
+
+import unicodedata
+
+from v2.parsers.text_cells import excel_scalar_to_clean_str
 
 VENDAS_DIR = Path(__file__).resolve().parents[3].parent / "vendas"  # …/MERCADO LIVRE/vendas
 
@@ -24,23 +29,94 @@ PT_MONTHS = {
     "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12,
 }
 
-COLUMN_NAMES = {
-    "saleId": "N.º de venda",
-    "date": "Data da venda",
-    "units": "Unidades",
-    "receita": "Receita por produtos (BRL)",
-    "tarifaVenda": "Tarifa de venda e impostos (BRL)",
-    "tarifaEnvio": "Tarifas de envio (BRL)",
-    "custoTroca": "Custo de envio por troca de produto",
-    "cancelamentos": "Cancelamentos e reembolsos (BRL)",
-    "total": "Total (BRL)",
-    "ads": "Venda por publicidade",
-    "sku": "SKU",
-    "mlb": "# de anúncio",
-    "title": "Título do anúncio",
-    "shipMode": "Forma de entrega",
-    "status": "Estado",
+# ML exports sometimes change punctuation (N.º vs Nº) or encoding of ó/ã.
+# First matching column left-to-right wins (important when «Unidades» repeats).
+COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
+    "saleId": ("N.º de venda", "Nº de venda", "Número de venda", "Numero de venda"),
+    "date": ("Data da venda",),
+    "units": ("Unidades",),
+    "receita": ("Receita por produtos (BRL)",),
+    "tarifaVenda": ("Tarifa de venda e impostos (BRL)",),
+    "tarifaEnvio": ("Tarifas de envio (BRL)",),
+    "custoTroca": ("Custo de envio por troca de produto",),
+    "cancelamentos": ("Cancelamentos e reembolsos (BRL)",),
+    "total": ("Total (BRL)",),
+    "ads": ("Venda por publicidade",),
+    "sku": ("SKU",),
+    "mlb": ("# de anúncio", "# de anuncio", "# de publicación", "# de publicacion"),
+    "title": ("Título do anúncio", "Titulo do anuncio"),
+    "shipMode": ("Forma de entrega",),
+    "status": ("Estado",),
 }
+
+
+def _norm_header(s: str) -> str:
+    t = unicodedata.normalize("NFKC", (s or "").strip().strip("\ufeff")).lower()
+    return " ".join(t.split())
+
+
+def _indices_from_header_cells(cells: list[str]) -> dict[str, int]:
+    """Map logical keys → 0-based column index (first header match per key)."""
+    out: dict[str, int] = {}
+    for logical, aliases in COLUMN_ALIASES.items():
+        want = {_norm_header(a) for a in aliases}
+        for i, h in enumerate(cells):
+            if _norm_header(h) in want:
+                out[logical] = i
+                break
+    return out
+
+
+def _parse_int_units(raw: str | float | int | None) -> int:
+    if raw is None:
+        return 0
+    if isinstance(raw, float):
+        if raw != raw:  # NaN
+            return 0
+        try:
+            return int(raw)
+        except (ValueError, OverflowError):
+            return 0
+    s = str(raw).strip().replace(",", ".")
+    if not s:
+        return 0
+    try:
+        return int(float(s))
+    except ValueError:
+        return 0
+
+
+def _vendas_row_from_indices(
+    ix: dict[str, int],
+    get_cell: Callable[[str], str],
+) -> VendasRow | None:
+    sku = get_cell("sku").strip()
+    if not sku:
+        return None
+    units = _parse_int_units(get_cell("units"))
+    if units <= 0:
+        return None
+
+    def cell(k: str) -> str:
+        return get_cell(k).strip()
+
+    return VendasRow(
+        sale_id=cell("saleId"),
+        date_ms=parse_pt_date(cell("date")),
+        sku=sku,
+        mlb=excel_scalar_to_clean_str(cell("mlb")),
+        title=cell("title"),
+        units=units,
+        receita=parse_brl(cell("receita")),
+        tarifa_venda=abs(parse_brl(cell("tarifaVenda"))),
+        tarifa_envio=abs(parse_brl(cell("tarifaEnvio"))),
+        custo_troca=abs(parse_brl(cell("custoTroca"))),
+        cancelamentos=abs(parse_brl(cell("cancelamentos"))),
+        total=parse_brl(cell("total")),
+        ads=cell("ads").lower() == "sim",
+        ship_mode=cell("shipMode"),
+        status=cell("status"),
+    )
 
 
 @dataclass
@@ -140,20 +216,110 @@ def parse_csv(text: str, sep: str = ";") -> list[list[str]]:
 
 
 def is_vendas_ml_file(filename: str) -> bool:
-    """Accept any CSV in vendas/ that isn't in the deny list of other-format reports.
+    """Accept CSV/XLSX in vendas/ that isn't in the deny list of other-format reports.
 
     Some month files have corrupted filenames (e.g. `marc╠зo 26.csv` from a
     cp866→utf8 round-trip). A name-pattern accept regex was missing them and
     silently dropping a whole month of sales — so this is a deny-only filter.
     The format itself (Mercado Livre Vendas) is detected by the header row.
     """
-    if not filename.lower().endswith(".csv"):
+    if not filename.lower().endswith((".csv", ".xlsx", ".xls")):
         return False
     lower = filename.lower()
     # Other ML-related CSV formats that ship into the same folder
     deny = ("anuncios", "patrocinados", "account_statement", "after_collection",
             "armazenamento", "armazenagem", "relat.")
     return not any(p in lower for p in deny)
+
+
+def parse_vendas_dataframe(df: Any) -> list[VendasRow]:
+    """Build VendasRow list from a pandas DataFrame whose columns are ML headers."""
+    try:
+        import pandas as pd
+    except ImportError:
+        return []
+    if df is None or df.empty:
+        return []
+    header_cells = [str(c) for c in df.columns]
+    ix = _indices_from_header_cells(header_cells)
+    if "sku" not in ix or "units" not in ix:
+        return []
+
+    out: list[VendasRow] = []
+    for _, ser in df.iterrows():
+        ncols = len(ser)
+
+        def get_cell(k: str) -> str:
+            j = ix.get(k, -1)
+            if j < 0 or j >= ncols:
+                return ""
+            v = ser.iloc[j]
+            if pd.isna(v):
+                return ""
+            if isinstance(v, float) and v == int(v):
+                return str(int(v))
+            return str(v).strip()
+
+        vr = _vendas_row_from_indices(ix, get_cell)
+        if vr is not None:
+            out.append(vr)
+    return out
+
+
+def _try_pandas_ml_vendas_blob(filename: str, file_bytes: bytes) -> Any:
+    """Same heuristics as `v2.legacy.reports._parse_one_vendas_file` (finance preview).
+
+    Escalar used to call only the strict RFC-style CSV parser; ML monthly files
+    and some XLSX exports load here when that parser returns empty.
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        return None
+    buf = BytesIO(file_bytes)
+    fn = (filename or "").lower()
+    if fn.endswith(".csv"):
+        for enc in ("utf-8", "utf-8-sig", "latin-1"):
+            buf.seek(0)
+            try:
+                df = pd.read_csv(
+                    buf,
+                    sep=";",
+                    skiprows=5,
+                    encoding=enc,
+                    low_memory=False,
+                    decimal=",",
+                    thousands=".",
+                )
+                if "Estado" in df.columns or "N.º de venda" in df.columns:
+                    return df
+            except Exception:
+                continue
+        return None
+    if fn.endswith((".xlsx", ".xls")):
+        for _h in (5, 6, 4, 7):
+            buf.seek(0)
+            try:
+                df = pd.read_excel(buf, sheet_name=0, header=_h)
+                if "Estado" in df.columns or "N.º de venda" in df.columns:
+                    return df
+            except Exception:
+                continue
+        return None
+    return None
+
+
+def parse_vendas_xlsx_bytes(file_bytes: bytes) -> list[VendasRow]:
+    """Mercado Livre «Relatório de vendas» as .xlsx (skiprows=5 first)."""
+    try:
+        import pandas as pd
+    except ImportError:
+        return []
+    try:
+        df = pd.read_excel(BytesIO(file_bytes), engine="openpyxl", skiprows=5, header=0)
+    except Exception:
+        return []
+    return parse_vendas_dataframe(df)
 
 
 def parse_vendas_text(text: str) -> list[VendasRow]:
@@ -163,61 +329,35 @@ def parse_vendas_text(text: str) -> list[VendasRow]:
     if len(rows) < 7:
         return []
     header = rows[5]
-
-    def find_idx(name: str) -> int:
-        for i, h in enumerate(header):
-            if (h or "").strip() == name:
-                return i
-        return -1
-
-    ix = {k: find_idx(v) for k, v in COLUMN_NAMES.items()}
-    if ix["sku"] < 0 or ix["units"] < 0:
+    ix = _indices_from_header_cells(header)
+    if "sku" not in ix or "units" not in ix:
         return []
 
     out: list[VendasRow] = []
     for r in range(6, len(rows)):
         row = rows[r]
-        if ix["sku"] >= len(row):
-            continue
-        sku = (row[ix["sku"]] or "").strip()
-        if not sku:
-            continue
-        units_raw = (row[ix["units"]] or "").strip() if ix["units"] < len(row) else ""
-        try:
-            units = int(units_raw or "0")
-        except ValueError:
-            units = 0
-        if units <= 0:
-            continue
 
-        def cell(k: str) -> str:
-            j = ix[k]
+        def get_cell(k: str) -> str:
+            j = ix.get(k, -1)
             if j < 0 or j >= len(row):
                 return ""
-            return row[j] or ""
+            return (row[j] or "").strip()
 
-        out.append(VendasRow(
-            sale_id=cell("saleId").strip(),
-            date_ms=parse_pt_date(cell("date").strip()),
-            sku=sku,
-            mlb=cell("mlb").strip(),
-            title=cell("title").strip(),
-            units=units,
-            receita=parse_brl(cell("receita")),
-            tarifa_venda=abs(parse_brl(cell("tarifaVenda"))),
-            tarifa_envio=abs(parse_brl(cell("tarifaEnvio"))),
-            custo_troca=abs(parse_brl(cell("custoTroca"))),
-            cancelamentos=abs(parse_brl(cell("cancelamentos"))),
-            total=parse_brl(cell("total")),
-            ads=cell("ads").strip().lower() == "sim",
-            ship_mode=cell("shipMode").strip(),
-            status=cell("status").strip(),
-        ))
+        vr = _vendas_row_from_indices(ix, get_cell)
+        if vr is not None:
+            out.append(vr)
     return out
 
 
 def read_vendas_file(path: Path) -> list[VendasRow]:
-    """FS-source shim around `parse_vendas_text`. Kept for backward compat."""
+    """FS-source: CSV (UTF-8 text) or XLSX (openpyxl)."""
+    suf = path.suffix.lower()
+    if suf in (".xlsx", ".xls"):
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return []
+        return parse_vendas_xlsx_bytes(data)
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
@@ -225,14 +365,30 @@ def read_vendas_file(path: Path) -> list[VendasRow]:
     return parse_vendas_text(text)
 
 
-def parse_vendas_bytes(file_bytes: bytes) -> list[VendasRow]:
-    """DB-source shim: decode raw bytes then parse. Silently skips undecodable."""
+def parse_vendas_bytes(file_bytes: bytes, filename: str | None = None) -> list[VendasRow]:
+    """Decode vendas ML from uploaded bytes (CSV text or XLSX ZIP).
+
+    `filename` enables a pandas fallback aligned with `/finance/uploads/.../preview`
+    when the strict line-6 CSV parser yields no rows (common for some ML exports).
+    """
+    if len(file_bytes) >= 4 and file_bytes[:2] == b"PK":
+        xrows = parse_vendas_xlsx_bytes(file_bytes)
+        if xrows:
+            return xrows
     for enc in ("utf-8", "utf-8-sig", "latin-1"):
         try:
             text = file_bytes.decode(enc)
         except UnicodeDecodeError:
             continue
-        return parse_vendas_text(text)
+        rows = parse_vendas_text(text)
+        if rows:
+            return rows
+    if filename:
+        df = _try_pandas_ml_vendas_blob(filename, file_bytes)
+        if df is not None and not df.empty:
+            alt = parse_vendas_dataframe(df)
+            if alt:
+                return alt
     return []
 
 
