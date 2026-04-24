@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from v2.deps import CurrentUser, current_user, get_pool
 from v2.parsers import db_loader
 from v2.schemas.escalar import EscalarProductsOut, SnoozeIn, SnoozeOut
-from v2.services import abc, ml_backfill as ml_backfill_svc, projects
+from v2.services import abc, ml_backfill as ml_backfill_svc, ml_quality as ml_quality_svc, projects
 from v2.settings import get_settings
 from v2.storage import user_storage
 
@@ -75,10 +75,56 @@ async def get_products(
         vendas_filenames=vendas_filenames,
     )
     _step(f"after abc.aggregate (products={len(summary['products'])})")
+
+    # Join cached listing quality (ml_item_quality) — fast dict lookup by itemId.
+    quality_map: dict = {}
+    latest_fetched_at = None
+    if pool is not None:
+        try:
+            await ml_quality_svc.ensure_schema(pool)
+            async with pool.acquire() as conn:
+                quality_map = await ml_quality_svc.get_cached_map(conn, user.id)
+                latest_fetched_at = await ml_quality_svc.get_latest_fetched_at(conn, user.id)
+            _step(f"after quality map load ({len(quality_map)} items)")
+        except Exception as err:  # noqa: BLE001
+            _log.warning("quality map load failed: %s", err)
+
+    products_out = summary["products"]
+    if quality_map:
+        quality_coverage = 0
+        for p in products_out:
+            item_id = (p.get("itemId") or "").strip().upper()
+            if not item_id:
+                continue
+            key = item_id if item_id.startswith("MLB") else f"MLB{item_id}"
+            q = quality_map.get(key)
+            if not q:
+                continue
+            quality_coverage += 1
+            p["qualityScore"] = q["score"]
+            p["qualityLevel"] = q["level"]
+            p["qualityStatus"] = q["status"]
+            p["qualityCalculatedAt"] = q["calculatedAt"]
+            p["qualityFetchedAt"] = q["fetchedAt"]
+            p["warningsCount"] = q["warningsCount"]
+            p["opportunitiesCount"] = q["opportunitiesCount"]
+            p["warnings"] = q["warnings"]
+            p["opportunities"] = q["opportunities"]
+
+        meta = dict(summary["meta"])
+        meta["qualityFetchedAt"] = latest_fetched_at
+        meta["qualityCoverage"] = quality_coverage
+        summary_meta = meta
+    else:
+        meta = dict(summary["meta"])
+        meta["qualityFetchedAt"] = latest_fetched_at
+        meta["qualityCoverage"] = 0
+        summary_meta = meta
+
     return {
-        "products": summary["products"],
-        "hasData": len(summary["products"]) > 0,
-        "meta": summary["meta"],
+        "products": products_out,
+        "hasData": len(products_out) > 0,
+        "meta": summary_meta,
     }
 
 
@@ -110,3 +156,51 @@ async def backfill_notices(
     async with httpx.AsyncClient() as http:
         result = await ml_backfill_svc.backfill_user(pool, http, user.id, days=days)
     return {"fetched": result["fetched"], "saved": result["saved"]}
+
+
+@router.post("/products/refresh-quality")
+async def refresh_products_quality(
+    limit: int = Query(500, ge=1, le=1000),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Rebuild the ml_item_quality cache for this user's items.
+
+    Triggered by the Next.js UI when the cache is missing or stale (>24h).
+    Walks the user's product list (same ABC aggregator as /products), extracts
+    unique itemIds and calls /item/{id}/performance for each (throttled).
+    """
+    # Build the same product list as /products to know which itemIds to refresh.
+    snoozed = set(await user_storage.get(pool, user.id, SNOOZE_KEY) or [])
+    resolver = await projects.load_resolver(pool, user.id)
+
+    vendas_rows = None
+    storage_map = None
+    stock_full_map = None
+    vendas_filenames = None
+    if get_settings().storage_mode == "db" and pool is not None:
+        vendas_rows = await db_loader.load_user_vendas(pool, user.id)
+        storage_map = await db_loader.load_user_armazenagem(pool, user.id)
+        stock_full_map = await db_loader.load_user_stock_full(pool, user.id)
+        vendas_filenames = await db_loader.list_user_vendas_filenames(pool, user.id)
+
+    summary = abc.aggregate(
+        days="all",
+        project="",
+        snoozed_skus=snoozed,
+        resolver=resolver,
+        vendas_rows=vendas_rows,
+        storage_map=storage_map,
+        stock_full_map=stock_full_map,
+        vendas_filenames=vendas_filenames,
+    )
+    item_ids = [p.get("itemId") for p in summary["products"] if p.get("itemId")]
+
+    await ml_quality_svc.ensure_schema(pool)
+    result = await ml_quality_svc.refresh_user_quality(pool, user.id, item_ids, limit=limit)
+    return {
+        "totalItems": len(item_ids),
+        "fetched": result["fetched"],
+        "saved": result["saved"],
+        "failed": result["failed"],
+    }

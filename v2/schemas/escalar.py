@@ -48,6 +48,16 @@ class ABCProduct(BaseModel):
     ean: Optional[str] = None
     csosn_venda: Optional[str] = None
     descricao_nfe: Optional[str] = None
+    # Listing quality (from ML /item/{id}/performance, cached in ml_item_quality)
+    qualityScore: Optional[float] = None        # 0..100
+    qualityLevel: Optional[str] = None           # "Basic" | "Standard" | "Professional"
+    qualityStatus: Optional[str] = None          # "PENDING" | "COMPLETED"
+    qualityCalculatedAt: Optional[str] = None    # ISO timestamp from ML
+    qualityFetchedAt: Optional[str] = None       # When we pulled it (for TTL)
+    warningsCount: Optional[int] = None
+    opportunitiesCount: Optional[int] = None
+    warnings: Optional[list[dict]] = None        # [{bucket, key, title, description}]
+    opportunities: Optional[list[dict]] = None
 
 
 class ABCMeta(BaseModel):
@@ -63,6 +73,10 @@ class ABCMeta(BaseModel):
     periodFrom: Optional[str] = None
     periodTo: Optional[str] = None
     snoozedSkus: list[str]
+    # Most recent fetched_at across this user's ml_item_quality rows — used by UI
+    # to decide if auto-refresh is needed (>24h old = stale).
+    qualityFetchedAt: Optional[str] = None
+    qualityCoverage: Optional[int] = None  # how many items have quality vs total
 
 
 class EscalarProductsOut(BaseModel):
