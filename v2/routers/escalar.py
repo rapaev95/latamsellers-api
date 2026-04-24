@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from v2.deps import CurrentUser, current_user, get_pool
 from v2.parsers import db_loader
 from v2.schemas.escalar import EscalarProductsOut, SnoozeIn, SnoozeOut
-from v2.services import abc, ml_backfill as ml_backfill_svc, ml_quality as ml_quality_svc, projects
+from v2.services import abc, ml_backfill as ml_backfill_svc, ml_oauth as ml_oauth_svc, ml_quality as ml_quality_svc, projects
 from v2.settings import get_settings
 from v2.storage import user_storage
 
