@@ -9,7 +9,18 @@ from v2.deps import CurrentUser, current_user, get_pool
 from v2.legacy import db_storage as legacy_db
 from v2.parsers import db_loader
 from v2.schemas.escalar import EscalarProductsOut, SnoozeIn, SnoozeOut
-from v2.services import abc, ml_account_health as ml_account_health_svc, ml_backfill as ml_backfill_svc, ml_oauth as ml_oauth_svc, ml_quality as ml_quality_svc, ml_visits as ml_visits_svc, projects
+from v2.services import (
+    abc,
+    ml_account_health as ml_account_health_svc,
+    ml_backfill as ml_backfill_svc,
+    ml_oauth as ml_oauth_svc,
+    ml_quality as ml_quality_svc,
+    ml_user_claims as ml_user_claims_svc,
+    ml_user_items as ml_user_items_svc,
+    ml_user_questions as ml_user_questions_svc,
+    ml_visits as ml_visits_svc,
+    projects,
+)
 from v2.settings import get_settings
 from v2.storage import user_storage
 
@@ -455,3 +466,117 @@ async def refresh_account_health(
     if fresh is None:
         return {"error": "ml_oauth_required"}
     return {"refreshed": True, **fresh}
+
+
+# ── Items catalog (cached ML /users/{id}/items/search + /items?ids=) ──────────
+
+@router.get("/user-items")
+async def get_user_items(
+    status: str = Query("active"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    if pool is None:
+        return {"error": "no_db", "items": [], "total": 0}
+    await ml_user_items_svc.ensure_schema(pool)
+    return await ml_user_items_svc.get_cached(pool, user.id, status=status, limit=limit, offset=offset)
+
+
+@router.post("/user-items/refresh")
+async def refresh_user_items(
+    status: str = Query("active"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    if pool is None:
+        return {"error": "no_db"}
+    await ml_user_items_svc.ensure_schema(pool)
+    return await ml_user_items_svc.refresh_user_items(pool, user.id, status=status)
+
+
+# ── Questions Q&A (cached ML /my/received_questions/search) ───────────────────
+
+@router.get("/user-questions")
+async def get_user_questions(
+    status: str = Query("ALL"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    if pool is None:
+        return {"error": "no_db", "questions": [], "total": 0}
+    await ml_user_questions_svc.ensure_schema(pool)
+    return await ml_user_questions_svc.get_cached(pool, user.id, status=status)
+
+
+@router.post("/user-questions/refresh")
+async def refresh_user_questions(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    if pool is None:
+        return {"error": "no_db"}
+    await ml_user_questions_svc.ensure_schema(pool)
+    return await ml_user_questions_svc.refresh_user_questions(pool, user.id)
+
+
+class _AnswerIn(__import__("pydantic").BaseModel):
+    questionId: int
+    text: str
+
+
+@router.post("/user-questions/answer")
+async def answer_question(
+    body: _AnswerIn,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Post answer to ML, then update the cached row so UI reflects the reply
+    immediately — no need to wait for the next refresh cycle."""
+    if pool is None:
+        return {"error": "no_db"}
+    try:
+        token, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        return {"error": "ml_oauth_required", "detail": str(err)}
+    async with httpx.AsyncClient() as http:
+        r = await http.post(
+            "https://api.mercadolibre.com/answers",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={"question_id": body.questionId, "text": body.text},
+            timeout=15.0,
+        )
+        if r.status_code >= 400:
+            return {"error": "ml_error", "status": r.status_code, "body": r.text[:500]}
+    await ml_user_questions_svc.ensure_schema(pool)
+    await ml_user_questions_svc.upsert_one_answered(pool, user.id, body.questionId, body.text)
+    return {"success": True}
+
+
+# ── Claims (cached ML /post-purchase/v1/claims/search + enrich) ───────────────
+
+@router.get("/user-claims")
+async def get_user_claims(
+    status: str = Query("ALL"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    if pool is None:
+        return {"error": "no_db", "claims": [], "total": 0}
+    await ml_user_claims_svc.ensure_schema(pool)
+    return await ml_user_claims_svc.get_cached(pool, user.id, status=status)
+
+
+@router.post("/user-claims/refresh")
+async def refresh_user_claims(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    if pool is None:
+        return {"error": "no_db"}
+    await ml_user_claims_svc.ensure_schema(pool)
+    return await ml_user_claims_svc.refresh_user_claims(pool, user.id)
