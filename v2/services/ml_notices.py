@@ -171,7 +171,7 @@ async def _dispatch_to_telegram(
 
         pending_rows = await conn.fetch(
             """
-            SELECT notice_id, label, description, actions
+            SELECT notice_id, label, description, actions, tags, topic, raw
               FROM ml_notices
              WHERE user_id = $1 AND telegram_sent_at IS NULL
              ORDER BY from_date ASC NULLS FIRST
@@ -187,6 +187,9 @@ async def _dispatch_to_telegram(
             "label": row["label"],
             "description": row["description"],
             "actions": row["actions"] or [],
+            "tags": row["tags"] or [],
+            "topic": row["topic"],
+            "raw": row["raw"] or {},
         }
         ok = await tg_svc.send_notice(chat_id, notice, language, http)
         if ok:
