@@ -182,7 +182,10 @@ async def fetch_one(
         )
     except Exception as err:  # noqa: BLE001
         return None, {"status": 0, "body": f"network: {err}"}
-    if r.status_code == 404:
+    # 400 / 404: item has no performance data available (deactivated, FBM-only,
+    # unsupported category, etc). Save a null row so UI shows "—" and we don't
+    # re-hit ML for this item on every refresh.
+    if r.status_code in (400, 404):
         return {
             "item_id": mlb,
             "score": None,
@@ -214,6 +217,27 @@ async def fetch_one(
 
 # ── Bulk refresh ──────────────────────────────────────────────────────────────
 
+def _coerce_score(v) -> Optional[float]:
+    """asyncpg's NUMERIC codec is picky about ints-vs-floats; normalize to float|None."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    # NaN/Inf would break jsonb too and make no sense for a score.
+    import math
+    if math.isnan(f) or math.isinf(f):
+        return None
+    return f
+
+
+def _coerce_str(v) -> Optional[str]:
+    if v is None:
+        return None
+    return str(v)
+
+
 async def _upsert_quality(conn: asyncpg.Connection, user_id: int, row: dict) -> None:
     await conn.execute(
         """
@@ -232,12 +256,12 @@ async def _upsert_quality(conn: asyncpg.Connection, user_id: int, row: dict) -> 
         """,
         user_id,
         row["item_id"],
-        row.get("score"),
-        row.get("level"),
-        row.get("status"),
-        row.get("calculated_at"),
-        json.dumps(row.get("warnings") or []),
-        json.dumps(row.get("opportunities") or []),
+        _coerce_score(row.get("score")),
+        _coerce_str(row.get("level")),
+        _coerce_str(row.get("status")),
+        _coerce_str(row.get("calculated_at")),
+        json.dumps(row.get("warnings") or [], default=str),
+        json.dumps(row.get("opportunities") or [], default=str),
     )
 
 
