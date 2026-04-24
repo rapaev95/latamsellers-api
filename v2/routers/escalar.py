@@ -59,6 +59,7 @@ async def get_products(
     storage_map = None
     stock_full_map = None
     vendas_filenames = None
+    publicidade_rows = None
     if get_settings().storage_mode == "db" and pool is not None:
         vendas_rows = await db_loader.load_user_vendas(pool, user.id)
         _step(f"after load_user_vendas ({len(vendas_rows)} rows)")
@@ -68,6 +69,8 @@ async def get_products(
         _step(f"after load_user_stock_full ({len(stock_full_map)} skus)")
         vendas_filenames = await db_loader.list_user_vendas_filenames(pool, user.id)
         _step(f"after list_vendas_filenames ({len(vendas_filenames)} files)")
+        publicidade_rows = await db_loader.load_user_publicidade(pool, user.id)
+        _step(f"after load_user_publicidade ({len(publicidade_rows)} rows)")
 
     summary = abc.aggregate(
         days=days_v,
@@ -78,6 +81,7 @@ async def get_products(
         storage_map=storage_map,
         stock_full_map=stock_full_map,
         vendas_filenames=vendas_filenames,
+        publicidade_rows=publicidade_rows,
     )
     _step(f"after abc.aggregate (products={len(summary['products'])})")
 

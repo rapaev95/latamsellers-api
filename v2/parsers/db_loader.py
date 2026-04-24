@@ -13,6 +13,7 @@ from typing import Iterable
 import asyncpg
 
 from v2.parsers.armazenagem import StorageData, parse_armazenagem_bytes
+from v2.parsers.publicidade import PublicidadeRow, parse_publicidade_bytes
 from v2.parsers.stock_full import StockFullSku, parse_stock_full_bytes
 from v2.parsers.vendas_ml import VendasRow, parse_vendas_bytes
 from v2.storage import uploads_storage
@@ -20,6 +21,7 @@ from v2.storage import uploads_storage
 VENDAS_SOURCE_KEY = "vendas_ml"
 ARMAZENAGEM_SOURCE_KEY = "armazenagem_full"
 STOCK_FULL_SOURCE_KEY = "stock_full"
+PUBLICIDADE_SOURCE_KEY = "ads_publicidade"
 
 
 async def load_user_vendas(pool: asyncpg.Pool, user_id: int) -> list[VendasRow]:
@@ -78,6 +80,24 @@ async def load_user_stock_full(pool: asyncpg.Pool, user_id: int) -> dict[str, St
             if sku not in merged:
                 merged[sku] = entry
     return merged
+
+
+async def load_user_publicidade(pool: asyncpg.Pool, user_id: int) -> list[PublicidadeRow]:
+    """All Product Ads rows from the user's uploaded reports, deduped by
+    (mlb, desde, ate, investimento). ML can emit overlapping monthly exports
+    the same way vendas does — same period values would double-count otherwise.
+    """
+    files = await uploads_storage.fetch_files_by_source(pool, user_id, PUBLICIDADE_SOURCE_KEY)
+    seen: set[tuple] = set()
+    out: list[PublicidadeRow] = []
+    for sf in files:
+        for row in parse_publicidade_bytes(sf.file_bytes, sf.filename):
+            key = (row.mlb, row.desde.isoformat(), row.ate.isoformat(), row.investimento)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
+    return out
 
 
 def dedupe_vendas_rows(rows: Iterable[VendasRow]) -> list[VendasRow]:

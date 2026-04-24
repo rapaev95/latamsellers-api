@@ -16,8 +16,28 @@ from typing import Any, Iterable
 
 from v2.parsers.vendas_ml import VendasRow, list_vendas_files, load_all_vendas, shipping_mode_key
 from v2.parsers.armazenagem import StorageData, load_all_armazenagem
+from v2.parsers.publicidade import PublicidadeRow
 from v2.parsers.stock_full import StockFullSku, load_all_stock_full
 from v2.services.projects import ProjectResolver
+from v2.parsers.text_cells import excel_scalar_to_clean_str
+
+
+def _normalize_mlb(raw: str | None) -> str:
+    """Produce 'MLB{digits}' form for join keys. Mirrors ml_quality.normalize_item_id
+    but inlined to avoid cross-service import chain."""
+    s = str(raw or "").strip().upper()
+    if not s:
+        return ""
+    numeric = s[3:] if s.startswith("MLB") else s
+    if "." in numeric:
+        head, _, tail = numeric.partition(".")
+        if tail.strip("0") == "":
+            numeric = head
+        else:
+            return ""
+    if not numeric.isdigit():
+        return ""
+    return f"MLB{numeric}"
 
 
 # Поля из Dados Fiscais, пробрасываемые в каждую запись продукта для UI.
@@ -30,6 +50,12 @@ _DADOS_FISCAIS_PRODUCT_FIELDS = (
 
 def _empty_dados_fiscais_fields() -> dict[str, Any]:
     return {k: None for k in _DADOS_FISCAIS_PRODUCT_FIELDS}
+
+
+def _item_id_json(mlb: str | None) -> str | None:
+    """Strip Excel float tail from MLB for JSON / UI."""
+    s = excel_scalar_to_clean_str(mlb or "")
+    return s or None
 
 LEAD_TIME = 30
 BATCH_SIZE = 100
@@ -67,6 +93,7 @@ def aggregate(
     storage_map: dict[str, StorageData] | None = None,
     stock_full_map: dict[str, StockFullSku] | None = None,
     vendas_filenames: list[str] | None = None,
+    publicidade_rows: Iterable[PublicidadeRow] | None = None,
 ) -> dict[str, Any]:
     """Build full ABC summary. Returns dict with `products` and `meta`.
 
@@ -110,6 +137,35 @@ def aggregate(
         if not item:
             return _empty_dados_fiscais_fields()
         return {k: item.get(k) for k in _DADOS_FISCAIS_PRODUCT_FIELDS}
+
+    def _unit_cost_for(sku: str) -> float:
+        """COGS from sku_catalog. Populated by Dados Fiscais sync (custo_brl) OR
+        manual entry in /finance/sku-mapping. 0.0 if neither — UI flags this."""
+        item = _catalog_by_sku.get((sku or "").upper())
+        if not item:
+            return 0.0
+        raw = item.get("unit_cost_brl")
+        if raw is None:
+            return 0.0
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+
+    # Aggregate ads investment per MLB over the selected period. Publicidade
+    # export rows have `desde`/`ate` (period they cover) and `investimento` (R$).
+    # We sum all rows whose `ate` falls after the cutoff.
+    ads_by_mlb: dict[str, float] = {}
+    if publicidade_rows is not None:
+        for pr in publicidade_rows:
+            if cutoff_ms > 0:
+                pr_ms = int(datetime(pr.ate.year, pr.ate.month, pr.ate.day).timestamp() * 1000)
+                if pr_ms < cutoff_ms:
+                    continue
+            mlb_key = _normalize_mlb(pr.mlb)
+            if not mlb_key:
+                continue
+            ads_by_mlb[mlb_key] = ads_by_mlb.get(mlb_key, 0.0) + pr.investimento
 
     source_rows: Iterable[VendasRow] = vendas_rows if vendas_rows is not None else load_all_vendas()
     filenames: list[str] = (
@@ -183,10 +239,19 @@ def aggregate(
         sales_per_day = (a.units / st.days_in_stock) if (st and st.days_in_stock > 0) else 0.0
         days_of_stock = (current_stock / sales_per_day) if sales_per_day > 0 else 0.0
 
-        ad_pu = 0.0
-        unit_cost = 0.0
+        # Ads cost per-unit — sum of investimento across ALL campaigns for this
+        # MLB in the selected period, divided by units sold.
+        mlb_key = _normalize_mlb(a.mlb)
+        ads_total = ads_by_mlb.get(mlb_key, 0.0) if mlb_key else 0.0
+        ad_pu = (ads_total / a.units) if a.units > 0 else 0.0
+        # COGS — from Dados Fiscais sync (custo_brl) or manual /finance/sku-mapping.
+        unit_cost = _unit_cost_for(a.sku)
         margin = avg_price - comm_pu - ship_pu - refund_pu - ad_pu - storage_pu - unit_cost
         margin_pct = (margin / avg_price * 100) if avg_price > 0 else 0.0
+        # ROI = profit_per_unit / cost_per_unit. Cost = COGS + ad spend (what
+        # the seller actually puts at risk). Returns 0 if no cost basis yet.
+        cost_basis = unit_cost + ad_pu
+        roi = (margin / cost_basis * 100) if cost_basis > 0 else 0.0
 
         dominant_ship = max(a.shipping_modes.items(), key=lambda x: x[1])[0] if a.shipping_modes else None
         ad_pct = (a.ad_orders / a.total_orders * 100) if a.total_orders > 0 else 0.0
@@ -215,7 +280,7 @@ def aggregate(
         products.append({
             "sku": a.sku,
             "title": a.title,
-            "itemId": a.mlb or None,
+            "itemId": _item_id_json(a.mlb),
             "units": a.units,
             "revenue": a.revenue,
             "avgPrice": avg_price,
@@ -227,7 +292,7 @@ def aggregate(
             "unitCost": unit_cost,
             "margin": margin,
             "marginPct": margin_pct,
-            "roi": 0.0,
+            "roi": roi,
             "abcGrade": "C",
             "revenuePct": 0.0,
             "cumulativePct": 0.0,
@@ -262,10 +327,11 @@ def aggregate(
             continue
         st = storage_map.get(sku)
         dominant_ship = None
+        idle_unit_cost = _unit_cost_for(sku)
         products.append({
             "sku": sku,
             "title": sf.title or (st.produto if st else sku),
-            "itemId": sf.mlb or (st.mlb if st else None) or None,
+            "itemId": _item_id_json(sf.mlb or (st.mlb if st else "") or ""),
             "units": 0,
             "revenue": 0.0,
             "avgPrice": 0.0,
@@ -274,7 +340,7 @@ def aggregate(
             "adPerUnit": 0.0,
             "storagePerUnit": 0.0,
             "refundPerUnit": 0.0,
-            "unitCost": 0.0,
+            "unitCost": idle_unit_cost,
             "margin": 0.0,
             "marginPct": 0.0,
             "roi": 0.0,
@@ -308,11 +374,26 @@ def aggregate(
         p["cumulativePct"] = cum
         p["abcGrade"] = "A" if cum <= 80 else "B" if cum <= 95 else "C"
 
-    project_set: set[str] = set(resolver.project_names) if resolver else set()
-    if not project_set:
+    # Dropdown «проект»: не только ключи из `projects`, но и фактические resolve()
+    # по продажам / складу / каталогу — иначе при пустом `projects` в БД список пустой.
+    project_set: set[str] = set()
+    if resolver:
+        project_set.update(resolver.project_names)
         for a in by_sku.values():
-            proj = resolver.resolve(a.sku, a.mlb) if resolver else ""
-            if proj:
+            proj = resolver.resolve(a.sku, a.mlb)
+            if proj and str(proj).upper() != "NAO_CLASSIFICADO":
+                project_set.add(proj)
+        for sku, sf in (stock_full_map or {}).items():
+            if sku in snoozed_skus:
+                continue
+            proj = resolver.resolve(sku, (sf.mlb or "").strip())
+            if proj and str(proj).upper() != "NAO_CLASSIFICADO":
+                project_set.add(proj)
+        for it in resolver.catalog.values():
+            if not isinstance(it, dict):
+                continue
+            proj = (it.get("project") or "").strip()
+            if proj and proj.upper() != "NAO_CLASSIFICADO":
                 project_set.add(proj)
 
     period_from = datetime.fromtimestamp(min_date / 1000).strftime("%Y-%m-%d") if max_date > 0 else None
