@@ -122,7 +122,12 @@ _normalize_item_id = normalize_item_id
 
 
 def _flatten_buckets(buckets: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Split variables across all buckets into (warnings, opportunities)."""
+    """Split rules across all buckets → variables → rules into (warnings, opportunities).
+
+    ML structure (verified via /quality-probe):
+      buckets[] → variables[] → rules[{mode, status, progress, wordings{title,label,link}}]
+    The `mode` lives on `rules[]` — NOT on the variable itself.
+    """
     warnings: list[dict] = []
     opportunities: list[dict] = []
     for b in buckets or []:
@@ -131,19 +136,25 @@ def _flatten_buckets(buckets: list[dict]) -> tuple[list[dict], list[dict]]:
         for v in variables:
             if not isinstance(v, dict):
                 continue
-            mode = (v.get("mode") or "").upper()
-            entry = {
-                "bucket": bucket_key,
-                "key": v.get("key"),
-                "title": v.get("title"),
-                "description": v.get("description"),
-                "status": v.get("status"),
-                "score": v.get("score"),
-            }
-            if mode == "WARNING":
-                warnings.append(entry)
-            elif mode == "OPPORTUNITY":
-                opportunities.append(entry)
+            var_title = v.get("title")
+            rules = v.get("rules") or []
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    continue
+                mode = (rule.get("mode") or "").upper()
+                wordings = rule.get("wordings") or {}
+                entry = {
+                    "bucket": bucket_key,
+                    "key": rule.get("key") or v.get("key"),
+                    "title": wordings.get("title") or var_title,
+                    "description": wordings.get("label"),
+                    "link": wordings.get("link"),
+                    "status": rule.get("status"),
+                }
+                if mode == "WARNING":
+                    warnings.append(entry)
+                elif mode == "OPPORTUNITY":
+                    opportunities.append(entry)
     return warnings, opportunities
 
 
@@ -192,10 +203,14 @@ async def fetch_one(
         return None
 
     warnings, opportunities = _flatten_buckets(data.get("buckets") or [])
+    # Prefer localized level_wording ('Profissional', 'Normal', 'Básico', ...) over
+    # the internal level code ('good'/'regular'/'bad') — it's what the user sees
+    # in ML Seller Center and is fed straight to our UI badge.
+    level_display = data.get("level_wording") or data.get("level")
     return {
         "item_id": mlb,
         "score": data.get("score"),
-        "level": data.get("level"),
+        "level": level_display,
         "status": data.get("status"),
         "calculated_at": data.get("calculated_at"),
         "warnings": warnings,
