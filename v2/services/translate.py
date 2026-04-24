@@ -1,26 +1,45 @@
-"""Claude Haiku pt→ru translator for ML notices.
+"""ML notices translator — via OpenRouter (OpenAI-compatible chat API).
 
-Zero-cost fast-path when the text is already Cyrillic or empty.
-System prompt (glossary) is marked cache_control=ephemeral so repeated
-calls within 5 minutes read from the prompt cache instead of re-billing tokens.
+Supported targets: ru, en. Portuguese (pt) is source — for pt target we skip.
+
+Fast-paths (no API call):
+- Empty/whitespace → return as is.
+- Target=ru and text already contains Cyrillic → return as is.
+- Target=en and text has no Portuguese-specific letters (ã/ç/õ/etc.) and no
+  Cyrillic → assume already English-ish, return as is.
+
+Glossary is sent as system prompt; OpenRouter forwards `cache_control`
+hints to providers that support them (Anthropic, etc.) so repeated calls
+within the 5-minute window can reuse the cached prompt.
+
+Env:
+  OPENROUTER_API_KEY — required for live translation.
+  TRANSLATE_MODEL — optional, default "anthropic/claude-haiku-4.5".
 """
 from __future__ import annotations
 
 import logging
 import os
 import re
-from typing import Optional
+from typing import Literal, Optional
 
 import httpx
 
 log = logging.getLogger(__name__)
 
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-MODEL = "claude-haiku-4-5-20251001"
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_MODEL = "anthropic/claude-haiku-4.5"
+
+# Target languages we actually translate TO. 'pt' is source — no-op.
+TargetLang = Literal["ru", "en", "pt"]
 
 _CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+# Portuguese-specific accented letters — if absent AND no cyrillic, a text in
+# "en-speaker's e-commerce vocabulary" is probably already English-adjacent.
+_PT_SPECIFIC_RE = re.compile(r"[ãâáàçéêíõôóúü]", re.IGNORECASE)
 
-SYSTEM_GLOSSARY = """Você é um tradutor profissional de português brasileiro para russo, especializado em e-commerce do Mercado Livre.
+
+GLOSSARY_RU = """Você é um tradutor profissional de português brasileiro para russo, especializado em e-commerce do Mercado Livre.
 
 REGRAS:
 1. Traduza o texto fornecido do pt-BR para o ru, preservando o sentido técnico exato dos termos oficiais do Mercado Livre.
@@ -57,33 +76,104 @@ GLOSSÁRIO OBRIGATÓRIO (pt → ru):
 - desativação → деактивация"""
 
 
-async def translate_pt_ru(text: Optional[str], http: Optional[httpx.AsyncClient] = None) -> str:
-    """Translate pt-BR → ru. Returns original on failure or fast-path match."""
+GLOSSARY_EN = """You are a professional translator from Brazilian Portuguese to English, specialized in Mercado Livre e-commerce.
+
+RULES:
+1. Translate the provided text from pt-BR to en, preserving the exact technical sense of Mercado Livre's official terminology.
+2. Keep links, IDs, URLs, and alphanumeric codes intact.
+3. Do not add comments, explanations, or markdown — return ONLY the translation.
+4. Preserve line breaks if present.
+
+REQUIRED GLOSSARY (pt → en):
+- comissão → commission
+- tarifa de venda → sales fee
+- frete → shipping
+- envio → shipment
+- anúncio → listing
+- publicação → listing
+- produto → product
+- venda → sale
+- comprador → buyer
+- vendedor → seller
+- reclamação → claim
+- mediação → mediation
+- reputação → reputation
+- conta → account
+- moderação → moderation
+- faturamento → billing
+- fatura → invoice
+- cancelamento → cancellation
+- reembolso → refund
+- estoque → stock
+- Full → Full (keep as is)
+- MLB → MLB (keep as is)
+- permalink → product link
+- política → policy
+- suspensão → suspension
+- desativação → deactivation"""
+
+
+def _fast_path(text: str, target: TargetLang) -> Optional[str]:
+    """Return translated text if we can skip the API call, else None."""
     if not text or not text.strip():
         return text or ""
-    if _CYRILLIC_RE.search(text):
-        # Already (partly) Russian — skip.
+    if target == "pt":
+        # No translation needed — pt is our source.
         return text
+    if target == "ru" and _CYRILLIC_RE.search(text):
+        return text
+    if target == "en" and not _CYRILLIC_RE.search(text) and not _PT_SPECIFIC_RE.search(text):
+        # Latin-only text without pt-specific diacritics — assume already English-ish.
+        return text
+    return None
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+
+async def translate(
+    text: Optional[str],
+    target: TargetLang = "ru",
+    http: Optional[httpx.AsyncClient] = None,
+) -> str:
+    """Translate pt-BR text to `target`. Returns original on failure or fast-path hit.
+
+    target='pt' is a no-op (returns text unchanged).
+    """
+    raw = text or ""
+    if target == "pt":
+        return raw
+
+    skip = _fast_path(raw, target)
+    if skip is not None:
+        return skip
+
+    api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        log.warning("ANTHROPIC_API_KEY not set — returning original text")
-        return text
+        log.warning("OPENROUTER_API_KEY not set — returning original text")
+        return raw
+
+    model = os.environ.get("TRANSLATE_MODEL", DEFAULT_MODEL)
+    glossary = GLOSSARY_RU if target == "ru" else GLOSSARY_EN
 
     payload = {
-        "model": MODEL,
+        "model": model,
         "max_tokens": 1024,
-        "system": [
-            {"type": "text", "text": SYSTEM_GLOSSARY, "cache_control": {"type": "ephemeral"}},
-        ],
         "messages": [
-            {"role": "user", "content": text},
+            # OpenRouter accepts cache_control in `system` content parts for
+            # providers that support it (Anthropic via OpenRouter).
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": glossary, "cache_control": {"type": "ephemeral"}},
+                ],
+            },
+            {"role": "user", "content": raw},
         ],
     }
     headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        # Optional attribution headers recommended by OpenRouter (harmless).
+        "HTTP-Referer": "https://app.lsprofit.app",
+        "X-Title": "LS Profit App",
     }
 
     client = http
@@ -91,18 +181,36 @@ async def translate_pt_ru(text: Optional[str], http: Optional[httpx.AsyncClient]
     if owns_client:
         client = httpx.AsyncClient(timeout=20.0)
     try:
-        r = await client.post(ANTHROPIC_API_URL, json=payload, headers=headers)
+        r = await client.post(OPENROUTER_API_URL, json=payload, headers=headers)
         if r.status_code != 200:
-            log.warning("Anthropic %s: %s", r.status_code, r.text[:200])
-            return text
+            log.warning("OpenRouter %s: %s", r.status_code, r.text[:200])
+            return raw
         data = r.json()
-        content = data.get("content") or []
-        if content and isinstance(content, list) and content[0].get("type") == "text":
-            return content[0].get("text", text) or text
-        return text
+        choices = data.get("choices") or []
+        if not choices:
+            return raw
+        content = choices[0].get("message", {}).get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        # Some providers return content as list of parts.
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    txt = part.get("text")
+                    if isinstance(txt, str) and txt.strip():
+                        return txt.strip()
+        return raw
     except Exception as err:  # noqa: BLE001
-        log.exception("translate_pt_ru failed: %s", err)
-        return text
+        log.exception("translate failed (target=%s): %s", target, err)
+        return raw
     finally:
         if owns_client and client is not None:
             await client.aclose()
+
+
+# ── Backwards-compat shim ─────────────────────────────────────────────────────
+# telegram_notify.py currently calls translate_pt_ru(). Keep it working until
+# that caller migrates to the generic translate(target=...).
+
+async def translate_pt_ru(text: Optional[str], http: Optional[httpx.AsyncClient] = None) -> str:
+    return await translate(text, target="ru", http=http)

@@ -59,9 +59,10 @@ async def send_notice(
     label = notice.get("label") or ""
     description = notice.get("description") or ""
 
-    if language == "ru":
-        label = await translate_svc.translate_pt_ru(label, http=http)
-        description = await translate_svc.translate_pt_ru(description, http=http)
+    # language: 'pt' (no translation), 'ru', or 'en'. Anything else → treated as 'pt'.
+    if language in ("ru", "en"):
+        label = await translate_svc.translate(label, target=language, http=http)
+        description = await translate_svc.translate(description, target=language, http=http)
 
     text = _format_message(
         label=label,
