@@ -468,13 +468,28 @@ def compute_pnl(
     elif _regime == "lucro_presumido":
         das_label = "DAS Lucro Presumido + ICMS"
 
-    opex_items = [
-        ("Publicidade (Mercado Ads)", publicidade_val),
-        (das_label, das_val),
-        ("Armazenagem Full", armazenagem_val),
-        ("Aluguel empresa (proрационально)", aluguel_val),
+    # Fulfillment — manual_expenses[fulfillment] + bank_tx[fulfillment] за период.
+    # Note: "R$ X/продажа" если есть продажи (пользователь просил раскладку на шт).
+    try:
+        from .reports import get_fulfillment_by_period as _fulf_by_period
+        fulfillment_val = round(float(_fulf_by_period(project, period_start, period_end)), 2)
+    except Exception:
+        fulfillment_val = 0.0
+    fulfillment_note = ""
+    if fulfillment_val > 0 and vendas_count > 0:
+        fulfillment_note = f"R$ {fulfillment_val/vendas_count:.2f}/продажа"
+
+    opex_items: list[tuple[str, float, str]] = [
+        ("Publicidade (Mercado Ads)", publicidade_val, ""),
+        (das_label, das_val, ""),
+        ("Armazenagem Full", armazenagem_val, ""),
+        ("Fulfillment (доставка до клиента)", fulfillment_val, fulfillment_note),
+        ("Aluguel empresa (proрационально)", aluguel_val, ""),
     ]
-    operating_expenses = [PnLLine(label=lbl, amount_brl=val) for lbl, val in opex_items]
+    operating_expenses = [
+        PnLLine(label=lbl, amount_brl=val, note=note)
+        for lbl, val, note in opex_items
+    ]
     opex_total = sum(line.amount_brl for line in operating_expenses)
     operating_profit = revenue_net - opex_total
 
@@ -749,11 +764,17 @@ def compute_cashflow(project: str, period: tuple[date, date]) -> CashFlowReport:
     # op_profit из compute_pnl включает прорейт аренды → вычитаем его обратно,
     # чтобы строка «Операционный приток» не дублировалась с реальными платежами.
     aluguel_accrual_brl = 0.0
+    fulfillment_accrual_brl = 0.0
     for line in (pnl.operating_expenses or []):
         lbl = (line.label or "").lower()
         if lbl.startswith("aluguel") or "alug" in lbl:
             aluguel_accrual_brl += float(line.amount_brl or 0)
-    op_profit_cash = op_profit + aluguel_accrual_brl  # восстанавливаем до-арендной прибыли
+        elif "fulfillment" in lbl or "фулфилмент" in lbl:
+            # manual_expenses[fulfillment] уже в other_expenses_total (cash),
+            # а compute_pnl вычитает их через operating_expenses. Чтобы не
+            # задваивать — возвращаем их обратно в op_profit_cash.
+            fulfillment_accrual_brl += float(line.amount_brl or 0)
+    op_profit_cash = op_profit + aluguel_accrual_brl + fulfillment_accrual_brl
 
     # Фактически оплаченные rental.payments в периоде (status=paid)
     rental = proj_meta.get("rental") or {}
@@ -960,8 +981,15 @@ def compute_balance(
             rate = 5.46
         out_aluguel += usd * rate
 
-    # 6. Full Express — пока нет парсера
-    out_full_express = 0.0
+    # 6. Fulfillment — manual_expenses[category=fulfillment] + bank_tx[fulfillment]
+    #    cumulative от 2025-01-01 до as_of (тот же диапазон что для PnL period
+    #    в строчке выше). Балансовая строка outflow_full_express теперь показывает
+    #    реальные fulfillment-расходы (а не 0).
+    try:
+        from .reports import get_fulfillment_by_period as _fulf_by_period_bal
+        out_full_express = round(float(_fulf_by_period_bal(project, date(2025, 1, 1), as_of)), 2)
+    except Exception:
+        out_full_express = 0.0
 
     # 7. Mercadoria = фактические платежи поставщикам (из ДДС/banking + manual_supplier)
     # НЕ stock_value: чтобы не дублировать (stock_value = оставшийся актив,

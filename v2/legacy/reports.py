@@ -1385,7 +1385,9 @@ def aggregate_classified_by_project(project: str, after_date: str | None = None)
 
 
 VENDAS_ML_DELIVERED_PATTERNS = [
-    "Entregue", "Venda entregue", "No ponto de retirada", "Troca entregue",
+    # «No ponto de retirada» — pacote na agência aguardando retirada; não é venda
+    # quitada pelo comprador → não entra em delivered (evita inflar bruto/NET).
+    "Entregue", "Venda entregue", "Troca entregue",
     "Mediação finalizada. Te demos o dinheiro",  # медиация в нашу пользу
     "Venda com solicitação de alteração",         # продажа с запросом изменений (деньги остаются)
     "Pacote de",                                   # «Pacote de 2 produtos» — multi-item доставлено
@@ -3636,6 +3638,75 @@ def get_armazenagem_by_period(project: str, period_from, period_to) -> dict:
     }
 
 
+def get_fulfillment_by_period(project: str, period_from, period_to) -> float:
+    """Сумма BRL фулфилмент-расходов за период.
+
+    Два источника:
+      1) `project.manual_expenses` с `category == "fulfillment"` — ручные
+         записи из ДДС "💸 Прочий расход".
+      2) `aggregate_classified_by_project(project)` → `transactions` с
+         `Категория == "fulfillment"` — банковские транзакции, автоматом
+         классифицированные по правилам `_AUTO_RULES` (config.py:733-735)
+         или вручную через UI правил.
+
+    Периодная фильтрация: `period_from <= date <= period_to`.
+    """
+    from datetime import datetime as _dt_fulf
+    from .config import load_projects as _lp
+    total = 0.0
+    # 1. manual_expenses
+    proj_meta = (_lp() or {}).get(project.upper(), {}) or {}
+    for item in (proj_meta.get("manual_expenses") or []):
+        if str(item.get("category", "")).lower() != "fulfillment":
+            continue
+        ds = str(item.get("date", ""))[:10]
+        if not ds:
+            continue
+        try:
+            d = _dt_fulf.strptime(ds, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            continue
+        if period_from <= d <= period_to:
+            # _entry_valor_brl живёт в finance.py, переносить сюда не хочется —
+            # дублируем минимальную логику: currency BRL → val; иначе val × rate.
+            try:
+                v = abs(float(item.get("valor", 0) or 0))
+            except (ValueError, TypeError):
+                v = 0.0
+            cur = str(item.get("currency", "BRL") or "BRL").upper()
+            if cur != "BRL":
+                try:
+                    rate = float(item.get("rate_brl", 0) or 0)
+                    if rate > 0:
+                        v = v * rate
+                except (ValueError, TypeError):
+                    pass
+            total += v
+
+    # 2. bank_tx (classified)
+    try:
+        live = aggregate_classified_by_project(project)
+        for tx in (live.get("transactions") or []):
+            if str(tx.get("Категория", "")).lower() != "fulfillment":
+                continue
+            ds = str(tx.get("Data", ""))
+            try:
+                # Дата в формате dd/mm/yyyy
+                import pandas as _pd_fulf
+                td = _pd_fulf.to_datetime(ds, dayfirst=True).date()
+            except Exception:
+                continue
+            if period_from <= td <= period_to:
+                try:
+                    total += abs(float(tx.get("Valor", 0) or 0))
+                except (ValueError, TypeError):
+                    pass
+    except Exception:
+        pass
+
+    return round(total, 2)
+
+
 def get_devolucoes_by_project() -> dict:
     """Парсит все devolucoes_ml.csv (claims/reclamações Mercado Pago) из _data/.
     Маппит каждую строку через order_id → SKU из collection MP → проект.
@@ -4696,6 +4767,7 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
 
     publi_by_month: dict = {}
     armaz_by_month: dict = {}
+    fulf_by_month: dict = {}     # Fulfillment — per-month из manual_expenses[category=fulfillment] + bank_tx[category=fulfillment]
     das_by_month: dict = {}
     das_info_by_month: dict = {}  # per-month {faixa, effective_pct, rbt12, ...}
     aluguel_by_month: dict = {}
@@ -4713,6 +4785,10 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
             armaz_by_month[mk] = float(get_armazenagem_by_period(project, pf, pt_).get("total", 0.0))
         except Exception:
             armaz_by_month[mk] = 0.0
+        try:
+            fulf_by_month[mk] = float(get_fulfillment_by_period(project, pf, pt_))
+        except Exception:
+            fulf_by_month[mk] = 0.0
         # DAS — по выбранному tax_regime. RBT12 считаем ПО КОМПАНИИ (сумма
         # bruto всех проектов с тем же company_cnpj) — именно так работает
         # Simples Nacional: одна компания → общий faixa.
@@ -4780,6 +4856,8 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
         _row("pnl_rev_gross", "REVENUE", rev_gross, key="rev_gross"),
         _row("pnl_tarifa_venda", "REVENUE", rev_tarifa, key="tarifa_venda"),
         _row("pnl_envios", "REVENUE", rev_envios, key="envios"),
+        # is_info children of pnl_envios — скрываются по умолчанию, раскрываются
+        # по клику на pnl_envios на фронте (PnlMonthlyTable.tsx).
         {
             "key": "envio_receita_ml_col",
             "label": "pnl_envio_receita_ml_col",
@@ -4811,6 +4889,7 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
             "is_info": True,
         },
         _row("pnl_cancelamentos", "REVENUE", rev_cancel, key="cancelamentos"),
+        # is_info children of pnl_cancelamentos
         {
             "key": "returned_cancelamentos",
             "label": "pnl_returned_cancelamentos",
@@ -4838,6 +4917,7 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
         },
         _row("pnl_publicidade", "EXPENSES", publi_by_month, sign=-1, key="publicidade"),
         _row("pnl_armazenagem", "EXPENSES", armaz_by_month, sign=-1, key="armazenagem"),
+        _row("pnl_fulfillment", "EXPENSES", fulf_by_month, sign=-1, key="fulfillment"),
         {
             **_row("pnl_das", "EXPENSES", das_by_month, sign=-1, key="das"),
             "tax_info": _build_das_tax_info(proj_meta, das_info_by_month, months),
