@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from v2.deps import CurrentUser, current_user, get_pool
 from v2.parsers import db_loader
 from v2.schemas.escalar import EscalarProductsOut, SnoozeIn, SnoozeOut
-from v2.services import abc, ml_backfill as ml_backfill_svc, ml_oauth as ml_oauth_svc, ml_quality as ml_quality_svc, projects
+from v2.services import abc, ml_backfill as ml_backfill_svc, ml_oauth as ml_oauth_svc, ml_quality as ml_quality_svc, ml_visits as ml_visits_svc, projects
 from v2.settings import get_settings
 from v2.storage import user_storage
 
@@ -110,9 +110,39 @@ async def get_products(
             p["warnings"] = q["warnings"]
             p["opportunities"] = q["opportunities"]
 
+    # Join cached ML visits (ml_item_visits) — same dict-lookup pattern.
+    visits_map: dict = {}
+    visits_latest_fetched_at = None
+    if pool is not None:
+        try:
+            await ml_visits_svc.ensure_schema(pool)
+            async with pool.acquire() as conn:
+                visits_map = await ml_visits_svc.get_cached_map(conn, user.id)
+                visits_latest_fetched_at = await ml_visits_svc.get_latest_fetched_at(conn, user.id)
+            _step(f"after visits map load ({len(visits_map)} items)")
+        except Exception as err:  # noqa: BLE001
+            _log.warning("visits map load failed: %s", err)
+
+    visits_coverage = 0
+    if visits_map:
+        for p in products_out:
+            key = ml_quality_svc.normalize_item_id(p.get("itemId"))
+            if not key:
+                continue
+            v = visits_map.get(key)
+            if not v:
+                continue
+            visits_coverage += 1
+            p["visits7d"] = v["visits7d"]
+            p["visits30d"] = v["visits30d"]
+            p["visitsDaily"] = v["daily"]
+            p["visitsFetchedAt"] = v["fetchedAt"]
+
     meta = dict(summary["meta"])
     meta["qualityFetchedAt"] = latest_fetched_at
     meta["qualityCoverage"] = quality_coverage
+    meta["visitsFetchedAt"] = visits_latest_fetched_at
+    meta["visitsCoverage"] = visits_coverage
     summary_meta = meta
 
     return {
@@ -232,6 +262,56 @@ async def refresh_products_quality(
 
     await ml_quality_svc.ensure_schema(pool)
     result = await ml_quality_svc.refresh_user_quality(pool, user.id, item_ids, limit=limit)
+    return {
+        "totalItems": len(item_ids),
+        "fetched": result["fetched"],
+        "saved": result["saved"],
+        "failed": result["failed"],
+        "skipped": result.get("skipped", 0),
+        "statusCounts": result.get("status_counts", {}),
+        "sampleErrors": result.get("sample_errors", []),
+    }
+
+
+@router.post("/products/refresh-visits")
+async def refresh_products_visits(
+    limit: int = Query(500, ge=1, le=1000),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Rebuild the ml_item_visits cache for this user's items.
+
+    Mirrors refresh-quality: walks the same product list, calls ML
+    `/items/{id}/visits/time_window?last=30&unit=day` per item (throttled)
+    and upserts into ml_item_visits.
+    """
+    snoozed = set(await user_storage.get(pool, user.id, SNOOZE_KEY) or [])
+    resolver = await projects.load_resolver(pool, user.id)
+
+    vendas_rows = None
+    storage_map = None
+    stock_full_map = None
+    vendas_filenames = None
+    if get_settings().storage_mode == "db" and pool is not None:
+        vendas_rows = await db_loader.load_user_vendas(pool, user.id)
+        storage_map = await db_loader.load_user_armazenagem(pool, user.id)
+        stock_full_map = await db_loader.load_user_stock_full(pool, user.id)
+        vendas_filenames = await db_loader.list_user_vendas_filenames(pool, user.id)
+
+    summary = abc.aggregate(
+        days="all",
+        project="",
+        snoozed_skus=snoozed,
+        resolver=resolver,
+        vendas_rows=vendas_rows,
+        storage_map=storage_map,
+        stock_full_map=stock_full_map,
+        vendas_filenames=vendas_filenames,
+    )
+    item_ids = [p.get("itemId") for p in summary["products"] if p.get("itemId")]
+
+    await ml_visits_svc.ensure_schema(pool)
+    result = await ml_visits_svc.refresh_user_visits(pool, user.id, item_ids, limit=limit)
     return {
         "totalItems": len(item_ids),
         "fetched": result["fetched"],
