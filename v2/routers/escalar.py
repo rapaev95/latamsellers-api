@@ -182,6 +182,54 @@ async def backfill_notices(
     return {"fetched": result["fetched"], "saved": result["saved"]}
 
 
+@router.post("/notices/dispatch-now")
+async def dispatch_notices_now(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Manually trigger TG dispatch for current user — bypasses cron schedule.
+
+    Diagnoses why messages aren't arriving: runs _dispatch_to_telegram with
+    full exception visibility, returns counts + any error.
+    """
+    from v2.services import ml_notices as ml_notices_svc
+    if pool is None:
+        return {"error": "db_pool_unavailable"}
+
+    # Pre-check: how many notices are actually pending for this user?
+    async with pool.acquire() as conn:
+        pending_row = await conn.fetchrow(
+            "SELECT COUNT(*) AS n FROM ml_notices WHERE user_id = $1 AND telegram_sent_at IS NULL",
+            user.id,
+        )
+        pending = int(pending_row["n"] if pending_row else 0)
+        settings_row = await conn.fetchrow(
+            """
+            SELECT telegram_chat_id, notify_ml_news, COALESCE(language, 'pt') AS language
+              FROM notification_settings WHERE user_id = $1
+            """,
+            user.id,
+        )
+
+    try:
+        async with httpx.AsyncClient() as http:
+            sent = await ml_notices_svc._dispatch_to_telegram(pool, http, user.id)
+        return {
+            "pending_before": pending,
+            "sent": sent,
+            "settings": dict(settings_row) if settings_row else None,
+        }
+    except Exception as err:  # noqa: BLE001
+        import traceback
+        return {
+            "pending_before": pending,
+            "sent": 0,
+            "error": str(err),
+            "traceback": traceback.format_exc()[:2000],
+            "settings": dict(settings_row) if settings_row else None,
+        }
+
+
 @router.get("/products/quality-probe")
 async def quality_probe(
     item_id: str = Query(..., min_length=1),
