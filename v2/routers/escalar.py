@@ -152,6 +152,46 @@ async def backfill_notices(
     return {"fetched": result["fetched"], "saved": result["saved"]}
 
 
+@router.get("/products/quality-probe")
+async def quality_probe(
+    item_id: str = Query(..., min_length=1),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Diagnostic — call ML /item/{id}/performance with this user's token and
+    return the RAW response (status + body) without touching the cache.
+
+    Used to figure out why bulk refresh fails en masse (scope / 404 / etc).
+    Remove once cache is stable; safe to keep since it's per-user auth-gated.
+    """
+    mlb = ml_quality_svc.normalize_item_id(item_id)
+    if not mlb:
+        return {"error": "invalid_item_id", "normalized": None, "raw_input": item_id}
+    try:
+        access_token, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        return {"error": "token_refresh_failed", "detail": str(err)}
+
+    url = f"https://api.mercadolibre.com/item/{mlb}/performance"
+    async with httpx.AsyncClient() as http:
+        try:
+            r = await http.get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15.0)
+        except Exception as err:  # noqa: BLE001
+            return {"error": "network", "detail": str(err), "url": url, "normalized": mlb}
+
+    return {
+        "raw_input": item_id,
+        "normalized": mlb,
+        "url": url,
+        "status": r.status_code,
+        "headers_subset": {
+            "content-type": r.headers.get("content-type"),
+            "x-request-id": r.headers.get("x-request-id"),
+        },
+        "body": (r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text[:1000]),
+    }
+
+
 @router.post("/products/refresh-quality")
 async def refresh_products_quality(
     limit: int = Query(500, ge=1, le=1000),
