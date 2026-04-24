@@ -1958,3 +1958,72 @@ async def backfill_fs_to_db(
         "armazenagem_full": armazenagem,
         "stock_full": stock_full,
     }
+
+
+@router.get("/uploads/debug")
+async def uploads_debug(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Show what's in `uploads` for the current user + how many rows each
+    vendas file parses into. Diagnoses the "Finance sees data, Escalar
+    shows zero" mismatch.
+    """
+    if pool is None:
+        raise HTTPException(status_code=500, detail="db_pool_unavailable")
+
+    async with pool.acquire() as conn:
+        by_source = await conn.fetch(
+            """
+            SELECT source_key, COUNT(*) AS n, MAX(created_at) AS last_upload,
+                   SUM(LENGTH(file_bytes)) AS total_bytes
+              FROM uploads
+             WHERE user_id = $1
+             GROUP BY source_key
+             ORDER BY n DESC
+            """,
+            user.id,
+        )
+        vendas_files = await conn.fetch(
+            """
+            SELECT id, filename, LENGTH(file_bytes) AS bytes,
+                   to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+              FROM uploads
+             WHERE user_id = $1 AND source_key = 'vendas_ml'
+             ORDER BY created_at DESC
+            """,
+            user.id,
+        )
+
+    # Parse each vendas file via the same parser db_loader uses
+    from v2.parsers.vendas_ml import parse_vendas_bytes
+    parse_results = []
+    async with pool.acquire() as conn:
+        for f in vendas_files[:5]:  # first 5 only, to keep payload small
+            row = await conn.fetchrow(
+                "SELECT file_bytes FROM uploads WHERE id = $1", f["id"]
+            )
+            if not row:
+                continue
+            try:
+                rows = parse_vendas_bytes(row["file_bytes"], f["filename"])
+                parse_results.append({
+                    "filename": f["filename"],
+                    "bytes": f["bytes"],
+                    "parsed_rows": len(rows),
+                    "sample_skus": [r.sku for r in rows[:3] if r.sku],
+                })
+            except Exception as err:  # noqa: BLE001
+                parse_results.append({
+                    "filename": f["filename"],
+                    "bytes": f["bytes"],
+                    "parse_error": str(err)[:300],
+                })
+
+    return {
+        "user_id": user.id,
+        "by_source": [dict(r) for r in by_source],
+        "vendas_files_count": len(vendas_files),
+        "vendas_files_sample": [dict(f) for f in vendas_files[:10]],
+        "parse_results": parse_results,
+    }
