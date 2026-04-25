@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional, Union
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 
 from v2.deps import CurrentUser, current_user, get_pool
 from v2.legacy import db_storage as legacy_db
@@ -580,6 +580,92 @@ async def refresh_user_claims(
         return {"error": "no_db"}
     await ml_user_claims_svc.ensure_schema(pool)
     return await ml_user_claims_svc.refresh_user_claims(pool, user.id)
+
+
+# ── Clips probe (TEST step) ──────────────────────────────────────────────────
+# ML deprecated youtube `video_id` on items as of 2024-09-09 — only Clips
+# uploads work now. The endpoint uses cbt_item_id (Cross-Border Trading), so
+# we don't yet know whether it accepts a regular MLB item from a local seller
+# or 403s us. This probe pushes a real video file once and returns the raw
+# response so we can decide whether to invest in the full Clips integration.
+
+@router.post("/clips/probe")
+async def clips_probe(
+    item_id: str = Form(..., description="MLB item id to attach the test clip to"),
+    file: UploadFile = File(..., description="Test video — MP4/MOV/MPEG/AVI, 10-61s, ≤280MB"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """One-shot upload to ML `/marketplace/items/{item_id}/clips/upload`.
+
+    Returns the RAW HTTP response (status, headers, body) without any parsing
+    or DB write. Throw-away once we know which response shape ML returns
+    (clip id? moderation status? domain-specific error?).
+
+    Cleanup: if status_code == 200, you'll need to remove the test clip via
+    the seller hub (no DELETE endpoint documented).
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    try:
+        access_token, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        return {"error": "ml_oauth_required", "detail": str(err)}
+
+    # Normalize id: accept "MLB123", "MLB-123", or pure numeric.
+    raw = (item_id or "").strip().upper()
+    if raw.startswith("MLB-"):
+        raw = "MLB" + raw[4:]
+    if not raw.startswith("MLB"):
+        raw = f"MLB{raw}"
+
+    body_bytes = await file.read()
+    file_size_kb = len(body_bytes) / 1024
+
+    url = f"https://api.mercadolibre.com/marketplace/items/{raw}/clips/upload"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as http:
+            files = {
+                "file": (file.filename or "clip.mp4", body_bytes, file.content_type or "video/mp4"),
+            }
+            r = await http.post(
+                url,
+                files=files,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+    except Exception as err:  # noqa: BLE001
+        return {
+            "error": "network",
+            "detail": str(err),
+            "url": url,
+            "file_size_kb": round(file_size_kb, 2),
+        }
+
+    content_type = r.headers.get("content-type", "")
+    try:
+        body = r.json() if "json" in content_type else r.text[:2000]
+    except Exception:  # noqa: BLE001
+        body = r.text[:2000]
+
+    return {
+        "url": url,
+        "item_id_normalized": raw,
+        "file_name": file.filename,
+        "file_size_kb": round(file_size_kb, 2),
+        "file_content_type": file.content_type,
+        "status": r.status_code,
+        "headers": {
+            "content-type": content_type,
+            "x-request-id": r.headers.get("x-request-id"),
+            "x-ratelimit-remaining": r.headers.get("x-ratelimit-remaining"),
+        },
+        "body": body,
+        "hint": (
+            "200 → Clips API works for our account, можно строить full integration. "
+            "403/404 → cbt_item_id only — для local MLB не доступно, отказываемся. "
+            "413 → файл слишком большой. 415 → не тот content-type."
+        ),
+    }
 
 
 # ── Promotions probe (TEST step before building cache) ───────────────────────
