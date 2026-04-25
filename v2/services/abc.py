@@ -174,6 +174,15 @@ def aggregate(
         else [f.name for f in list_vendas_files()]
     )
 
+    # Snooze list accepts either a SKU or an MLB id — TG "Ignorar SKU" button
+    # passes item_id (MLB) since paused-item notices don't carry the SKU.
+    # Pre-normalize once so the per-row check is O(1) for both forms.
+    snoozed_mlbs: set[str] = set()
+    for s in snoozed_skus:
+        norm = _normalize_mlb(s)
+        if norm:
+            snoozed_mlbs.add(norm)
+
     rows: list[VendasRow] = []
     min_date = float("inf")
     max_date = 0
@@ -187,6 +196,9 @@ def aggregate(
             if proj != project_lc:
                 continue
         if row.sku in snoozed_skus:
+            continue
+        # Also skip if the row's MLB is in the snooze list (TG "Ignorar SKU" path).
+        if snoozed_mlbs and _normalize_mlb(row.mlb) in snoozed_mlbs:
             continue
         if row.date_ms > 0:
             min_date = min(min_date, row.date_ms)
@@ -321,6 +333,8 @@ def aggregate(
     sold_skus = set(by_sku.keys())
     for sku, sf in (stock_full_map or {}).items():
         if sku in sold_skus or sku in snoozed_skus or sf.total <= 0:
+            continue
+        if snoozed_mlbs and _normalize_mlb(sf.mlb) in snoozed_mlbs:
             continue
         proj_resolved = resolver.resolve(sku, sf.mlb) if resolver else ""
         if project_lc and proj_resolved.lower() != project_lc:

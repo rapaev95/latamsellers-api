@@ -327,12 +327,48 @@ async def send_notice(
         text = text[:3990] + "…"
 
     url = f"{TG_API_BASE}/bot{token}/sendMessage"
-    payload = {
+    payload: dict[str, Any] = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "MarkdownV2",
         "disable_web_page_preview": False,
     }
+
+    # Interactive buttons for paused-item notices: "Ignorar SKU" snoozes the
+    # MLB id from /escalar/products listing without leaving Telegram. The
+    # callback handler in app/api/telegram-webhook recognizes the `is:` prefix.
+    topic = notice.get("topic")
+    raw = notice.get("raw") or {}
+    actions = notice.get("actions") or []
+    if topic == "items":
+        item_id = ""
+        # Notice_id is "items:MLB6155302096" — extract the MLB part.
+        nid = str(notice.get("notice_id") or "")
+        if ":" in nid:
+            item_id = nid.split(":", 1)[1].strip()
+        if not item_id:
+            item_id = str(raw.get("resource_id") or raw.get("id") or "")
+        if item_id:
+            ignore_label = {
+                "ru": "🚫 Игнорировать SKU",
+                "en": "🚫 Ignore SKU",
+                "pt": "🚫 Ignorar SKU",
+            }.get(language, "🚫 Ignorar SKU")
+            open_label = {
+                "ru": "🔍 Открыть в ML",
+                "en": "🔍 Open in ML",
+                "pt": "🔍 Abrir no ML",
+            }.get(language, "🔍 Abrir no ML")
+            buttons = [{"text": ignore_label, "callback_data": f"is:{item_id}"}]
+            # Stick the ML link into the same row if we have a permalink — keeps
+            # it close to the action so user doesn't have to scroll up.
+            permalink = next(
+                (a.get("url") for a in actions if a and a.get("url")),
+                None,
+            )
+            if permalink:
+                buttons.append({"text": open_label, "url": permalink})
+            payload["reply_markup"] = {"inline_keyboard": [buttons]}
 
     for attempt in (0, 1):
         try:
