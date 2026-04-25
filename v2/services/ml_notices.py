@@ -236,6 +236,16 @@ async def _sync_one_user(
     http: httpx.AsyncClient,
     user_id: int,
 ) -> dict[str, int]:
+    """One tick:
+      1. fetch /communications/notices (may be empty for active sellers — normal)
+      2. upsert any new notices into ml_notices
+      3. dispatch ALL pending rows to Telegram
+
+    Step 3 must run on every tick regardless of step 1 — webhook is the
+    primary source of seller events (orders/questions/items/...) and writes
+    directly to ml_notices. If we early-returned on empty /communications,
+    webhook-saved rows would never get dispatched (production bug 2026-04-25).
+    """
     # Delegate refresh to ml_oauth — handles refresh-margin, invalid_grant, etc.
     try:
         access_token, _expires_at, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user_id)
@@ -244,12 +254,12 @@ async def _sync_one_user(
         return {"user_id": user_id, "fetched": 0, "saved": 0, "sent": 0}
 
     notices = await _fetch_notices(http, access_token)
-    if not notices:
-        return {"user_id": user_id, "fetched": 0, "saved": 0, "sent": 0}
+    saved = 0
+    if notices:
+        async with pool.acquire() as conn:
+            saved = await _upsert_notices(conn, user_id, notices)
 
-    async with pool.acquire() as conn:
-        saved = await _upsert_notices(conn, user_id, notices)
-
+    # Always dispatch — there may be pending rows from webhooks.
     sent = await _dispatch_to_telegram(pool, http, user_id)
     return {"user_id": user_id, "fetched": len(notices), "saved": saved, "sent": sent}
 
