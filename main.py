@@ -54,6 +54,7 @@ from v2.db import close_pool, create_pool, get_pool  # noqa: E402
 from v2.services import ml_backfill as ml_backfill_svc  # noqa: E402
 from v2.services import ml_notices as ml_notices_svc  # noqa: E402
 from v2.services import ml_oauth as ml_oauth_svc  # noqa: E402
+from v2.services import ml_questions_dispatch as ml_questions_dispatch_svc  # noqa: E402
 from v2.services import ml_scraper  # noqa: E402
 from v2.storage import positions_storage  # noqa: E402
 
@@ -76,6 +77,23 @@ async def _refresh_ml_tokens_job() -> None:
         "ML token refresh tick: refreshed=%s failed=%s",
         result.get("refreshed"), result.get("failed"),
     )
+
+
+async def _dispatch_questions_to_tg_job() -> None:
+    """Send new UNANSWERED questions to seller's Telegram with AI-suggested
+    replies and inline action buttons. Cron-driven (default 5 min)."""
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("Questions dispatch tick skipped: no DB pool")
+            return
+        result = await ml_questions_dispatch_svc.dispatch_all_users(pool)
+        _ml_log.info(
+            "Questions dispatch tick: users=%s sent=%s",
+            result.get("users"), result.get("sent"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("Questions dispatch job failed: %s", err)
 
 
 async def _sync_ml_notices_job() -> None:
@@ -151,12 +169,26 @@ async def _v2_startup() -> None:
     )
     # /communications/notices sync (Phase 1 — ML anouncements: billing, policies).
     # Usually empty for most sellers. Runs slowly as it's a secondary source.
-    _notices_interval = int(os.environ.get("NOTICES_SYNC_INTERVAL_MIN", "1440"))
+    # ML «communications/notices» + Telegram. Default 5m matches product expectation;
+    # set NOTICES_SYNC_INTERVAL_MIN=1440 (etc.) on Railway if you need less API traffic.
+    _notices_interval = int(os.environ.get("NOTICES_SYNC_INTERVAL_MIN", "5"))
     _ml_scheduler.add_job(
         _sync_ml_notices_job,
         "interval",
         minutes=_notices_interval,
         id="ml_notices_sync",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Questions auto-dispatch to Telegram with AI suggestion + inline buttons.
+    # Default 5 min — gives seller near-realtime alerts on new buyer questions.
+    _qa_interval = int(os.environ.get("QUESTIONS_TG_INTERVAL_MIN", "5"))
+    _ml_scheduler.add_job(
+        _dispatch_questions_to_tg_job,
+        "interval",
+        minutes=_qa_interval,
+        id="questions_tg_dispatch",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
