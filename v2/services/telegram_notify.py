@@ -1,6 +1,7 @@
 """Send formatted ML notice to a Telegram chat via Bot API."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any
@@ -347,8 +348,27 @@ async def send_notice(
     # MLB id from /escalar/products listing without leaving Telegram. The
     # callback handler in app/api/telegram-webhook recognizes the `is:` prefix.
     topic = notice.get("topic")
-    raw = notice.get("raw") or {}
-    actions = notice.get("actions") or []
+    raw_block = notice.get("raw")
+    if isinstance(raw_block, str):
+        try:
+            raw_block = json.loads(raw_block)
+        except Exception:  # noqa: BLE001
+            raw_block = {}
+    if not isinstance(raw_block, dict):
+        raw_block = {}
+    # actions may arrive as JSON-string when asyncpg returns JSONB without a
+    # codec — defensive parse mirrors _format_message above. Without this,
+    # iterating raw string chars throws AttributeError on a.get(...) and the
+    # whole send_notice fails for items: notices, leaving them stuck in
+    # pending forever (production bug 2026-04-25).
+    actions_block = notice.get("actions")
+    if isinstance(actions_block, str):
+        try:
+            actions_block = json.loads(actions_block)
+        except Exception:  # noqa: BLE001
+            actions_block = []
+    if not isinstance(actions_block, list):
+        actions_block = []
     if topic == "items":
         item_id = ""
         # Notice_id is "items:MLB6155302096" — extract the MLB part.
@@ -356,7 +376,7 @@ async def send_notice(
         if ":" in nid:
             item_id = nid.split(":", 1)[1].strip()
         if not item_id:
-            item_id = str(raw.get("resource_id") or raw.get("id") or "")
+            item_id = str(raw_block.get("resource_id") or raw_block.get("id") or "")
         if item_id:
             ignore_label = {
                 "ru": "🚫 Игнорировать SKU",
@@ -369,12 +389,13 @@ async def send_notice(
                 "pt": "🔍 Abrir no ML",
             }.get(language, "🔍 Abrir no ML")
             buttons = [{"text": ignore_label, "callback_data": f"is:{item_id}"}]
-            # Stick the ML link into the same row if we have a permalink — keeps
-            # it close to the action so user doesn't have to scroll up.
-            permalink = next(
-                (a.get("url") for a in actions if a and a.get("url")),
-                None,
-            )
+            permalink = None
+            for a in actions_block:
+                if isinstance(a, dict):
+                    u = a.get("url") or a.get("link")
+                    if u:
+                        permalink = u
+                        break
             if permalink:
                 buttons.append({"text": open_label, "url": permalink})
             payload["reply_markup"] = {"inline_keyboard": [buttons]}
