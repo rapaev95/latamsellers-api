@@ -13,6 +13,7 @@ from v2.services import (
     abc,
     ml_account_health as ml_account_health_svc,
     ml_backfill as ml_backfill_svc,
+    ml_item_context as ml_item_context_svc,
     ml_oauth as ml_oauth_svc,
     ml_quality as ml_quality_svc,
     ml_user_claims as ml_user_claims_svc,
@@ -861,3 +862,124 @@ async def notifications_diagnostic(
         out["mlOauth"] = {"error": str(err)}
 
     return out
+
+
+# ── Per-item product context cache (TEST → DB → CACHE) ───────────────────────
+# Used by AI question-reply pipeline (UI ai-suggest + TG cron dispatch) to
+# ground GPT replies in real product data without hitting ML on every call.
+
+@router.get("/items/{item_id}/context")
+async def get_item_context(
+    item_id: str,
+    refresh: bool = Query(False, description="Force re-fetch from ML even if cache fresh"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Cache-first product context. Returns title + attributes + description
+    from ml_item_context (TTL=24h). On cache miss/stale, refetches from ML
+    and persists. Augments with seller-uploaded escalar_item_docs and SKU
+    from ml_user_items so the caller has the complete grounding payload.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+
+    await ml_item_context_svc.ensure_schema(pool)
+
+    async with httpx.AsyncClient() as http:
+        if refresh:
+            # Force-refresh: bypass cache entirely, refetch from ML.
+            try:
+                token = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+                if token:
+                    fresh = await ml_item_context_svc.fetch_from_ml(http, token, item_id)
+                    if fresh:
+                        await ml_item_context_svc.upsert(pool, user.id, fresh)
+            except Exception as err:  # noqa: BLE001
+                return {"error": "refresh_failed", "detail": str(err)}
+            ml_ctx = await ml_item_context_svc.get_cached(pool, user.id, item_id)
+        else:
+            ml_ctx = await ml_item_context_svc.get_or_refresh(pool, http, user.id, item_id)
+
+    # Augment with DB-only data (seller docs + internal SKU)
+    from v2.services.ml_quality import normalize_item_id
+    mlb = normalize_item_id(item_id) or item_id
+
+    docs: list[dict] = []
+    sku: Optional[str] = None
+    try:
+        async with pool.acquire() as conn:
+            doc_rows = await conn.fetch(
+                """
+                SELECT id, kind, title, content,
+                       to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at
+                  FROM escalar_item_docs
+                 WHERE user_id = $1 AND item_id = $2
+                 ORDER BY updated_at DESC LIMIT 20
+                """,
+                user.id, mlb,
+            )
+            docs = [
+                {"id": r["id"], "kind": r["kind"], "title": r["title"],
+                 "content": r["content"], "updatedAt": r["updated_at"]}
+                for r in doc_rows
+            ]
+    except Exception:  # noqa: BLE001
+        docs = []
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT sku FROM ml_user_items WHERE user_id = $1 AND item_id = $2 LIMIT 1",
+                user.id, mlb,
+            )
+            sku = row["sku"] if row else None
+    except Exception:  # noqa: BLE001
+        sku = None
+
+    if not ml_ctx:
+        return {
+            "itemId": mlb, "sku": sku, "title": None, "permalink": None,
+            "attributes": [], "description": "", "customDocs": docs,
+            "fetchedAt": None, "cacheStatus": "empty",
+        }
+
+    return {
+        "itemId": ml_ctx["item_id"],
+        "sku": sku,
+        "title": ml_ctx.get("title"),
+        "condition": ml_ctx.get("condition"),
+        "price": ml_ctx.get("price"),
+        "currency": ml_ctx.get("currency"),
+        "availableQuantity": ml_ctx.get("available_quantity"),
+        "warranty": ml_ctx.get("warranty"),
+        "shippingFree": ml_ctx.get("shipping_free"),
+        "permalink": ml_ctx.get("permalink"),
+        "attributes": ml_ctx.get("attributes") or [],
+        "description": ml_ctx.get("description") or "",
+        "customDocs": docs,
+        "fetchedAt": ml_ctx.get("fetched_at"),
+        "cacheStatus": "fresh",
+    }
+
+
+@router.post("/items/{item_id}/context/refresh")
+async def refresh_item_context(
+    item_id: str,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Force-refresh a single item's ML context cache."""
+    if pool is None:
+        return {"error": "no_db"}
+    await ml_item_context_svc.ensure_schema(pool)
+    async with httpx.AsyncClient() as http:
+        try:
+            token = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+        except Exception as err:  # noqa: BLE001
+            return {"error": "oauth_failed", "detail": str(err)}
+        if not token:
+            return {"error": "no_token"}
+        fresh = await ml_item_context_svc.fetch_from_ml(http, token, item_id)
+        if not fresh:
+            return {"error": "ml_fetch_failed", "itemId": item_id}
+        await ml_item_context_svc.upsert(pool, user.id, fresh)
+    return {"ok": True, "itemId": fresh["item_id"]}

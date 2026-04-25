@@ -24,6 +24,7 @@ import httpx
 
 from . import ml_user_questions as questions_svc
 from . import ml_oauth as ml_oauth_svc
+from . import ml_item_context as item_ctx_svc
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +47,32 @@ def _esc(text: str) -> str:
 def _esc_code(text: str) -> str:
     """Escape for use INSIDE `...` inline code blocks."""
     return (text or "").translate(_MD_CODE_ESCAPE)
+
+
+# Strip MarkdownV2 escape backslashes for the plain-text fallback path.
+# Keeps real backslashes from doubling — only removes the escape preceding
+# one of the MD2 special characters.
+import re as _re  # noqa: E402
+
+_MD2_UNESCAPE_RE = _re.compile(r"\\([_*\[\]()~`>#+\-=|{}.!\\])")
+
+
+def _strip_md2_escapes(text: str) -> str:
+    """Convert MarkdownV2-formatted text to plain text.
+
+    Removes formatting markers (* _ ` ~) without consuming the surrounding
+    content so "*Nova pergunta*" → "Nova pergunta". Then de-escapes any
+    \\X back to X. Used when TG rejects our MarkdownV2 — better to send
+    ugly plain text than nothing.
+    """
+    if not text:
+        return ""
+    # Drop formatting markers ONLY when they look like balanced toggles —
+    # i.e., not preceded by a backslash. We use a regex with negative
+    # look-behind so escaped `\*` survives this step.
+    out = _re.sub(r"(?<!\\)[*_~`]", "", text)
+    # Now safely de-escape \X → X for all special chars.
+    return _MD2_UNESCAPE_RE.sub(r"\1", out)
 
 
 SUGGEST_SYSTEM_PROMPT = """Você é um vendedor profissional do Mercado Livre Brasil.
@@ -85,53 +112,25 @@ async def _fetch_product_context(
     user_id: int,
     item_id: str,
 ) -> dict[str, Any]:
-    """Aggregate ML core + description + custom docs + SKU. Returns dict
-    suitable for prompt-context. Best-effort: missing pieces are simply absent."""
+    """Aggregate cached ML context + custom docs + SKU.
+
+    Cache-first via ml_item_context (TTL=24h). Falls back to live ML fetch
+    on miss/stale, persists result to DB for next time. DB-only data
+    (escalar_item_docs, ml_user_items.sku) is always read fresh.
+    """
     mlb = _normalize_item_id(item_id)
     out: dict[str, Any] = {"itemId": mlb, "title": "", "sku": None, "permalink": None,
                           "attributes": [], "description": "", "customDocs": []}
     if not mlb:
         return out
 
-    # Get a valid ML access token (auto-refresh)
-    try:
-        access_token = await ml_oauth_svc.get_valid_access_token(pool, user_id)
-    except Exception as err:  # noqa: BLE001
-        log.warning("oauth fetch failed for user %s: %s", user_id, err)
-        access_token = None
-
-    headers = {"Authorization": f"Bearer {access_token}"} if access_token else {}
-
-    # Parallel: ML item, ML description, DB docs, DB sku
-    async def _ml_item():
-        if not access_token:
+    # Three parallel reads: cached ML context, DB docs, DB sku
+    async def _ml_ctx():
+        try:
+            return await item_ctx_svc.get_or_refresh(pool, http, user_id, mlb)
+        except Exception as err:  # noqa: BLE001
+            log.warning("get_or_refresh failed user=%s item=%s: %s", user_id, mlb, err)
             return None
-        try:
-            attrs_q = "id,title,condition,price,currency_id,permalink,available_quantity,attributes,shipping,warranty"
-            r = await http.get(
-                f"https://api.mercadolibre.com/items/{mlb}?attributes={attrs_q}",
-                headers=headers, timeout=10.0,
-            )
-            if r.status_code == 200:
-                return r.json()
-        except Exception:  # noqa: BLE001
-            pass
-        return None
-
-    async def _ml_desc():
-        if not access_token:
-            return ""
-        try:
-            r = await http.get(
-                f"https://api.mercadolibre.com/items/{mlb}/description",
-                headers=headers, timeout=10.0,
-            )
-            if r.status_code == 200:
-                d = r.json() or {}
-                return (d.get("plain_text") or d.get("text") or "")[:3000]
-        except Exception:  # noqa: BLE001
-            pass
-        return ""
 
     async def _db_docs():
         try:
@@ -161,32 +160,22 @@ async def _fetch_product_context(
         except Exception:  # noqa: BLE001
             return None
 
-    item, desc, docs, sku = await asyncio.gather(
-        _ml_item(), _ml_desc(), _db_docs(), _db_sku(), return_exceptions=False,
+    ml_ctx, docs, sku = await asyncio.gather(
+        _ml_ctx(), _db_docs(), _db_sku(), return_exceptions=False,
     )
 
-    if item:
-        out["title"] = item.get("title") or ""
-        out["permalink"] = item.get("permalink")
-        out["condition"] = item.get("condition")
-        out["price"] = item.get("price")
-        out["currency"] = item.get("currency_id") or "BRL"
-        out["availableQuantity"] = item.get("available_quantity")
-        out["warranty"] = item.get("warranty")
-        sh = item.get("shipping") or {}
-        out["shippingFree"] = sh.get("free_shipping")
-        attrs = []
-        for a in (item.get("attributes") or [])[:30]:
-            name = a.get("name") or a.get("id") or ""
-            val = a.get("value_name")
-            if not val and a.get("values"):
-                vv = a["values"][0] if a["values"] else None
-                val = (vv or {}).get("name")
-            if name and val:
-                attrs.append({"name": str(name), "value": str(val)})
-        out["attributes"] = attrs
-
-    out["description"] = desc or ""
+    if ml_ctx:
+        out["title"] = ml_ctx.get("title") or ""
+        out["permalink"] = ml_ctx.get("permalink")
+        out["condition"] = ml_ctx.get("condition")
+        out["price"] = ml_ctx.get("price")
+        out["currency"] = ml_ctx.get("currency") or "BRL"
+        out["availableQuantity"] = ml_ctx.get("available_quantity")
+        out["warranty"] = ml_ctx.get("warranty")
+        out["shippingFree"] = ml_ctx.get("shipping_free")
+        out["attributes"] = ml_ctx.get("attributes") or []
+        out["description"] = ml_ctx.get("description") or ""
+        out["fetchedAt"] = ml_ctx.get("fetched_at")
     out["customDocs"] = docs or []
     out["sku"] = sku
     return out
@@ -361,23 +350,51 @@ async def _tg_send_question(
         ],
     }
 
-    try:
+    async def _post(payload: dict[str, Any]) -> tuple[int, str, Optional[str]]:
         r = await http.post(
             f"{TG_API_BASE}/bot{bot_token}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "MarkdownV2",
-                "reply_markup": keyboard,
-                "disable_web_page_preview": True,
-            },
+            json=payload,
             timeout=10.0,
         )
-        if r.status_code != 200:
-            log.warning("TG send_message %s: %s", r.status_code, r.text[:200])
+        body_preview = r.text[:200] if r.status_code != 200 else ""
+        msg_id: Optional[str] = None
+        if r.status_code == 200:
+            mid = (r.json() or {}).get("result", {}).get("message_id")
+            msg_id = str(mid) if mid else None
+        return r.status_code, body_preview, msg_id
+
+    try:
+        # First attempt: MarkdownV2 with rich formatting.
+        status, body_preview, msg_id = await _post({
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "MarkdownV2",
+            "reply_markup": keyboard,
+            "disable_web_page_preview": True,
+        })
+        if status == 200 and msg_id:
+            return msg_id
+
+        # MarkdownV2 parser rejected something (TG returns 400 + "can't parse
+        # entities"). Strip ALL Markdown escapes and resend as plain text so
+        # the seller still gets the question + suggestion + buttons. Better
+        # ugly than silent.
+        if status == 400 and "parse" in body_preview.lower():
+            log.warning("TG MD2 parse failed (q=%s): %s — retrying plain", question_id, body_preview)
+            plain_text = _strip_md2_escapes(text)
+            status2, body2, msg_id2 = await _post({
+                "chat_id": chat_id,
+                "text": plain_text,
+                "reply_markup": keyboard,
+                "disable_web_page_preview": True,
+            })
+            if status2 == 200 and msg_id2:
+                return msg_id2
+            log.warning("TG plain fallback also failed (q=%s): %s %s", question_id, status2, body2)
             return None
-        msg_id = (r.json() or {}).get("result", {}).get("message_id")
-        return str(msg_id) if msg_id else None
+
+        log.warning("TG send_message %s: %s", status, body_preview)
+        return None
     except Exception as err:  # noqa: BLE001
         log.exception("TG send failed: %s", err)
         return None

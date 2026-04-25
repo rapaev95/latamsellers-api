@@ -52,6 +52,7 @@ app.add_middleware(
 from v2.app import router as v2_router  # noqa: E402
 from v2.db import close_pool, create_pool, get_pool  # noqa: E402
 from v2.services import ml_backfill as ml_backfill_svc  # noqa: E402
+from v2.services import ml_item_context as ml_item_context_svc  # noqa: E402
 from v2.services import ml_notices as ml_notices_svc  # noqa: E402
 from v2.services import ml_oauth as ml_oauth_svc  # noqa: E402
 from v2.services import ml_questions_dispatch as ml_questions_dispatch_svc  # noqa: E402
@@ -173,6 +174,10 @@ async def _v2_startup() -> None:
             await ml_notices_svc.ensure_schema(pool)
         except Exception as err:  # noqa: BLE001
             _ml_log.exception("ML notices schema bootstrap failed: %s", err)
+        try:
+            await ml_item_context_svc.ensure_schema(pool)
+        except Exception as err:  # noqa: BLE001
+            _ml_log.exception("ML item context schema bootstrap failed: %s", err)
 
     # Spin up the headless Chromium used by /escalar/positions scraper.
     # Failure here is logged but non-fatal — the scraper self-heals on first use.
