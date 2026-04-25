@@ -197,6 +197,20 @@ async def _dispatch_to_telegram(
                 user_id,
             )
 
+        # Questions are dispatched by ml_questions_dispatch (rich format with
+        # AI suggestion + Aprovar/Editar buttons + product context). Mark
+        # questions notices as sent here so we don't double-notify.
+        await conn.execute(
+            """
+            UPDATE ml_notices
+               SET telegram_sent_at = NOW()
+             WHERE user_id = $1
+               AND telegram_sent_at IS NULL
+               AND topic IN ('questions', 'questions_v2')
+            """,
+            user_id,
+        )
+
         pending_rows = await conn.fetch(
             """
             SELECT notice_id, label, description, actions, tags, topic, raw

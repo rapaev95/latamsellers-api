@@ -38,6 +38,34 @@ _CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
 # "en-speaker's e-commerce vocabulary" is probably already English-adjacent.
 _PT_SPECIFIC_RE = re.compile(r"[ãâáàçéêíõôóúü]", re.IGNORECASE)
 
+# Patterns that indicate the LLM refused to translate and replied with a
+# meta-message instead of a translation. To avoid false-positives with legit
+# buyer questions (e.g., a buyer politely asking "por favor, forneça mais
+# detalhes"), each pattern requires a translation-context word: "перевести",
+# "traduzir", "translate", "ortografia", "tradução" etc.
+_REFUSAL_PATTERNS = [
+    # Russian refusals — must mention translation
+    re.compile(r"не\s+мог[уть]\s+перевести", re.IGNORECASE),
+    re.compile(r"перевести\s+(этот|данн)", re.IGNORECASE),
+    re.compile(r"для\s+перевода", re.IGNORECASE),
+    # Portuguese refusals — must mention translating
+    re.compile(r"não\s+(consigo|posso)\s+traduzir", re.IGNORECASE),
+    re.compile(r"verificar\s+a\s+ortografia", re.IGNORECASE),
+    re.compile(r"para\s+traduzir", re.IGNORECASE),
+    # English refusals — must mention translation
+    re.compile(r"can(?:'|no)t\s+translate", re.IGNORECASE),
+    re.compile(r"unable\s+to\s+translate", re.IGNORECASE),
+    re.compile(r"please\s+provide.*translat", re.IGNORECASE),
+    # The specific "Não entendi sua solicitação" hallucination from Claude when
+    # given short buyer text — it's a refusal in disguise.
+    re.compile(r"não\s+entendi\s+sua\s+solicita", re.IGNORECASE),
+]
+
+
+def _looks_like_refusal(s: str) -> bool:
+    sample = (s or "")[:300]
+    return any(p.search(sample) for p in _REFUSAL_PATTERNS)
+
 
 GLOSSARY_RU = """Você é um tradutor profissional de português brasileiro para russo, especializado em e-commerce do Mercado Livre.
 
@@ -46,6 +74,8 @@ REGRAS:
 2. Mantenha ligações, IDs, URLs e códigos alfanuméricos intactos.
 3. Não adicione comentários, explicações ou markdown — retorne APENAS a tradução.
 4. Se o texto contiver quebras de linha, preserve-as.
+5. SEMPRE traduza, mesmo se o texto for curto, ambíguo, contiver erros de digitação ou parecer sem sentido. NUNCA recuse traduzir. NUNCA peça esclarecimento. NUNCA pergunte de volta. Se o texto contém um erro óbvio (ex: "munda" → provavelmente "mudar"), traduza interpretando o erro. Se realmente não conseguir interpretar, retorne o texto original sem alterações.
+6. NÃO prefacie a resposta. NÃO escreva "Перевод:" / "Translation:" / qualquer cabeçalho — apenas o texto traduzido.
 
 GLOSSÁRIO OBRIGATÓRIO (pt → ru):
 - comissão → комиссия
@@ -83,6 +113,8 @@ RULES:
 2. Keep links, IDs, URLs, and alphanumeric codes intact.
 3. Do not add comments, explanations, or markdown — return ONLY the translation.
 4. Preserve line breaks if present.
+5. ALWAYS translate, even if the text is short, ambiguous, contains typos, or seems nonsensical. NEVER refuse. NEVER ask for clarification. NEVER ask the user back. If the text contains an obvious typo (e.g., "munda" likely "mudar"), translate interpreting the typo. If you truly cannot interpret it, return the original text unchanged.
+6. DO NOT preface the response. DO NOT write "Translation:" / "Перевод:" / any header — only the translated text.
 
 REQUIRED GLOSSARY (pt → en):
 - comissão → commission
@@ -190,16 +222,26 @@ async def translate(
         if not choices:
             return raw
         content = choices[0].get("message", {}).get("content")
+        result_text: Optional[str] = None
         if isinstance(content, str) and content.strip():
-            return content.strip()
-        # Some providers return content as list of parts.
-        if isinstance(content, list):
+            result_text = content.strip()
+        elif isinstance(content, list):
+            # Some providers return content as list of parts.
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
                     txt = part.get("text")
                     if isinstance(txt, str) and txt.strip():
-                        return txt.strip()
-        return raw
+                        result_text = txt.strip()
+                        break
+        if not result_text:
+            return raw
+        # Guard: if the model refused to translate (asked back, said "I can't
+        # translate this"), fall back to original text instead of shipping the
+        # meta-message to the user's Telegram.
+        if _looks_like_refusal(result_text):
+            log.info("translate refusal detected — returning original. raw=%r reply=%r", raw[:80], result_text[:120])
+            return raw
+        return result_text
     except Exception as err:  # noqa: BLE001
         log.exception("translate failed (target=%s): %s", target, err)
         return raw
