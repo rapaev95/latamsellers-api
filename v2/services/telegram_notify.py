@@ -306,11 +306,20 @@ async def send_notice(
         t = s.strip()
         return 0 < len(t) < 30 and " " not in t
 
+    def _fix_currency(s: str) -> str:
+        # The translator sometimes localizes "R$" into the target locale's
+        # currency symbol (₽ for ru, $ for en, € for es). All ML notices carry
+        # BRL only, so force the canonical R$ back.
+        return (s
+                .replace("₽", "R$")
+                .replace("€", "R$")
+                .replace(" $ ", " R$ "))
+
     if language in ("ru", "en"):
         if label and not _is_key_like(label):
-            label = await translate_svc.translate(label, target=language, http=http)
+            label = _fix_currency(await translate_svc.translate(label, target=language, http=http))
         if description and not _is_key_like(description):
-            description = await translate_svc.translate(description, target=language, http=http)
+            description = _fix_currency(await translate_svc.translate(description, target=language, http=http))
 
     text = _format_message(
         label=label,

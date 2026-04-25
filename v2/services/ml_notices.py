@@ -264,6 +264,55 @@ async def _sync_one_user(
     return {"user_id": user_id, "fetched": len(notices), "saved": saved, "sent": sent}
 
 
+# ── Public helpers for schedulers ─────────────────────────────────────────────
+
+async def dispatch_pending_for_user(
+    pool: asyncpg.Pool,
+    http: httpx.AsyncClient,
+    user_id: int,
+) -> int:
+    """Public wrapper around `_dispatch_to_telegram` for the dispatch-only cron
+    job (separate from the fetch loop in sync_all_users_notices)."""
+    return await _dispatch_to_telegram(pool, http, user_id)
+
+
+async def dispatch_all_pending(pool: asyncpg.Pool) -> dict[str, Any]:
+    """Drain TG queue for every user with any pending notices.
+
+    Independent of /communications/notices fetch — webhook keeps writing to
+    ml_notices in real time, this cron just empties the outbox. Call every
+    1-2 min to keep latency low for buyers' questions / new orders / paused
+    items without burning ML rate-limits on /communications fetches.
+    """
+    if pool is None:
+        return {"users": 0, "sent": 0}
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT n.user_id
+              FROM notification_settings n
+              JOIN ml_notices m ON m.user_id = n.user_id
+                                AND m.telegram_sent_at IS NULL
+             WHERE n.notify_ml_news = TRUE
+               AND n.telegram_chat_id IS NOT NULL
+            """,
+        )
+    user_ids = [r["user_id"] for r in rows]
+    if not user_ids:
+        return {"users": 0, "sent": 0}
+
+    total_sent = 0
+    async with httpx.AsyncClient() as http:
+        for uid in user_ids:
+            try:
+                sent = await _dispatch_to_telegram(pool, http, uid)
+                total_sent += sent
+            except Exception as err:  # noqa: BLE001
+                log.exception("dispatch_all_pending: user %s failed: %s", uid, err)
+            await asyncio.sleep(0.1)
+    return {"users": len(user_ids), "sent": total_sent}
+
+
 # ── Entry point for the APScheduler job ───────────────────────────────────────
 
 async def sync_all_users_notices(pool: asyncpg.Pool) -> dict[str, Any]:

@@ -131,6 +131,29 @@ async def _backfill_all_users_job() -> None:
         _ml_log.exception("ML backfill job failed: %s", err)
 
 
+async def _dispatch_pending_telegram_job() -> None:
+    """Drain Telegram queue for every user with pending notices.
+
+    Independent of /communications/notices fetch (which runs every 5 min) —
+    webhook writes orders/questions/claims/items in real time, this cron just
+    empties the outbox without burning ML quota. Runs every 2 min so end-to-end
+    latency from "ML event" → "TG message" is at most ~2 min, regardless of
+    whether the user has the site open.
+    """
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("TG dispatch tick skipped: no DB pool")
+            return
+        result = await ml_notices_svc.dispatch_all_pending(pool)
+        _ml_log.info(
+            "TG dispatch tick: users=%s sent=%s",
+            result.get("users"), result.get("sent"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("TG dispatch job failed: %s", err)
+
+
 @app.on_event("startup")
 async def _v2_startup() -> None:
     global _ml_scheduler
@@ -181,6 +204,19 @@ async def _v2_startup() -> None:
         coalesce=True,
         replace_existing=True,
     )
+    # Dispatch-only cron — drains TG queue every 2 min regardless of fetch
+    # status. Webhook writes notices in real time, this empties the outbox so
+    # the user gets pings within 2 min without any UI interaction.
+    _dispatch_interval = int(os.environ.get("TG_DISPATCH_INTERVAL_MIN", "2"))
+    _ml_scheduler.add_job(
+        _dispatch_pending_telegram_job,
+        "interval",
+        minutes=_dispatch_interval,
+        id="tg_dispatch_pending",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
     # Questions auto-dispatch to Telegram with AI suggestion + inline buttons.
     # Default 5 min — gives seller near-realtime alerts on new buyer questions.
     _qa_interval = int(os.environ.get("QUESTIONS_TG_INTERVAL_MIN", "5"))
@@ -207,14 +243,17 @@ async def _v2_startup() -> None:
     )
     _ml_scheduler.start()
     _ml_log.info(
-        "ML schedulers started: token_refresh=5h, notices_sync=%dm, backfill=%.2fh",
-        _notices_interval, _backfill_interval_hours,
+        "ML schedulers started: token_refresh=5h, notices_sync=%dm, "
+        "tg_dispatch=%dm, backfill=%.2fh",
+        _notices_interval, _dispatch_interval, _backfill_interval_hours,
     )
 
     # Kick once on boot so tokens that expired during downtime get refreshed immediately.
     _asyncio.create_task(_refresh_ml_tokens_job())
     # Also kick notices sync — catches anything missed while API was down.
     _asyncio.create_task(_sync_ml_notices_job())
+    # And drain pending TG queue right away — no waiting for the first 2-min tick.
+    _asyncio.create_task(_dispatch_pending_telegram_job())
 
 
 @app.on_event("shutdown")
