@@ -582,6 +582,95 @@ async def refresh_user_claims(
     return await ml_user_claims_svc.refresh_user_claims(pool, user.id)
 
 
+# ── Promotions probe (TEST step before building cache) ───────────────────────
+# Per the TEST → DB → CACHE rule in CLAUDE.md: hit ML once, return RAW response,
+# verify shape/scope before designing the schema. Throw-away once we have the
+# real shape captured and ml_user_promotions service is built.
+
+@router.get("/promotions/probe")
+async def promotions_probe(
+    item_id: str | None = Query(None, description="Optional MLB id to probe item-level promos"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Diagnostic — call multiple ML promotion endpoints with this user's token
+    and return RAW responses so we can decide which to use, what fields to
+    persist, and which scope works for this account.
+
+    Endpoints probed (per ESCALAR_API_PLAN §3.2 / research/escalar-promotions.md):
+      A. GET /seller-promotions/promotions/search?app_version=v2
+         — seller-level list of available campaigns (e.g. SELLER_CAMPAIGN, MARKETPLACE_CAMPAIGN, DOD)
+      B. GET /users/{seller_id}/promotions  (legacy/alternate path; some accounts only see this)
+      C. GET /seller-promotions/items/{item_id}?app_version=v2  (only if item_id passed)
+         — promotions available for a specific listing
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    try:
+        access_token, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        return {"error": "ml_oauth_required", "detail": str(err)}
+
+    token_row = await ml_oauth_svc.load_user_tokens(pool, user.id) or {}
+    seller_id = token_row.get("ml_user_id")
+
+    async def _probe(label: str, url: str) -> dict:
+        try:
+            async with httpx.AsyncClient() as http:
+                r = await http.get(
+                    url,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    timeout=15.0,
+                )
+            content_type = r.headers.get("content-type", "")
+            try:
+                body = r.json() if "json" in content_type else r.text[:2000]
+            except Exception:  # noqa: BLE001
+                body = r.text[:2000]
+            return {
+                "label": label,
+                "url": url,
+                "status": r.status_code,
+                "headers": {
+                    "content-type": content_type,
+                    "x-request-id": r.headers.get("x-request-id"),
+                    "x-pagination-total": r.headers.get("x-pagination-total"),
+                },
+                "body": body,
+            }
+        except Exception as err:  # noqa: BLE001
+            return {"label": label, "url": url, "error": str(err)}
+
+    base = "https://api.mercadolibre.com"
+    probes = [
+        ("seller_promotions_search_v2",
+         f"{base}/seller-promotions/promotions/search?app_version=v2"),
+    ]
+    if seller_id:
+        probes.append((
+            "users_promotions_legacy",
+            f"{base}/users/{seller_id}/promotions",
+        ))
+    if item_id:
+        item_id_clean = str(item_id).strip().upper()
+        probes.append((
+            "seller_promotions_for_item_v2",
+            f"{base}/seller-promotions/items/{item_id_clean}?app_version=v2",
+        ))
+
+    # Run probes sequentially (small fan-out, easier to read in dev tools).
+    results = []
+    for label, url in probes:
+        results.append(await _probe(label, url))
+
+    return {
+        "user_id": user.id,
+        "ml_user_id": seller_id,
+        "probes": results,
+        "hint": "Look at the 200 response with non-empty data — that's the endpoint we'll cache. 403/scope errors → need to request additional ML scope.",
+    }
+
+
 # ── Telegram notifications diagnostic ─────────────────────────────────────────
 
 @router.get("/notifications/diagnostic")
