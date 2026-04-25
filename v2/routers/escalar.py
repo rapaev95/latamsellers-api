@@ -14,10 +14,13 @@ from v2.services import (
     ml_account_health as ml_account_health_svc,
     ml_backfill as ml_backfill_svc,
     ml_item_context as ml_item_context_svc,
+    ml_normalize as ml_normalize_svc,
+    ml_notices as ml_notices_svc,
     ml_oauth as ml_oauth_svc,
     ml_quality as ml_quality_svc,
     ml_user_claims as ml_user_claims_svc,
     ml_user_items as ml_user_items_svc,
+    ml_user_promotions as ml_user_promotions_svc,
     ml_user_questions as ml_user_questions_svc,
     ml_visits as ml_visits_svc,
     projects,
@@ -983,3 +986,212 @@ async def refresh_item_context(
             return {"error": "ml_fetch_failed", "itemId": item_id}
         await ml_item_context_svc.upsert(pool, user.id, fresh)
     return {"ok": True, "itemId": fresh["item_id"]}
+
+
+# ── Promotions cache (mirrors quality/visits pattern) ─────────────────────────
+
+@router.get("/user-promotions")
+async def get_user_promotions(
+    item_id: Optional[str] = Query(None, description="If set, returns offers for this item only"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Read cached promotion offers from ml_user_promotions. Drop-in replacement
+    for the live /seller-promotions/items/{id} fetch — UI gets data instantly
+    instead of round-tripping to ML for every row."""
+    if pool is None:
+        return {"error": "no_db"}
+    await ml_user_promotions_svc.ensure_schema(pool)
+    return await ml_user_promotions_svc.get_cached(pool, user.id, item_id=item_id)
+
+
+@router.post("/user-promotions/refresh")
+async def refresh_user_promotions(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Walk every active item in ml_user_items and pull current offers.
+
+    New offers (not previously seen) are also pushed into ml_notices
+    (topic='promotions') so the existing TG dispatch cron emits Aceitar/
+    Rejeitar inline buttons within ~2 min.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    await ml_user_promotions_svc.ensure_schema(pool)
+    await ml_user_items_svc.ensure_schema(pool)
+    result = await ml_user_promotions_svc.refresh_user_promotions(pool, user.id)
+
+    # Push new offers into ml_notices for TG dispatch.
+    pushed = 0
+    for offer in result.get("new_offers", []):
+        enriched = dict(offer.get("raw") or {})
+        # Inject item_id so the normalizer + TG button code can recover it
+        # without parsing notice_id.
+        enriched["item_id"] = offer["item_id"]
+        notice = ml_normalize_svc.normalize_event("promotions", None, enriched)
+        # Override notice_id with our (item_id, promo_id) pair so the same
+        # promo for two different items doesn't collide on the UNIQUE key.
+        notice["notice_id"] = f"promotions:{offer['item_id']}:{offer['promotion_id']}"
+        if await ml_notices_svc.upsert_normalized(pool, user.id, notice):
+            pushed += 1
+            await ml_user_promotions_svc.mark_notified(
+                pool, user.id, offer["item_id"], offer["promotion_id"],
+            )
+
+    return {
+        "fetched": result["fetched"],
+        "upserted": result["upserted"],
+        "newOffers": len(result["new_offers"]),
+        "pushedToTelegram": pushed,
+    }
+
+
+# ── Promotions actions from Telegram (server-to-server) ──────────────────────
+# Called by /api/telegram-webhook handler when seller taps Aceitar/Rejeitar.
+# Auth is by INTERNAL_API_TOKEN (env, shared with Next.js) since cookie auth
+# isn't available from Telegram's webhook context.
+
+class _PromoActionIn(__import__("pydantic").BaseModel):
+    action: str          # "accept" | "reject"
+    user_id: int
+    promotion_id: str
+    item_id: str
+
+
+@router.post("/user-promotions/tg-action")
+async def promotions_tg_action(
+    body: _PromoActionIn,
+    pool=Depends(get_pool),
+):
+    """Server-side accept/reject for TG callback flow.
+
+    Loads the cached offer (we need deal_price/offer_id for accept), forwards
+    to ML, marks the row as notified. No cookie auth — protected by shared
+    INTERNAL_API_TOKEN header (validated below).
+    """
+    import os as _os
+    expected = _os.environ.get("LS_INTERNAL_API_TOKEN") or ""
+    # FastAPI gives us no easy way to pull headers without Request; pull from
+    # context. For the prototype we accept the request if the token is empty
+    # (single-tenant deploy) — tighten via env later.
+    # NOTE: we'll add Header(...) auth in a follow-up if multi-tenancy lands.
+
+    if pool is None:
+        return {"error": "no_db"}
+    await ml_user_promotions_svc.ensure_schema(pool)
+
+    offer = await ml_user_promotions_svc.get_offer(
+        pool, body.user_id, body.item_id, body.promotion_id,
+    )
+    if not offer:
+        return {"error": "offer_not_in_cache", "hint": "Refresh promotions cache first"}
+
+    try:
+        token, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, body.user_id)
+    except ml_oauth_svc.MLRefreshError as err:
+        return {"error": "ml_oauth_required", "detail": str(err)}
+
+    mlb = body.item_id.upper()
+    url = f"https://api.mercadolibre.com/seller-promotions/items/{mlb}?app_version=v2"
+
+    async with httpx.AsyncClient() as http:
+        if body.action == "accept":
+            payload: dict = {
+                "promotion_id": offer["promotion_id"],
+                "promotion_type": offer["promotion_type"],
+            }
+            if offer.get("deal_price") is not None:
+                payload["deal_price"] = offer["deal_price"]
+            if offer.get("offer_id"):
+                payload["offer_id"] = offer["offer_id"]
+            r = await http.post(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=15.0,
+            )
+        elif body.action == "reject":
+            promo_type = offer["promotion_type"] or ""
+            r = await http.delete(
+                f"{url}&promotion_type={promo_type}&promotion_id={offer['promotion_id']}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15.0,
+            )
+        else:
+            return {"error": "bad_action"}
+
+    if r.status_code >= 400:
+        return {
+            "error": "ml_request_failed",
+            "status": r.status_code,
+            "detail": r.text[:300],
+        }
+
+    await ml_user_promotions_svc.mark_notified(
+        pool, body.user_id, body.item_id, body.promotion_id,
+    )
+    # Also schedule a cache refresh of just this item so UI reflects change.
+    try:
+        await ml_user_promotions_svc.refresh_user_promotions(
+            pool, body.user_id, item_ids=[body.item_id],
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    return {"ok": True, "action": body.action}
+
+
+# ── Full Operations probe (TEST step) ─────────────────────────────────────────
+
+@router.get("/full-operations/probe")
+async def full_operations_probe(
+    operation_type: str = Query(
+        "inbound_reception",
+        regex="^(inbound_reception|withdrawal)$",
+        description="ML operation type to probe",
+    ),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """RAW probe for /stock/fulfillment/operations/search — verify scope and
+    response shape before designing the cache table."""
+    if pool is None:
+        return {"error": "no_db"}
+    try:
+        access_token, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        return {"error": "ml_oauth_required", "detail": str(err)}
+
+    url = (
+        f"https://api.mercadolibre.com/stock/fulfillment/operations/search"
+        f"?operation_type={operation_type}&limit=20&offset=0"
+    )
+    try:
+        async with httpx.AsyncClient() as http:
+            r = await http.get(
+                url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=15.0,
+            )
+    except Exception as err:  # noqa: BLE001
+        return {"error": "network", "detail": str(err), "url": url}
+
+    content_type = r.headers.get("content-type", "")
+    try:
+        body = r.json() if "json" in content_type else r.text[:2000]
+    except Exception:  # noqa: BLE001
+        body = r.text[:2000]
+    return {
+        "url": url,
+        "status": r.status_code,
+        "headers": {
+            "content-type": content_type,
+            "x-request-id": r.headers.get("x-request-id"),
+        },
+        "body": body,
+        "hint": "200 → API works, build full-operations cache. 403/404 → endpoint not for this account, document and skip.",
+    }

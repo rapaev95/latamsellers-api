@@ -116,6 +116,56 @@ async def _fetch_notices(http: httpx.AsyncClient, access_token: str) -> list[dic
 
 # ── Sync one user ─────────────────────────────────────────────────────────────
 
+async def upsert_normalized(
+    pool: asyncpg.Pool,
+    user_id: int,
+    notice: dict[str, Any],
+) -> bool:
+    """Upsert a single normalize_event() output row into ml_notices.
+
+    Used by cron jobs that synthesize notices from non-webhook sources (e.g.
+    promotions discovered by ml_user_promotions.refresh). Returns True if a
+    new row was inserted, False if it already existed (still updates content).
+    """
+    nid = str(notice.get("notice_id") or "")
+    if not nid:
+        return False
+    async with pool.acquire() as conn:
+        existed = await conn.fetchval(
+            "SELECT 1 FROM ml_notices WHERE user_id = $1 AND notice_id = $2",
+            user_id, nid,
+        )
+        await conn.execute(
+            """
+            INSERT INTO ml_notices
+              (user_id, notice_id, label, description, from_date,
+               tags, actions, raw, topic, resource, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb, $9, $10, NOW())
+            ON CONFLICT (user_id, notice_id) DO UPDATE SET
+              label = EXCLUDED.label,
+              description = EXCLUDED.description,
+              from_date = EXCLUDED.from_date,
+              tags = EXCLUDED.tags,
+              actions = EXCLUDED.actions,
+              raw = EXCLUDED.raw,
+              topic = EXCLUDED.topic,
+              resource = EXCLUDED.resource,
+              updated_at = NOW()
+            """,
+            user_id,
+            nid,
+            notice.get("label"),
+            notice.get("description"),
+            notice.get("from_date"),
+            json.dumps(notice.get("tags") or []),
+            json.dumps(notice.get("actions") or []),
+            json.dumps(notice.get("raw") or {}),
+            notice.get("topic"),
+            notice.get("resource"),
+        )
+    return existed is None
+
+
 async def _upsert_notices(conn: asyncpg.Connection, user_id: int, notices: list[dict[str, Any]]) -> int:
     saved = 0
     for n in notices:

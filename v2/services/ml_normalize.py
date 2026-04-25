@@ -199,6 +199,53 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
             "actions": [{"label": "Abrir no ML", "url": permalink}] if permalink else [],
         }
 
+    if topic == "promotions":
+        # Enriched payload here is the raw offer dict from
+        # /seller-promotions/items/{mlb}?app_version=v2 (see ml_user_promotions
+        # for the discovered shape). Used by the cron pusher in main.py — the
+        # `item_id` is injected into enriched before calling normalize_event.
+        promo_id = (
+            str(enriched.get("id") or enriched.get("promotion_id") or rid).strip()
+        )
+        promo_type = str(enriched.get("type") or enriched.get("promotion_type") or "").upper()
+        sub_type = str(enriched.get("sub_type") or "").upper()
+        status = str(enriched.get("status") or "candidate").lower()
+        item_id = str(enriched.get("item_id") or "").upper()
+        original_price = enriched.get("original_price")
+        deal_price = enriched.get("deal_price")
+        discount_pct = enriched.get("discount_percentage")
+        finish_date = enriched.get("finish_date")
+
+        type_label = (sub_type or promo_type) or "PROMO"
+        label = f"Nova promoção {type_label} ({status})"
+        if discount_pct:
+            label = f"Nova promoção {type_label}: −{discount_pct}%"
+
+        desc_lines: list[str] = []
+        if item_id:
+            desc_lines.append(f"Item: {item_id}")
+        if deal_price is not None and original_price is not None:
+            desc_lines.append(
+                f"Preço: R$ {original_price} → R$ {deal_price}"
+            )
+        elif deal_price is not None:
+            desc_lines.append(f"Preço promocional: R$ {deal_price}")
+        if finish_date:
+            desc_lines.append(f"Termina: {finish_date}")
+        desc_lines.append(f"Status: {status}")
+
+        return {
+            **base,
+            "label": label,
+            "description": "\n".join(desc_lines),
+            "from_date": enriched.get("created_at") or enriched.get("start_date"),
+            "tags": [t for t in ["PROMOTIONS", promo_type, sub_type, status.upper()] if t],
+            # Inline TG buttons are added by telegram_notify.send_notice when
+            # topic == "promotions". Actions list stays empty so the message
+            # body doesn't double the link.
+            "actions": [],
+        }
+
     if topic == "messages":
         text = str(enriched.get("text") or enriched.get("message") or "")
         from_user = (enriched.get("from") or {}).get("user_id") or enriched.get("from_user_id") or ""

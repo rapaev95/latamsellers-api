@@ -54,15 +54,24 @@ from v2.db import close_pool, create_pool, get_pool  # noqa: E402
 from v2.services import ml_backfill as ml_backfill_svc  # noqa: E402
 from v2.services import ml_item_context as ml_item_context_svc  # noqa: E402
 from v2.services import ml_notices as ml_notices_svc  # noqa: E402
+from v2.services import ml_normalize as ml_normalize_svc  # noqa: E402
 from v2.services import ml_oauth as ml_oauth_svc  # noqa: E402
+from v2.services import ml_quality as ml_quality_svc  # noqa: E402
 from v2.services import ml_questions_dispatch as ml_questions_dispatch_svc  # noqa: E402
 from v2.services import ml_scraper  # noqa: E402
+from v2.services import ml_user_claims as ml_user_claims_svc  # noqa: E402
+from v2.services import ml_user_items as ml_user_items_svc  # noqa: E402
+from v2.services import ml_user_promotions as ml_user_promotions_svc  # noqa: E402
+from v2.services import ml_user_questions as ml_user_questions_svc  # noqa: E402
+from v2.services import ml_account_health as ml_account_health_svc  # noqa: E402
+from v2.services import ml_visits as ml_visits_svc  # noqa: E402
 from v2.storage import positions_storage  # noqa: E402
 
 app.include_router(v2_router)
 
 # APScheduler for background ML token refresh (every 5h < 6h TTL)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler  # noqa: E402
+from apscheduler.triggers.cron import CronTrigger  # noqa: E402
 import asyncio as _asyncio  # noqa: E402
 import logging as _logging  # noqa: E402
 
@@ -153,6 +162,129 @@ async def _dispatch_pending_telegram_job() -> None:
         )
     except Exception as err:  # noqa: BLE001
         _ml_log.exception("TG dispatch job failed: %s", err)
+
+
+async def _refresh_promotions_job() -> None:
+    """Scan ML promo offers per user every 30 min. New `candidate` offers
+    get pushed to ml_notices (topic='promotions') so the existing TG dispatch
+    cron emits Aceitar/Rejeitar inline buttons.
+
+    This is independent of the seller opening any UI — server-driven.
+    """
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("Promotions refresh tick skipped: no DB pool")
+            return
+        await ml_user_promotions_svc.ensure_schema(pool)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT user_id FROM ml_user_tokens WHERE access_token IS NOT NULL"
+            )
+        user_ids = [r["user_id"] for r in rows]
+        total_new = 0
+        for uid in user_ids:
+            try:
+                result = await ml_user_promotions_svc.refresh_user_promotions(pool, uid)
+            except Exception as err:  # noqa: BLE001
+                _ml_log.exception("promotions refresh user %s failed: %s", uid, err)
+                continue
+            for offer in result.get("new_offers", []):
+                enriched = dict(offer.get("raw") or {})
+                enriched["item_id"] = offer["item_id"]
+                notice = ml_normalize_svc.normalize_event("promotions", None, enriched)
+                notice["notice_id"] = (
+                    f"promotions:{offer['item_id']}:{offer['promotion_id']}"
+                )
+                if await ml_notices_svc.upsert_normalized(pool, uid, notice):
+                    total_new += 1
+                    await ml_user_promotions_svc.mark_notified(
+                        pool, uid, offer["item_id"], offer["promotion_id"],
+                    )
+            await _asyncio.sleep(0.3)
+        _ml_log.info(
+            "Promotions refresh tick: users=%s new=%s", len(user_ids), total_new,
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("Promotions refresh job failed: %s", err)
+
+
+async def _nightly_refresh_all_users_job() -> None:
+    """03:00 UTC = 00:00 BRT. Refresh every ML cache for every connected user
+    so the morning's first dashboard load reads from DB instantly instead of
+    waiting for ml_quality + ml_visits + ml_account_health refreshes (which
+    can total 30-60s for a seller with 100+ items).
+
+    Heavy job — runs once a day. Per-user budget: ~30s + ML rate-limit sleeps.
+    """
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("Nightly refresh skipped: no DB pool")
+            return
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT user_id FROM ml_user_tokens WHERE access_token IS NOT NULL"
+            )
+        user_ids = [r["user_id"] for r in rows]
+        if not user_ids:
+            return
+        # Make sure all schemas exist (cheap, idempotent).
+        await ml_account_health_svc.ensure_schema(pool)
+        await ml_user_items_svc.ensure_schema(pool)
+        await ml_quality_svc.ensure_schema(pool)
+        await ml_visits_svc.ensure_schema(pool)
+        await ml_user_questions_svc.ensure_schema(pool)
+        await ml_user_claims_svc.ensure_schema(pool)
+        await ml_user_promotions_svc.ensure_schema(pool)
+
+        for uid in user_ids:
+            try:
+                await ml_account_health_svc.refresh_user_health(pool, uid)
+            except Exception as err:  # noqa: BLE001
+                _ml_log.warning("nightly health user %s: %s", uid, err)
+            try:
+                await ml_user_items_svc.refresh_user_items(pool, uid, status="active")
+            except Exception as err:  # noqa: BLE001
+                _ml_log.warning("nightly items user %s: %s", uid, err)
+            # Get item ids for downstream caches.
+            try:
+                async with pool.acquire() as conn:
+                    item_rows = await conn.fetch(
+                        "SELECT item_id FROM ml_user_items WHERE user_id = $1 AND status = 'active'",
+                        uid,
+                    )
+                ids = [r["item_id"] for r in item_rows]
+            except Exception as err:  # noqa: BLE001
+                _ml_log.warning("nightly items list user %s: %s", uid, err)
+                ids = []
+            if ids:
+                try:
+                    await ml_quality_svc.refresh_user_quality(pool, uid, ids, limit=500)
+                except Exception as err:  # noqa: BLE001
+                    _ml_log.warning("nightly quality user %s: %s", uid, err)
+                try:
+                    await ml_visits_svc.refresh_user_visits(pool, uid, ids, limit=500)
+                except Exception as err:  # noqa: BLE001
+                    _ml_log.warning("nightly visits user %s: %s", uid, err)
+                try:
+                    await ml_user_promotions_svc.refresh_user_promotions(
+                        pool, uid, item_ids=ids,
+                    )
+                except Exception as err:  # noqa: BLE001
+                    _ml_log.warning("nightly promotions user %s: %s", uid, err)
+            try:
+                await ml_user_questions_svc.refresh_user_questions(pool, uid)
+            except Exception as err:  # noqa: BLE001
+                _ml_log.warning("nightly questions user %s: %s", uid, err)
+            try:
+                await ml_user_claims_svc.refresh_user_claims(pool, uid)
+            except Exception as err:  # noqa: BLE001
+                _ml_log.warning("nightly claims user %s: %s", uid, err)
+            await _asyncio.sleep(1.0)
+        _ml_log.info("Nightly refresh tick complete: users=%s", len(user_ids))
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("Nightly refresh job failed: %s", err)
 
 
 @app.on_event("startup")
@@ -246,11 +378,37 @@ async def _v2_startup() -> None:
         coalesce=True,
         replace_existing=True,
     )
+    # Promotions discovery — sweep ML for new offers per user, push new
+    # candidates to ml_notices for TG dispatch. 30-min default. Independent
+    # of seller opening UI — purely server-driven.
+    _promo_interval = int(os.environ.get("PROMOTIONS_REFRESH_INTERVAL_MIN", "30"))
+    _ml_scheduler.add_job(
+        _refresh_promotions_job,
+        "interval",
+        minutes=_promo_interval,
+        id="ml_promotions_refresh",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Nightly refresh — at 03:00 UTC (= 00:00 BRT), pre-warm every cache for
+    # every connected user so the morning's first dashboard load reads from
+    # DB instantly. Heavy but runs once a day.
+    _ml_scheduler.add_job(
+        _nightly_refresh_all_users_job,
+        CronTrigger(hour=3, minute=0, timezone="UTC"),
+        id="nightly_refresh_all_caches",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
     _ml_scheduler.start()
     _ml_log.info(
         "ML schedulers started: token_refresh=5h, notices_sync=%dm, "
-        "tg_dispatch=%dm, backfill=%.2fh",
+        "tg_dispatch=%dm, backfill=%.2fh, promotions_refresh=%dm, "
+        "nightly_refresh=03:00 UTC",
         _notices_interval, _dispatch_interval, _backfill_interval_hours,
+        _promo_interval,
     )
 
     # Kick once on boot so tokens that expired during downtime get refreshed immediately.

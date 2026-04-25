@@ -369,6 +369,40 @@ async def send_notice(
             actions_block = []
     if not isinstance(actions_block, list):
         actions_block = []
+    if topic == "promotions":
+        # Promotion id encoded in raw block; item_id was injected at normalize
+        # time. callback_data is `pa:` (accept) / `pr:` (reject) — handler
+        # in app/api/telegram-webhook/route.ts looks up offer details from
+        # ml_user_promotions row using these two ids.
+        promo_id = str(raw_block.get("id") or raw_block.get("promotion_id") or "").strip()
+        promo_item_id = str(raw_block.get("item_id") or "").strip().upper()
+        promo_type = str(raw_block.get("type") or raw_block.get("promotion_type") or "").upper()
+        # callback_data ≤ 64 bytes. Most promo ids look like "MLB-PROMO-123" (≤30
+        # bytes) and MLB ids ≤16 bytes — fits comfortably with `pa:` prefix.
+        if promo_id and promo_item_id:
+            accept_label = {
+                "ru": "✅ Принять",
+                "en": "✅ Accept",
+                "pt": "✅ Aceitar",
+            }.get(language, "✅ Aceitar")
+            reject_label = {
+                "ru": "❌ Отклонить",
+                "en": "❌ Reject",
+                "pt": "❌ Rejeitar",
+            }.get(language, "❌ Rejeitar")
+            details_label = {
+                "ru": "🔍 Детали",
+                "en": "🔍 Details",
+                "pt": "🔍 Detalhes",
+            }.get(language, "🔍 Detalhes")
+            buttons_row = [
+                {"text": accept_label, "callback_data": f"pa:{promo_id}:{promo_item_id}"},
+                {"text": reject_label, "callback_data": f"pr:{promo_id}:{promo_item_id}"},
+            ]
+            details_url = f"https://www.mercadolivre.com.br/anuncios/promotions/{promo_id}"
+            details_row = [{"text": details_label, "url": details_url}]
+            payload["reply_markup"] = {"inline_keyboard": [buttons_row, details_row]}
+
     if topic == "items":
         item_id = ""
         # Notice_id is "items:MLB6155302096" — extract the MLB part.
