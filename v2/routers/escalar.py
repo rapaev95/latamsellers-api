@@ -580,3 +580,109 @@ async def refresh_user_claims(
         return {"error": "no_db"}
     await ml_user_claims_svc.ensure_schema(pool)
     return await ml_user_claims_svc.refresh_user_claims(pool, user.id)
+
+
+# ── Telegram notifications diagnostic ─────────────────────────────────────────
+
+@router.get("/notifications/diagnostic")
+async def notifications_diagnostic(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Single-shot health check for the Telegram dispatch pipeline.
+
+    Surfaces the state of every gate that can silently swallow notices:
+      1. notification_settings row → has chat_id + notify_ml_news ON?
+      2. ml_notices counts (total/pending/sent) — proves webhook+cron writes succeed
+      3. Recent pending + recent sent — sanity check what's actually queued
+      4. TELEGRAM_BOT_TOKEN configured (masked)
+      5. ML token valid (so cron fetch works)
+    """
+    import os as _os
+    out: dict = {}
+
+    if pool is None:
+        return {"error": "no_db"}
+
+    # 1. notification_settings
+    async with pool.acquire() as conn:
+        ns = await conn.fetchrow(
+            """
+            SELECT telegram_chat_id, telegram_username, notify_ml_news,
+                   notify_daily_sales, notify_acos_change,
+                   COALESCE(language,'pt') AS language,
+                   to_char(updated_at AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at
+              FROM notification_settings
+             WHERE user_id = $1
+            """,
+            user.id,
+        )
+    out["notificationSettings"] = dict(ns) if ns else None
+    out["telegramConnected"] = bool(ns and ns["telegram_chat_id"])
+    out["mlNewsEnabled"] = bool(ns and ns["notify_ml_news"])
+
+    # 2. ml_notices counts
+    async with pool.acquire() as conn:
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM ml_notices WHERE user_id = $1", user.id,
+        )
+        pending = await conn.fetchval(
+            "SELECT COUNT(*) FROM ml_notices WHERE user_id = $1 AND telegram_sent_at IS NULL",
+            user.id,
+        )
+        sent = await conn.fetchval(
+            "SELECT COUNT(*) FROM ml_notices WHERE user_id = $1 AND telegram_sent_at IS NOT NULL",
+            user.id,
+        )
+    out["noticesCounts"] = {"total": int(total or 0), "pending": int(pending or 0), "sent": int(sent or 0)}
+
+    # 3. Sample recent rows
+    async with pool.acquire() as conn:
+        sample_pending = await conn.fetch(
+            """
+            SELECT notice_id, label, topic,
+                   to_char(from_date AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS from_date
+              FROM ml_notices
+             WHERE user_id = $1 AND telegram_sent_at IS NULL
+             ORDER BY from_date DESC NULLS LAST
+             LIMIT 5
+            """,
+            user.id,
+        )
+        sample_sent = await conn.fetch(
+            """
+            SELECT notice_id, label, topic,
+                   to_char(telegram_sent_at AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS sent_at
+              FROM ml_notices
+             WHERE user_id = $1 AND telegram_sent_at IS NOT NULL
+             ORDER BY telegram_sent_at DESC
+             LIMIT 5
+            """,
+            user.id,
+        )
+    out["recentPending"] = [dict(r) for r in sample_pending]
+    out["recentSent"] = [dict(r) for r in sample_sent]
+
+    # 4. ENV config (masked)
+    bot_token = _os.environ.get("TELEGRAM_BOT_TOKEN") or ""
+    out["env"] = {
+        "telegramBotTokenSet": bool(bot_token),
+        "telegramBotTokenMasked": (bot_token[-6:] if len(bot_token) >= 6 else "(short)") if bot_token else None,
+        "noticesSyncIntervalMin": _os.environ.get("NOTICES_SYNC_INTERVAL_MIN", "5"),
+    }
+
+    # 5. ML OAuth status — if user's token is dead, cron cannot fetch /communications/notices
+    try:
+        token_row = await ml_oauth_svc.load_user_tokens(pool, user.id)
+        out["mlOauth"] = {
+            "hasToken": bool(token_row and token_row.get("access_token")),
+            "mlUserId": token_row.get("ml_user_id") if token_row else None,
+            "expiresAt": str(token_row.get("expires_at")) if token_row and token_row.get("expires_at") else None,
+        }
+    except Exception as err:  # noqa: BLE001
+        out["mlOauth"] = {"error": str(err)}
+
+    return out
