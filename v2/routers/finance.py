@@ -219,17 +219,85 @@ def _dataclass_to_dict(obj: Any) -> Any:
 import re as _re_sku
 
 
-def _build_sku_mapping(user_id: int) -> dict[str, Any]:
-    """Build the merged SKU view: vendas + catalog overlay + groupings.
+async def _load_ml_items_sku_map(pool, user_id: int) -> dict[str, dict[str, str]]:
+    """seller_sku → {mlb, link, title} из кеша ml_user_items.
+
+    Парсит SELLER_SKU из raw JSONB: top-level attributes[] (для item без вариаций)
+    и variations[].attributes[] (для каждого варианта). Все SKU варианта мапятся
+    на parent MLB, потому что листинг = один MLB на parent.
+    """
+    import json as _json
+    if pool is None:
+        return {}
+    result: dict[str, dict[str, str]] = {}
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT item_id, title, permalink, raw FROM ml_user_items WHERE user_id = $1",
+                user_id,
+            )
+    except Exception:  # noqa: BLE001
+        return {}
+
+    for row in rows:
+        item_id = (row["item_id"] or "").strip()
+        if not item_id:
+            continue
+        title = (row["title"] or "").strip()
+        permalink = (row["permalink"] or "").strip()
+        raw = row["raw"]
+        if isinstance(raw, str):
+            try:
+                raw = _json.loads(raw)
+            except Exception:
+                raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+
+        def _add(sku_val: Any) -> None:
+            sku = str(sku_val or "").strip()
+            if not sku or sku.lower() == "nan":
+                return
+            nk = sku.upper()
+            if nk in result:
+                return
+            result[nk] = {
+                "mlb": item_id,
+                "link": permalink,
+                "title": title[:80],
+            }
+
+        for attr in raw.get("attributes") or []:
+            if isinstance(attr, dict) and attr.get("id") == "SELLER_SKU":
+                _add(attr.get("value_name") or attr.get("value_id"))
+
+        for var in raw.get("variations") or []:
+            if not isinstance(var, dict):
+                continue
+            for attr in var.get("attributes") or []:
+                if isinstance(attr, dict) and attr.get("id") == "SELLER_SKU":
+                    _add(attr.get("value_name") or attr.get("value_id"))
+            # Некоторые варианты хранят SKU в attribute_combinations
+            for attr in var.get("attribute_combinations") or []:
+                if isinstance(attr, dict) and attr.get("id") == "SELLER_SKU":
+                    _add(attr.get("value_name") or attr.get("value_id"))
+
+    return result
+
+
+def _build_sku_mapping(user_id: int, ml_sku_map: dict[str, dict[str, str]] | None = None) -> dict[str, Any]:
+    """Build the merged SKU view: vendas + ml-cache overlay + catalog + groupings.
 
     Mirrors _admin/app.py:2867-2946 logic. Synchronous (sits inside FastAPI
-    threadpool dispatch).
+    threadpool dispatch). `ml_sku_map` приходит из endpoint'а (async fetch
+    кеша ml_user_items) и нужен чтобы у SKU без продаж тоже был MLB/link.
     """
     from v2.legacy.reports import load_vendas_ml_report
     from v2.legacy.sku_catalog import load_catalog, normalize_sku
     from v2.legacy.config import get_project_by_sku, mlb_url
 
     legacy_db.set_current_user_id(user_id)
+    ml_sku_map = ml_sku_map or {}
 
     all_skus: dict[str, dict[str, Any]] = {}
 
@@ -267,6 +335,31 @@ def _build_sku_mapping(user_id: int) -> dict[str, Any]:
                 }
     except Exception:
         pass
+
+    # 1.5) Обогатить из кеша ml_user_items (включая variations).
+    # SKU которые не продавались всё равно получат MLB/link/title если они
+    # опубликованы как листинг или вариация на ML. Уже заполненные поля из
+    # vendas (более свежий title) не перетираем.
+    for nk, ml_info in ml_sku_map.items():
+        if nk in all_skus:
+            entry = all_skus[nk]
+            if not entry.get("mlb") and ml_info.get("mlb"):
+                entry["mlb"] = ml_info["mlb"]
+            if not entry.get("link") and ml_info.get("link"):
+                entry["link"] = ml_info["link"]
+            if not entry.get("title") and ml_info.get("title"):
+                entry["title"] = ml_info["title"]
+        else:
+            all_skus[nk] = {
+                "sku": nk,
+                "title": ml_info.get("title", ""),
+                "mlb": ml_info.get("mlb", ""),
+                "link": ml_info.get("link", ""),
+                "project": "",
+                "supplier_type": "local",
+                "unit_cost_brl": None,
+                "note": "",
+            }
 
     # 2) Catalog overlay (project, cost, supplier — saved values win)
     for it in load_catalog():
@@ -327,9 +420,13 @@ def _build_sku_mapping(user_id: int) -> dict[str, Any]:
 
 
 @router.get("/sku-mapping", response_model=SkuMappingOut)
-def get_sku_mapping(user: CurrentUser = Depends(current_user)):
+async def get_sku_mapping(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
     _bind_user(user)
-    return _build_sku_mapping(user.id)
+    ml_sku_map = await _load_ml_items_sku_map(pool, user.id)
+    return _build_sku_mapping(user.id, ml_sku_map)
 
 
 @router.get("/pnl-matrix", response_model=PnlMatrixOut)
