@@ -509,6 +509,156 @@ async def get_sku_mapping(
     return _build_sku_mapping(user.id, ml_sku_map)
 
 
+@router.get("/pnl-gap-debug")
+async def debug_pnl_gap(
+    project: str = Query(..., description="Project ID, e.g. 'ARTUR'"),
+    month: str = Query(..., description="Месяц YYYY-MM, e.g. '2026-03'"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Диагностика гэпа в PnL: показывает что лежит в vendas для project+month
+    + что висит в NAO_CLASSIFICADO/пусто за этот месяц + orphan-пакеты.
+    Помогает понять где недостающая выручка."""
+    _bind_user(user)
+    from v2.legacy.reports import load_vendas_ml_report, parse_brl
+    import pandas as pd
+
+    try:
+        # Принудительно сбросим кеш чтобы получить актуальные __project
+        from v2.legacy.reports import invalidate_vendas_cache
+        invalidate_vendas_cache(user.id)
+    except Exception:
+        pass
+
+    vdf = load_vendas_ml_report()
+    if vdf is None:
+        return {"error": "vendas_ml не загружен"}
+
+    # Парсим Data da venda → YYYY-MM
+    pt_months = {
+        "janeiro": "01", "fevereiro": "02", "março": "03", "marco": "03",
+        "abril": "04", "maio": "05", "junho": "06", "julho": "07",
+        "agosto": "08", "setembro": "09", "outubro": "10",
+        "novembro": "11", "dezembro": "12",
+    }
+
+    def _row_month(date_str: str) -> str:
+        s = (date_str or "").strip().lower()
+        if not s:
+            return ""
+        # «24 de março de 2026 22:36 hs.»
+        for pt, num in pt_months.items():
+            if pt in s:
+                # вытащить год — последняя группа из 4 цифр
+                import re
+                yrs = re.findall(r"\b(20\d{2})\b", s)
+                if yrs:
+                    return f"{yrs[0]}-{num}"
+        return ""
+
+    if "Data da venda" not in vdf.columns or "__project" not in vdf.columns:
+        return {"error": "vendas DF без обязательных колонок (Data da venda / __project)"}
+
+    # Считаем revenue per row: «Preço unitário × Unidades»
+    def _row_rev(row) -> float:
+        try:
+            preco = parse_brl(row.get("Preço unitário de venda do anúncio (BRL)", 0))
+            u_raw = row.get("Unidades", 0)
+            if pd.isna(u_raw) or u_raw == "":
+                return 0.0
+            unidades = int(float(str(u_raw).strip()))
+            return preco * unidades
+        except Exception:
+            return 0.0
+
+    target_proj = ""
+    target_naoclass = []  # список (sku, mlb, revenue, rows_count)
+    naoclass_total = 0.0
+    naoclass_rows = 0
+    naoclass_by_sku: dict[str, dict] = {}
+    target_total = 0.0
+    target_rows = 0
+    other_projects: dict[str, dict] = {}
+
+    for _, row in vdf.iterrows():
+        rm = _row_month(str(row.get("Data da venda", "")))
+        if rm != month:
+            continue
+        proj = str(row.get("__project", "") or "").strip()
+        rev = _row_rev(row)
+        sku = str(row.get("SKU", "") or "").strip()
+        mlb = str(row.get("# de anúncio", "") or "").strip()
+
+        if proj == project:
+            target_total += rev
+            target_rows += 1
+        elif proj in ("NAO_CLASSIFICADO", "", "nan"):
+            naoclass_total += rev
+            naoclass_rows += 1
+            key = sku.upper() or f"<no-sku> {mlb}"
+            if key not in naoclass_by_sku:
+                naoclass_by_sku[key] = {"sku": sku, "mlb": mlb, "revenue": 0.0, "rows": 0}
+            naoclass_by_sku[key]["revenue"] += rev
+            naoclass_by_sku[key]["rows"] += 1
+        else:
+            if proj not in other_projects:
+                other_projects[proj] = {"revenue": 0.0, "rows": 0}
+            other_projects[proj]["revenue"] += rev
+            other_projects[proj]["rows"] += 1
+
+    # Топ-20 NAO_CLASSIFICADO SKU по выручке
+    top_naoclass = sorted(
+        naoclass_by_sku.values(), key=lambda x: -x["revenue"]
+    )[:20]
+
+    # Orphan pacotes
+    orphans_summary: dict[str, Any] = {"count": 0, "total_brl": 0.0, "items": []}
+    try:
+        from v2.legacy.reports import list_orphan_pacotes
+        orphans = list_orphan_pacotes() or []
+        for o in orphans:
+            o_month = _row_month(str(o.get("data", "")))
+            if o_month != month:
+                continue
+            assigned = str(o.get("assigned_project") or "").strip()
+            o_rev = float(o.get("total_brl", 0) or 0)
+            orphans_summary["count"] += 1
+            orphans_summary["total_brl"] += o_rev
+            if len(orphans_summary["items"]) < 10:
+                orphans_summary["items"].append({
+                    "order_id": o.get("order_id"),
+                    "data": o.get("data"),
+                    "estado": o.get("estado"),
+                    "total_brl": o_rev,
+                    "assigned_project": assigned or None,
+                    "ml_url": o.get("ml_url"),
+                })
+    except Exception as err:  # noqa: BLE001
+        orphans_summary["error"] = str(err)
+
+    return {
+        "project": project,
+        "month": month,
+        "vendas_target_project": {
+            "revenue_brl": round(target_total, 2),
+            "rows": target_rows,
+        },
+        "vendas_nao_classificado": {
+            "revenue_brl": round(naoclass_total, 2),
+            "rows": naoclass_rows,
+            "top_skus": top_naoclass,
+        },
+        "vendas_other_projects": {
+            p: {"revenue_brl": round(v["revenue"], 2), "rows": v["rows"]}
+            for p, v in sorted(other_projects.items(), key=lambda kv: -kv[1]["revenue"])
+        },
+        "orphan_pacotes": orphans_summary,
+        "expected_total_if_all_attributed": round(
+            target_total + naoclass_total + orphans_summary["total_brl"], 2
+        ),
+    }
+
+
 @router.get("/sku-mapping-debug")
 async def debug_sku_mapping(
     sku: str = Query(..., description="SKU для диагностики, e.g. 'A21191-1'"),
