@@ -59,10 +59,22 @@ CREATE INDEX IF NOT EXISTS idx_ml_promo_user_status ON ml_user_promotions(user_i
 CREATE INDEX IF NOT EXISTS idx_ml_promo_user_item ON ml_user_promotions(user_id, item_id);
 """
 
+ALTER_SQL = """
+ALTER TABLE ml_user_promotions
+  ADD COLUMN IF NOT EXISTS dismissed_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS last_reminder_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS reminder_count INT NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_ml_promo_pending_dispatch
+  ON ml_user_promotions(user_id, notified_at, last_reminder_at)
+  WHERE status = 'candidate' AND dismissed_at IS NULL AND accepted_at IS NULL;
+"""
+
 
 async def ensure_schema(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
         await conn.execute(CREATE_SQL)
+        await conn.execute(ALTER_SQL)
 
 
 # ── ML API helpers ────────────────────────────────────────────────────────────
@@ -260,14 +272,18 @@ async def refresh_user_promotions(
                 await asyncio.sleep(RATE_SLEEP)
                 continue
             try:
+                fetched_promo_ids: list[str] = []
                 async with pool.acquire() as conn:
                     for offer in offers:
                         is_new = await _upsert_offer(conn, user_id, mlb, offer)
                         upserted += 1
+                        promo_id_str = str(offer.get("id") or offer.get("promotion_id") or "")
+                        if promo_id_str:
+                            fetched_promo_ids.append(promo_id_str)
                         if is_new:
                             new_offers.append({
                                 "item_id": mlb,
-                                "promotion_id": str(offer.get("id") or offer.get("promotion_id") or ""),
+                                "promotion_id": promo_id_str,
                                 "promotion_type": offer.get("type") or offer.get("promotion_type") or "",
                                 "sub_type": offer.get("sub_type") or "",
                                 "status": offer.get("status") or "",
@@ -276,6 +292,20 @@ async def refresh_user_promotions(
                                 "discount_percentage": offer.get("discount_percentage"),
                                 "raw": offer,
                             })
+                    # Candidates that ML no longer returns for this item were
+                    # accepted/rejected outside TG (web UI, app, API). Mark
+                    # them dismissed so the dispatcher stops sending reminders.
+                    await conn.execute(
+                        """
+                        UPDATE ml_user_promotions
+                           SET dismissed_at = NOW()
+                         WHERE user_id = $1 AND item_id = $2
+                           AND status = 'candidate'
+                           AND dismissed_at IS NULL AND accepted_at IS NULL
+                           AND promotion_id != ALL($3::text[])
+                        """,
+                        user_id, mlb, fetched_promo_ids,
+                    )
             except Exception as err:  # noqa: BLE001
                 log.exception("upsert promo for %s failed: %s", mlb, err)
             await asyncio.sleep(RATE_SLEEP)
@@ -382,6 +412,190 @@ async def mark_notified(
             """,
             user_id, item_id, promotion_id,
         )
+
+
+async def mark_accepted(
+    pool: asyncpg.Pool,
+    user_id: int,
+    item_id: str,
+    promotion_id: str,
+) -> None:
+    """User accepted via TG button. Stops further reminders for this offer."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE ml_user_promotions
+               SET accepted_at = NOW(), notified_at = COALESCE(notified_at, NOW())
+             WHERE user_id = $1 AND item_id = $2 AND promotion_id = $3
+            """,
+            user_id, item_id, promotion_id,
+        )
+
+
+async def mark_dismissed(
+    pool: asyncpg.Pool,
+    user_id: int,
+    item_id: str,
+    promotion_id: str,
+) -> None:
+    """User rejected via TG button. Stops further reminders for this offer."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE ml_user_promotions
+               SET dismissed_at = NOW(), notified_at = COALESCE(notified_at, NOW())
+             WHERE user_id = $1 AND item_id = $2 AND promotion_id = $3
+            """,
+            user_id, item_id, promotion_id,
+        )
+
+
+async def dispatch_pending_candidates(
+    pool: asyncpg.Pool,
+    user_id: int,
+    normalize_event,
+    upsert_notice,
+    limit: int = 15,
+    reminder_hours: float = 24.0,
+) -> dict[str, int]:
+    """Push first-time + reminder TG notices for `candidate` offers the user
+    has not yet acted on.
+
+    Sends in two cases:
+      - never sent: notified_at IS NULL
+      - reminder due: last_reminder_at IS NULL ⇒ notified_at + reminder_hours < NOW()
+                      OR last_reminder_at + reminder_hours < NOW()
+
+    Stops as soon as the user accepts (accepted_at), rejects (dismissed_at), or
+    the offer transitions out of `candidate` (e.g., started/finished/expired).
+
+    `normalize_event` and `upsert_notice` are passed in to avoid a circular
+    import with v2.services.ml_normalize / ml_notices (this module is a leaf
+    in the dependency graph).
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT p.item_id, p.promotion_id, p.promotion_type, p.sub_type,
+                   p.status, p.offer_id, p.original_price, p.deal_price,
+                   p.discount_percentage,
+                   to_char(p.start_date AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS start_date,
+                   to_char(p.finish_date AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS finish_date,
+                   p.raw,
+                   p.notified_at,
+                   p.last_reminder_at,
+                   p.reminder_count,
+                   i.title AS item_title,
+                   i.permalink AS item_permalink,
+                   i.thumbnail AS item_thumbnail,
+                   i.price AS item_price
+              FROM ml_user_promotions p
+              LEFT JOIN ml_user_items i
+                ON i.user_id = p.user_id AND i.item_id = p.item_id
+             WHERE p.user_id = $1
+               AND p.status = 'candidate'
+               AND p.dismissed_at IS NULL
+               AND p.accepted_at IS NULL
+               AND (
+                 p.notified_at IS NULL
+                 OR (p.last_reminder_at IS NULL
+                     AND p.notified_at + ($2 * INTERVAL '1 hour') < NOW())
+                 OR p.last_reminder_at + ($2 * INTERVAL '1 hour') < NOW()
+               )
+             ORDER BY p.notified_at ASC NULLS FIRST, p.fetched_at ASC
+             LIMIT $3
+            """,
+            user_id, reminder_hours, limit,
+        )
+
+    sent_first = 0
+    sent_reminder = 0
+    for row in rows:
+        raw = row["raw"]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+
+        enriched: dict = dict(raw)
+        enriched["item_id"] = row["item_id"]
+        enriched["id"] = row["promotion_id"]
+        enriched["promotion_id"] = row["promotion_id"]
+        enriched["type"] = row["promotion_type"]
+        enriched["sub_type"] = row["sub_type"]
+        enriched["status"] = row["status"]
+        enriched["original_price"] = (
+            float(row["original_price"]) if row["original_price"] is not None
+            else (float(row["item_price"]) if row["item_price"] is not None else None)
+        )
+        enriched["deal_price"] = (
+            float(row["deal_price"]) if row["deal_price"] is not None else None
+        )
+        enriched["discount_percentage"] = (
+            float(row["discount_percentage"])
+            if row["discount_percentage"] is not None else None
+        )
+        enriched["start_date"] = row["start_date"]
+        enriched["finish_date"] = row["finish_date"]
+        enriched["_item_title"] = row["item_title"] or ""
+        enriched["_item_permalink"] = row["item_permalink"] or ""
+        enriched["_item_thumbnail"] = row["item_thumbnail"] or ""
+        is_reminder = row["notified_at"] is not None
+        enriched["_is_reminder"] = is_reminder
+        enriched["_reminder_count"] = int(row["reminder_count"] or 0)
+
+        notice = normalize_event("promotions", None, enriched)
+        notice["notice_id"] = (
+            f"promotions:{row['item_id']}:{row['promotion_id']}"
+        )
+        # Reminders share the same notice_id ⇒ ON CONFLICT in ml_notices would
+        # update the existing row without re-sending. Suffix with reminder
+        # count so each reminder is treated as a fresh notice.
+        if is_reminder:
+            notice["notice_id"] = (
+                f"{notice['notice_id']}:r{int(row['reminder_count'] or 0) + 1}"
+            )
+
+        try:
+            pushed = await upsert_notice(pool, user_id, notice)
+        except Exception as err:  # noqa: BLE001
+            log.exception(
+                "promo notice upsert failed user=%s promo=%s: %s",
+                user_id, row["promotion_id"], err,
+            )
+            continue
+        if not pushed:
+            continue
+
+        async with pool.acquire() as conn:
+            if is_reminder:
+                await conn.execute(
+                    """
+                    UPDATE ml_user_promotions
+                       SET last_reminder_at = NOW(),
+                           reminder_count = reminder_count + 1
+                     WHERE user_id = $1 AND item_id = $2 AND promotion_id = $3
+                    """,
+                    user_id, row["item_id"], row["promotion_id"],
+                )
+                sent_reminder += 1
+            else:
+                await conn.execute(
+                    """
+                    UPDATE ml_user_promotions
+                       SET notified_at = NOW()
+                     WHERE user_id = $1 AND item_id = $2 AND promotion_id = $3
+                    """,
+                    user_id, row["item_id"], row["promotion_id"],
+                )
+                sent_first += 1
+
+    return {"sent_first": sent_first, "sent_reminder": sent_reminder}
 
 
 async def get_offer(

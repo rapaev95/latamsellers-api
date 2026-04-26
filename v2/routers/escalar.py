@@ -1133,9 +1133,14 @@ async def promotions_tg_action(
             "detail": r.text[:300],
         }
 
-    await ml_user_promotions_svc.mark_notified(
-        pool, body.user_id, body.item_id, body.promotion_id,
-    )
+    if body.action == "accept":
+        await ml_user_promotions_svc.mark_accepted(
+            pool, body.user_id, body.item_id, body.promotion_id,
+        )
+    else:
+        await ml_user_promotions_svc.mark_dismissed(
+            pool, body.user_id, body.item_id, body.promotion_id,
+        )
     # Also schedule a cache refresh of just this item so UI reflects change.
     try:
         await ml_user_promotions_svc.refresh_user_promotions(

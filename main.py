@@ -190,40 +190,34 @@ async def _refresh_promotions_job() -> None:
                 "SELECT user_id FROM ml_user_tokens WHERE access_token IS NOT NULL"
             )
         user_ids = [r["user_id"] for r in rows]
-        total_new = 0
+        dispatch_limit = int(os.environ.get("PROMOTIONS_DISPATCH_LIMIT_PER_TICK", "15"))
+        reminder_hours = float(os.environ.get("PROMOTIONS_REMINDER_HOURS", "24"))
+        total_first = 0
+        total_reminder = 0
         for uid in user_ids:
             try:
-                result = await ml_user_promotions_svc.refresh_user_promotions(pool, uid)
+                await ml_user_promotions_svc.refresh_user_promotions(pool, uid)
             except Exception as err:  # noqa: BLE001
                 _ml_log.exception("promotions refresh user %s failed: %s", uid, err)
                 continue
-            for offer in result.get("new_offers", []):
-                enriched = dict(offer.get("raw") or {})
-                enriched["item_id"] = offer["item_id"]
-                async with pool.acquire() as _conn:
-                    _item = await _conn.fetchrow(
-                        "SELECT title, permalink, thumbnail, price"
-                        "  FROM ml_user_items WHERE user_id = $1 AND item_id = $2",
-                        uid, offer["item_id"],
-                    )
-                if _item:
-                    enriched["_item_title"] = _item["title"]
-                    enriched["_item_permalink"] = _item["permalink"]
-                    enriched["_item_thumbnail"] = _item["thumbnail"]
-                    if enriched.get("original_price") is None and _item["price"] is not None:
-                        enriched["original_price"] = float(_item["price"])
-                notice = ml_normalize_svc.normalize_event("promotions", None, enriched)
-                notice["notice_id"] = (
-                    f"promotions:{offer['item_id']}:{offer['promotion_id']}"
+            try:
+                disp = await ml_user_promotions_svc.dispatch_pending_candidates(
+                    pool, uid,
+                    normalize_event=ml_normalize_svc.normalize_event,
+                    upsert_notice=ml_notices_svc.upsert_normalized,
+                    limit=dispatch_limit,
+                    reminder_hours=reminder_hours,
                 )
-                if await ml_notices_svc.upsert_normalized(pool, uid, notice):
-                    total_new += 1
-                    await ml_user_promotions_svc.mark_notified(
-                        pool, uid, offer["item_id"], offer["promotion_id"],
-                    )
+                total_first += disp.get("sent_first", 0)
+                total_reminder += disp.get("sent_reminder", 0)
+            except Exception as err:  # noqa: BLE001
+                _ml_log.exception(
+                    "promotions dispatch user %s failed: %s", uid, err,
+                )
             await _asyncio.sleep(0.3)
         _ml_log.info(
-            "Promotions refresh tick: users=%s new=%s", len(user_ids), total_new,
+            "Promotions refresh tick: users=%s sent_first=%s sent_reminder=%s",
+            len(user_ids), total_first, total_reminder,
         )
     except Exception as err:  # noqa: BLE001
         _ml_log.exception("Promotions refresh job failed: %s", err)
