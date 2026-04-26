@@ -219,13 +219,9 @@ def _dataclass_to_dict(obj: Any) -> Any:
 import re as _re_sku
 
 
-async def _load_ml_items_sku_map(pool, user_id: int) -> dict[str, dict[str, str]]:
-    """seller_sku → {mlb, link, title} из кеша ml_user_items.
-
-    Парсит SELLER_SKU из raw JSONB: top-level attributes[] (для item без вариаций)
-    и variations[].attributes[] (для каждого варианта). Все SKU варианта мапятся
-    на parent MLB, потому что листинг = один MLB на parent.
-    """
+async def _query_ml_items_sku_map(pool, user_id: int) -> dict[str, dict[str, str]]:
+    """SELECT по ml_user_items + парсинг raw JSONB. Возвращает пустой dict
+    если таблица пустая или у item'ов нет attributes/variations (старые кеши)."""
     import json as _json
     if pool is None:
         return {}
@@ -267,6 +263,10 @@ async def _load_ml_items_sku_map(pool, user_id: int) -> dict[str, dict[str, str]
                 "title": title[:80],
             }
 
+        # Легаси-поле: для item без вариаций SKU часто лежит здесь
+        if raw.get("seller_custom_field"):
+            _add(raw.get("seller_custom_field"))
+
         for attr in raw.get("attributes") or []:
             if isinstance(attr, dict) and attr.get("id") == "SELLER_SKU":
                 _add(attr.get("value_name") or attr.get("value_id"))
@@ -283,6 +283,25 @@ async def _load_ml_items_sku_map(pool, user_id: int) -> dict[str, dict[str, str]
                     _add(attr.get("value_name") or attr.get("value_id"))
 
     return result
+
+
+async def _load_ml_items_sku_map(pool, user_id: int) -> dict[str, dict[str, str]]:
+    """seller_sku → {mlb, link, title} из ml_user_items.
+
+    Если кеш есть, но raw не содержит attributes/variations (старые записи —
+    их fetch не запрашивал эти поля), делаем единичный refresh active-листингов
+    и пере-парсим. Дальше работает по кешу.
+    """
+    result = await _query_ml_items_sku_map(pool, user_id)
+    if result:
+        return result
+    # Cache пустой ИЛИ старого формата — один раз обновляем
+    try:
+        from v2.services import ml_user_items as ml_items_svc
+        await ml_items_svc.refresh_user_items(pool, user_id, status="active")
+    except Exception:  # noqa: BLE001
+        return {}
+    return await _query_ml_items_sku_map(pool, user_id)
 
 
 def _build_sku_mapping(user_id: int, ml_sku_map: dict[str, dict[str, str]] | None = None) -> dict[str, Any]:

@@ -86,7 +86,15 @@ async def _search_item_ids(http: httpx.AsyncClient, token: str, ml_user_id: int,
 
 
 async def _fetch_batch(http: httpx.AsyncClient, token: str, item_ids: list[str]) -> list[dict]:
-    attrs = "id,title,price,currency_id,status,thumbnail,sold_quantity,available_quantity,listing_type_id,shipping,category_id,health,permalink"
+    # attributes + variations + seller_custom_field нужны чтобы вытащить SELLER_SKU
+    # (для item без вариаций — в attributes[]/seller_custom_field, для вариаций —
+    # в variations[].attributes[] и variations[].attribute_combinations[]).
+    # Используется в /finance/sku-mapping чтобы дать ML-ссылку SKU без продаж.
+    attrs = (
+        "id,title,price,currency_id,status,thumbnail,sold_quantity,available_quantity,"
+        "listing_type_id,shipping,category_id,health,permalink,"
+        "attributes,variations,seller_custom_field"
+    )
     url = f"{ML_API_BASE}/items?ids={','.join(item_ids)}&attributes={attrs}"
     try:
         r = await http.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30.0)
