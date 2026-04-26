@@ -302,26 +302,40 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
         desc_lines.append("")
 
         orig_str = _money(original_price)
-        deal_str = _money(deal_price)
         sug_str = _money(suggested)
-        max_str = _money(max_disc)
-        min_str = _money(min_disc)
+        max_str = _money(max_disc)  # max_discounted_price = MINIMUM discount
+        min_str = _money(min_disc)  # min_discounted_price = MAXIMUM discount
 
-        if orig_str and deal_str:
-            if discount_pct:
-                desc_lines.append(f"💰 Preço: {orig_str} → {deal_str} (−{discount_pct}%)")
-            else:
-                desc_lines.append(f"💰 Preço: {orig_str} → {deal_str}")
-        elif orig_str and sug_str:
+        def _pct_off(price):
+            if not price or not original_price:
+                return None
+            try:
+                return round((1 - float(price) / float(original_price)) * 100, 1)
+            except (ZeroDivisionError, TypeError, ValueError):
+                return None
+
+        if orig_str:
             desc_lines.append(f"💰 Preço atual: {orig_str}")
-            if discount_pct:
-                desc_lines.append(f"💸 Sugerido pela ML: {sug_str} (−{discount_pct}%)")
-            else:
-                desc_lines.append(f"💸 Sugerido pela ML: {sug_str}")
-        elif orig_str:
-            desc_lines.append(f"💰 Preço atual: {orig_str}")
-            if discount_pct:
-                desc_lines.append(f"💸 Desconto previsto: −{discount_pct}%")
+
+        # Range view — only when ML returns a flexible window. Three points:
+        # max_discounted_price = entry ticket (smallest discount needed)
+        # suggested_discounted_price = ML recommendation
+        # min_discounted_price = deepest allowed discount
+        if max_str or sug_str or min_str:
+            desc_lines.append("")
+            desc_lines.append("🎯 Faixa permitida pela ML:")
+            if max_str:
+                pct = _pct_off(max_disc)
+                pct_str = f" (−{pct}%)" if pct else ""
+                desc_lines.append(f"   • Entrada (mín. desc.): {max_str}{pct_str}")
+            if sug_str:
+                pct = _pct_off(suggested)
+                pct_str = f" (−{pct}%)" if pct else ""
+                desc_lines.append(f"   • Sugerido pela ML:    {sug_str}{pct_str}")
+            if min_str:
+                pct = _pct_off(min_disc)
+                pct_str = f" (−{pct}%)" if pct else ""
+                desc_lines.append(f"   • Máx. desconto:       {min_str}{pct_str}")
 
         # Quem-paga breakdown — most useful for SMART / UNHEALTHY_STOCK /
         # PRICE_MATCHING where ML and seller split the discount.
@@ -339,9 +353,16 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
             if parts:
                 desc_lines.append("📐 Custo do desconto: " + " + ".join(parts))
 
-        # Price range when ML lets the seller pick (LIGHTNING, FLEXIBLE_PERCENTAGE).
-        if max_str and min_str and not deal_str:
-            desc_lines.append(f"📊 Faixa permitida: {min_str} → {max_str}")
+        # Fee-reduction badge — PRICE_MATCHING and any promo whose name
+        # mentions "reduza tarifas" carry a side benefit of lower ML fees
+        # while the seller is participating.
+        name_lower = promo_name.lower()
+        if (
+            promo_type == "PRICE_MATCHING"
+            or "reduza tarifa" in name_lower
+            or "reduza suas tarifa" in name_lower
+        ):
+            desc_lines.append("🎁 *Esta promoção reduz suas tarifas de venda*")
 
         s_str = _short_date(start_date)
         f_str = _short_date(finish_date)
@@ -355,14 +376,15 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
         # Margin block — read from ml_item_margin_cache (refreshed nightly).
         # Same opex formulas as the OPiU dashboard, allocated per-item.
         margin = enriched.get("_margin_3m") or None
-        margin_after = enriched.get("_margin_after_promo") or {}
+        margin_at_min = enriched.get("_margin_at_min_discount") or {}
+        margin_at_sug = enriched.get("_margin_at_suggested") or {}
+        margin_at_max = enriched.get("_margin_at_max_discount") or {}
         if margin is None:
             desc_lines.append("")
             desc_lines.append("📊 Margem 3M: calculando (próxima atualização noturna)")
         elif margin.get("ok"):
             units = margin.get("units_sold")
             now_pct = margin.get("margin_pct")
-            after_pct = margin_after.get("margin_pct") if margin_after.get("ok") else None
             desc_lines.append("")
             if margin.get("missing_cost"):
                 desc_lines.append(
@@ -370,13 +392,30 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                     f" ({units} un. vendidas)"
                 )
             elif now_pct is not None:
-                base_line = f"📊 Margem 3M: {now_pct}% ({units} un. vendidas)"
-                if after_pct is not None:
-                    base_line += f" → após promo: {after_pct}%"
-                desc_lines.append(base_line)
+                desc_lines.append(f"📊 *Margem atual 3M: {now_pct}%* ({units} un. vendidas)")
                 lucro = margin.get("net_profit")
                 if lucro is not None:
                     desc_lines.append(f"💵 Lucro líquido 3M: {_money(lucro) or '—'}")
+                # Show margin at each price point in the range, when computed.
+                pts: list[tuple[str, dict]] = []
+                if margin_at_min.get("ok"):
+                    pts.append(("entrada", margin_at_min))
+                if margin_at_sug.get("ok"):
+                    pts.append(("sugerido", margin_at_sug))
+                if margin_at_max.get("ok"):
+                    pts.append(("máx desc", margin_at_max))
+                if pts:
+                    desc_lines.append("")
+                    desc_lines.append("📈 Margem por preço promocional:")
+                    for label, m in pts:
+                        m_pct = m.get("margin_pct")
+                        m_lucro = m.get("net_profit")
+                        if m_pct is None:
+                            continue
+                        line = f"   • {label}: {m_pct}%"
+                        if m_lucro is not None:
+                            line += f" (lucro {_money(m_lucro) or '—'})"
+                        desc_lines.append(line)
         elif margin.get("error") == "no_sales_in_period":
             desc_lines.append("")
             desc_lines.append("📊 Sem vendas nos últimos 3 meses — margem indisponível")

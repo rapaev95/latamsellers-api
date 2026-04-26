@@ -581,11 +581,30 @@ async def dispatch_pending_candidates(
             )
             if cached is not None:
                 enriched["_margin_3m"] = cached
-                current_deal_price = enriched.get("deal_price")
-                if current_deal_price and cached.get("ok"):
-                    enriched["_margin_after_promo"] = margin_svc.apply_hypothetical_price(
-                        cached, float(current_deal_price),
+                if cached.get("ok"):
+                    suggested = (
+                        enriched.get("deal_price")
+                        or enriched.get("price")
+                        or enriched.get("suggested_discounted_price")
                     )
+                    if suggested:
+                        enriched["_margin_at_suggested"] = margin_svc.apply_hypothetical_price(
+                            cached, float(suggested),
+                        )
+                    # Margin at "minimum discount" (= max allowed price) —
+                    # the cheapest entry ticket. Often preserves most of the
+                    # margin while still qualifying for the promo.
+                    max_price = enriched.get("max_discounted_price")
+                    if max_price:
+                        enriched["_margin_at_min_discount"] = margin_svc.apply_hypothetical_price(
+                            cached, float(max_price),
+                        )
+                    # Margin at the deepest allowed discount (worst case).
+                    min_price = enriched.get("min_discounted_price")
+                    if min_price:
+                        enriched["_margin_at_max_discount"] = margin_svc.apply_hypothetical_price(
+                            cached, float(min_price),
+                        )
         except Exception as err:  # noqa: BLE001
             log.exception("margin cache read failed for %s: %s", row["item_id"], err)
 
