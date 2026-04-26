@@ -109,7 +109,12 @@ async def fetch_from_ml(
             )
             if r.status_code == 200:
                 return r.json()
-            log.info("ml_item_context: items/%s status=%s", mlb, r.status_code)
+            # Surface non-2xx loudly — silent fails here historically left
+            # ml_item_context permanently empty for affected items.
+            log.warning(
+                "ml_item_context: items/%s status=%s body=%s",
+                mlb, r.status_code, r.text[:200],
+            )
         except Exception as err:  # noqa: BLE001
             log.warning("ml_item_context items/%s exception: %s", mlb, err)
         return None
@@ -307,7 +312,7 @@ async def get_or_refresh(
     # Cache miss or stale — fetch fresh
     if access_token is None:
         try:
-            access_token = await ml_oauth_svc.get_valid_access_token(pool, user_id)
+            access_token, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user_id)
         except Exception as err:  # noqa: BLE001
             log.warning("ml_item_context oauth fail user=%s: %s", user_id, err)
             return cached  # serve stale if we have it
@@ -338,7 +343,7 @@ async def refresh_user_context(
 
     if access_token is None:
         try:
-            access_token = await ml_oauth_svc.get_valid_access_token(pool, user_id)
+            access_token, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user_id)
         except Exception as err:  # noqa: BLE001
             log.warning("ml_item_context bulk oauth fail user=%s: %s", user_id, err)
             return {"fetched": 0, "saved": 0, "failed": len(item_ids)}

@@ -892,7 +892,7 @@ async def get_item_context(
         if refresh:
             # Force-refresh: bypass cache entirely, refetch from ML.
             try:
-                token = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+                token, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user.id)
                 if token:
                     fresh = await ml_item_context_svc.fetch_from_ml(http, token, item_id)
                     if fresh:
@@ -978,7 +978,7 @@ async def refresh_item_context(
     await ml_item_context_svc.ensure_schema(pool)
     async with httpx.AsyncClient() as http:
         try:
-            token = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+            token, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user.id)
         except Exception as err:  # noqa: BLE001
             return {"error": "oauth_failed", "detail": str(err)}
         if not token:
