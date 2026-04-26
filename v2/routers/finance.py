@@ -486,6 +486,221 @@ async def get_sku_mapping(
     return _build_sku_mapping(user.id, ml_sku_map)
 
 
+@router.get("/sku-mapping-debug")
+async def debug_sku_mapping(
+    sku: str = Query(..., description="SKU для диагностики, e.g. 'A21191-1'"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Диагностика — почему конкретный SKU не получил MLB/link.
+    Проверяет все 4 источника + статус OAuth-токена."""
+    _bind_user(user)
+    from v2.legacy.sku_catalog import normalize_sku, load_catalog
+    from v2.legacy.reports import load_vendas_ml_report, load_stock_full
+    from v2.services import ml_oauth as ml_oauth_svc
+    import json as _json
+
+    nk = normalize_sku(sku)
+    report: dict[str, Any] = {
+        "sku_input": sku,
+        "normalized": nk,
+        "sources": {},
+    }
+
+    # 1) vendas_ml
+    try:
+        vdf = load_vendas_ml_report()
+        found = False
+        mlb = ""
+        title = ""
+        if vdf is not None and "SKU" in vdf.columns:
+            mask = vdf["SKU"].astype(str).str.strip().str.upper() == nk
+            matches = vdf[mask]
+            if len(matches) > 0:
+                found = True
+                row = matches.iloc[0]
+                mlb_col = next(
+                    (c for c in vdf.columns
+                     if c.startswith("#") and ("anúncio" in c.lower() or "anuncio" in c.lower())),
+                    None,
+                )
+                if mlb_col:
+                    mlb = str(row.get(mlb_col, "")).strip()
+                title_col = next(
+                    (c for c in vdf.columns if "título" in c.lower() or "titulo" in c.lower()),
+                    None,
+                )
+                if title_col:
+                    title = str(row.get(title_col, ""))[:80]
+        report["sources"]["vendas_ml"] = {
+            "found": found, "mlb": mlb, "title": title,
+            "total_rows_in_file": int(len(vdf)) if vdf is not None else 0,
+        }
+    except Exception as err:  # noqa: BLE001
+        report["sources"]["vendas_ml"] = {"error": str(err)}
+
+    # 2) stock_full.xlsx
+    try:
+        stock = load_stock_full() or {}
+        found = False
+        mlb = ""
+        title = ""
+        qty = 0
+        proj_found = ""
+        for proj_name, block in stock.items():
+            sku_mlbs = (block or {}).get("sku_mlbs") or {}
+            sku_titles = (block or {}).get("sku_titles") or {}
+            by_sku = (block or {}).get("by_sku") or {}
+            for s, m in sku_mlbs.items():
+                if normalize_sku(s) == nk:
+                    found = True
+                    mlb = str(m or "").strip()
+                    title = str(sku_titles.get(s) or "").strip()[:80]
+                    qty = int(by_sku.get(s) or 0)
+                    proj_found = proj_name
+                    break
+            # Также проверим присутствие SKU в by_sku даже если в sku_mlbs нет
+            if not found:
+                for s in by_sku.keys():
+                    if normalize_sku(s) == nk:
+                        found = True
+                        title = str(sku_titles.get(s) or "").strip()[:80]
+                        qty = int(by_sku.get(s) or 0)
+                        proj_found = proj_name
+                        # mlb остаётся пустой — этого не было в sku_mlbs
+                        break
+            if found:
+                break
+        report["sources"]["stock_full"] = {
+            "found": found, "mlb": mlb, "title": title, "qty": qty,
+            "project": proj_found,
+            "total_projects_in_stock": len(stock),
+        }
+    except Exception as err:  # noqa: BLE001
+        report["sources"]["stock_full"] = {"error": str(err)}
+
+    # 3) sku_catalog (legacy/db)
+    try:
+        catalog = load_catalog()
+        found = False
+        record: dict[str, Any] = {}
+        for it in catalog:
+            if normalize_sku(str(it.get("sku", ""))) == nk:
+                found = True
+                record = {
+                    "sku": it.get("sku", ""),
+                    "project": it.get("project", "") or "",
+                    "unit_cost_brl": it.get("unit_cost_brl"),
+                    "supplier_type": it.get("supplier_type", "local"),
+                }
+                break
+        report["sources"]["sku_catalog"] = {
+            "found": found, **record,
+            "total_entries": len(catalog),
+        }
+    except Exception as err:  # noqa: BLE001
+        report["sources"]["sku_catalog"] = {"error": str(err)}
+
+    # 4) ml_user_items cache
+    try:
+        cache_summary: dict[str, Any] = {
+            "total_items": 0,
+            "items_with_attributes": 0,
+            "items_with_variations": 0,
+            "items_with_seller_custom_field": 0,
+            "matched": False,
+            "mlb": "",
+            "matched_via": "",
+            "matched_title": "",
+            "sample_seller_skus": [],
+        }
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT item_id, title, permalink, raw FROM ml_user_items WHERE user_id = $1",
+                user.id,
+            )
+        cache_summary["total_items"] = len(rows)
+        sample_skus: list[str] = []
+        for row in rows:
+            raw = row["raw"]
+            if isinstance(raw, str):
+                try:
+                    raw = _json.loads(raw)
+                except Exception:
+                    raw = {}
+            if not isinstance(raw, dict):
+                continue
+            if raw.get("attributes"):
+                cache_summary["items_with_attributes"] += 1
+            if raw.get("variations"):
+                cache_summary["items_with_variations"] += 1
+            if raw.get("seller_custom_field"):
+                cache_summary["items_with_seller_custom_field"] += 1
+
+            # Поиск SKU + сбор sample
+            def _check(sku_val, via: str) -> bool:
+                s = str(sku_val or "").strip()
+                if not s or s.lower() == "nan":
+                    return False
+                if len(sample_skus) < 30 and s.upper() not in sample_skus:
+                    sample_skus.append(s.upper())
+                if s.upper() == nk and not cache_summary["matched"]:
+                    cache_summary["matched"] = True
+                    cache_summary["mlb"] = row["item_id"]
+                    cache_summary["matched_via"] = via
+                    cache_summary["matched_title"] = (row["title"] or "")[:80]
+                    return True
+                return False
+
+            if raw.get("seller_custom_field"):
+                _check(raw.get("seller_custom_field"), "seller_custom_field")
+            for attr in raw.get("attributes") or []:
+                if isinstance(attr, dict) and attr.get("id") == "SELLER_SKU":
+                    _check(attr.get("value_name") or attr.get("value_id"), "attributes.SELLER_SKU")
+            for var in raw.get("variations") or []:
+                if not isinstance(var, dict):
+                    continue
+                for attr in var.get("attributes") or []:
+                    if isinstance(attr, dict) and attr.get("id") == "SELLER_SKU":
+                        _check(attr.get("value_name") or attr.get("value_id"), "variations.attributes.SELLER_SKU")
+                for attr in var.get("attribute_combinations") or []:
+                    if isinstance(attr, dict) and attr.get("id") == "SELLER_SKU":
+                        _check(attr.get("value_name") or attr.get("value_id"), "variations.attribute_combinations.SELLER_SKU")
+
+        cache_summary["sample_seller_skus"] = sample_skus[:30]
+        report["sources"]["ml_user_items_cache"] = cache_summary
+    except Exception as err:  # noqa: BLE001
+        report["sources"]["ml_user_items_cache"] = {"error": str(err)}
+
+    # 5) OAuth token status
+    try:
+        tokens = await ml_oauth_svc.load_user_tokens(pool, user.id)
+        if tokens:
+            from datetime import datetime as _dt, timezone as _tz
+            exp = tokens.get("access_token_expires_at")
+            now = _dt.now(_tz.utc)
+            valid = bool(exp and exp > now)
+            report["ml_oauth"] = {
+                "has_token": True,
+                "valid_now": valid,
+                "expires_at": exp.isoformat() if exp else None,
+                "ml_user_id": tokens.get("ml_user_id"),
+                "ml_nickname": tokens.get("ml_nickname"),
+                "ml_site_id": tokens.get("ml_site_id"),
+                "scope": tokens.get("scope"),
+                "last_refreshed_at": (
+                    tokens.get("last_refreshed_at").isoformat()
+                    if tokens.get("last_refreshed_at") else None
+                ),
+            }
+        else:
+            report["ml_oauth"] = {"has_token": False}
+    except Exception as err:  # noqa: BLE001
+        report["ml_oauth"] = {"error": str(err)}
+
+    return report
+
+
 @router.get("/pnl-matrix", response_model=PnlMatrixOut)
 def get_pnl_matrix(
     project: str = Query(..., description="Project ID, e.g. 'ARTHUR'"),
