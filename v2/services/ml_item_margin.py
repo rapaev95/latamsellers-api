@@ -339,8 +339,36 @@ def _build_item_payload(
     }
 
 
-_ANUNCIO_COLS = ("#anúncio", "# anúncio", "anuncio_id", "MLB", "mlb", "ID")
+_ANUNCIO_COLS = (
+    "# de anúncio", "# de anuncio", "#anúncio", "# anúncio",
+    "anuncio_id", "MLB", "mlb", "ID",
+)
 _DATE_COLS = ("Data da venda", "Data de venda", "date_created", "Date")
+
+# Portuguese natural-language date format used by Vendas ML CSVs:
+#   "17 de abril de 2026 13:13 hs."
+_PT_MONTHS = {
+    "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3, "abril": 4,
+    "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
+    "outubro": 10, "novembro": 11, "dezembro": 12,
+}
+import re as _re_pt
+_PT_DATE_RE = _re_pt.compile(r"(\d+)\s+de\s+(\w+)\s+de\s+(\d{4})")
+
+
+def _parse_pt_date(s):
+    if s is None:
+        return None
+    m = _PT_DATE_RE.search(str(s))
+    if not m:
+        return None
+    mn = _PT_MONTHS.get(m.group(2).lower())
+    if not mn:
+        return None
+    try:
+        return date(int(m.group(3)), mn, int(m.group(1)))
+    except (ValueError, TypeError):
+        return None
 _REVENUE_COLS = ("Receita por produtos (BRL)", "Receita por produtos", "Receita")
 _FEE_COLS = ("Tarifa de venda e impostos (BRL)", "Tarifa de venda e impostos", "Tarifa")
 _QTY_COLS = ("Unidades", "Quantidade", "Qty")
@@ -396,15 +424,17 @@ def _lookup_sku_project_cost(
 
 
 def _filter_vendas_for_item(df, item_id: str, period: tuple[date, date]):
-    import pandas as pd
     anuncio_col = _first_col(df, _ANUNCIO_COLS)
     if not anuncio_col:
         return None
     sub = df[df[anuncio_col].astype(str).str.upper() == item_id.upper()]
     date_col = _first_col(df, _DATE_COLS)
     if date_col and len(sub) > 0:
-        dt = pd.to_datetime(sub[date_col], errors="coerce", dayfirst=True)
-        mask = (dt >= pd.Timestamp(period[0])) & (dt <= pd.Timestamp(period[1]))
+        parsed = sub[date_col].map(_parse_pt_date)
+        period_start, period_end = period
+        mask = parsed.map(
+            lambda d: d is not None and period_start <= d <= period_end
+        )
         sub = sub[mask]
     return sub
 
