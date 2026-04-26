@@ -185,6 +185,10 @@ async def _refresh_promotions_job() -> None:
             _ml_log.warning("Promotions refresh tick skipped: no DB pool")
             return
         await ml_user_promotions_svc.ensure_schema(pool)
+        # Ensure margin cache table exists — dispatch_pending_candidates
+        # reads from it without compute_pnl (cache miss = "calculando" hint).
+        from v2.services import ml_item_margin as _margin_svc
+        await _margin_svc.ensure_schema(pool)
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT user_id FROM ml_user_tokens WHERE access_token IS NOT NULL"
@@ -295,6 +299,17 @@ async def _nightly_refresh_all_users_job() -> None:
                 await ml_user_claims_svc.refresh_user_claims(pool, uid)
             except Exception as err:  # noqa: BLE001
                 _ml_log.warning("nightly claims user %s: %s", uid, err)
+            try:
+                from v2.services import ml_item_margin as _margin_svc
+                await _margin_svc.ensure_schema(pool)
+                _mres = await _margin_svc.refresh_user_item_margins(pool, uid, period_months=3)
+                _ml_log.info(
+                    "nightly margin user=%s computed=%s items=%s projects=%s",
+                    uid, _mres.get("computed"), _mres.get("items_total"),
+                    _mres.get("projects"),
+                )
+            except Exception as err:  # noqa: BLE001
+                _ml_log.warning("nightly margin user %s: %s", uid, err)
             await _asyncio.sleep(1.0)
         _ml_log.info("Nightly refresh tick complete: users=%s", len(user_ids))
     except Exception as err:  # noqa: BLE001

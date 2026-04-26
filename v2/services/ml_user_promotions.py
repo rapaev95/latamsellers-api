@@ -570,22 +570,24 @@ async def dispatch_pending_candidates(
         enriched["_is_reminder"] = is_reminder
         enriched["_reminder_count"] = int(row["reminder_count"] or 0)
 
-        # Margin lookup (sync legacy code wrapped in to_thread inside the
-        # service). Failures are non-fatal — the card still renders without
-        # the margin block, just with a "sem dados" hint.
+        # Margin block — read from ml_item_margin_cache (populated by the
+        # nightly refresh job). Cache miss = "calculando" hint in the card.
+        # Hypothetical-price scenario (after-promo) is derived on the fly
+        # from cached components — no compute_pnl call on the dispatch path.
         try:
             from . import ml_item_margin as margin_svc
-            margin_now = await margin_svc.get_item_margin(user_id, row["item_id"], months=3)
-            enriched["_margin_3m"] = margin_now
-            current_deal_price = enriched.get("deal_price")
-            if current_deal_price and margin_now.get("ok"):
-                margin_after = await margin_svc.get_item_margin(
-                    user_id, row["item_id"], months=3,
-                    hypothetical_price=float(current_deal_price),
-                )
-                enriched["_margin_after_promo"] = margin_after
+            cached = await margin_svc.get_cached_margin(
+                pool, user_id, row["item_id"], period_months=3,
+            )
+            if cached is not None:
+                enriched["_margin_3m"] = cached
+                current_deal_price = enriched.get("deal_price")
+                if current_deal_price and cached.get("ok"):
+                    enriched["_margin_after_promo"] = margin_svc.apply_hypothetical_price(
+                        cached, float(current_deal_price),
+                    )
         except Exception as err:  # noqa: BLE001
-            log.exception("margin lookup failed for %s: %s", row["item_id"], err)
+            log.exception("margin cache read failed for %s: %s", row["item_id"], err)
 
         notice = normalize_event("promotions", None, enriched)
         notice["notice_id"] = (

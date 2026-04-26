@@ -352,12 +352,14 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
         elif promo_type == "LIGHTNING":
             desc_lines.append("📅 Datas: a ML decide próximo ao início")
 
-        # Margin block — same opex formulas as the OPiU dashboard, allocated
-        # per item by units (publi/armaz/fulfillment) and revenue (DAS/aluguel).
-        # See ml_item_margin.get_item_margin for the calculation.
-        margin = enriched.get("_margin_3m") or {}
+        # Margin block — read from ml_item_margin_cache (refreshed nightly).
+        # Same opex formulas as the OPiU dashboard, allocated per-item.
+        margin = enriched.get("_margin_3m") or None
         margin_after = enriched.get("_margin_after_promo") or {}
-        if margin.get("ok"):
+        if margin is None:
+            desc_lines.append("")
+            desc_lines.append("📊 Margem 3M: calculando (próxima atualização noturna)")
+        elif margin.get("ok"):
             units = margin.get("units_sold")
             now_pct = margin.get("margin_pct")
             after_pct = margin_after.get("margin_pct") if margin_after.get("ok") else None
