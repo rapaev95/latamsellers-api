@@ -157,9 +157,9 @@ async def upsert_normalized(
             notice.get("label"),
             notice.get("description"),
             notice.get("from_date"),
-            json.dumps(notice.get("tags") or []),
-            json.dumps(notice.get("actions") or []),
-            json.dumps(notice.get("raw") or {}),
+            json.dumps(notice.get("tags") or [], default=str),
+            json.dumps(notice.get("actions") or [], default=str),
+            json.dumps(notice.get("raw") or {}, default=str),
             notice.get("topic"),
             notice.get("resource"),
         )
