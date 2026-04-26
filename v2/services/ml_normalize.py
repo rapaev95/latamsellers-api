@@ -6,7 +6,7 @@ ready for upsert into ml_notices.
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Optional
 
 _RESOURCE_ID_RE = re.compile(r"/([^/?]+)(?:\?|$)")
 
@@ -201,9 +201,9 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
 
     if topic == "promotions":
         # Enriched payload here is the raw offer dict from
-        # /seller-promotions/items/{mlb}?app_version=v2 (see ml_user_promotions
-        # for the discovered shape). Used by the cron pusher in main.py — the
-        # `item_id` is injected into enriched before calling normalize_event.
+        # /seller-promotions/items/{mlb}?app_version=v2 plus item_id and
+        # _item_{title,permalink,thumbnail} injected by _refresh_promotions_job
+        # in main.py from the ml_user_items cache.
         promo_id = (
             str(enriched.get("id") or enriched.get("promotion_id") or rid).strip()
         )
@@ -211,28 +211,94 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
         sub_type = str(enriched.get("sub_type") or "").upper()
         status = str(enriched.get("status") or "candidate").lower()
         item_id = str(enriched.get("item_id") or "").upper()
+        item_title = str(enriched.get("_item_title") or "")
+        item_permalink = str(enriched.get("_item_permalink") or "")
         original_price = enriched.get("original_price")
         deal_price = enriched.get("deal_price")
         discount_pct = enriched.get("discount_percentage")
+        if discount_pct is None and original_price and deal_price:
+            try:
+                discount_pct = round(
+                    (1 - float(deal_price) / float(original_price)) * 100, 1,
+                )
+            except (ZeroDivisionError, TypeError, ValueError):
+                discount_pct = None
+        start_date = enriched.get("start_date")
         finish_date = enriched.get("finish_date")
 
-        type_label = (sub_type or promo_type) or "PROMO"
-        label = f"Nova promoção {type_label} ({status})"
+        type_friendly = {
+            "DEAL": "Oferta do dia",
+            "DOD": "Oferta do dia",
+            "LIGHTNING": "Promoção Relâmpago",
+            "SELLER_CAMPAIGN": "Campanha do vendedor",
+            "PRICE_DISCOUNT": "Desconto de preço",
+            "PRICE_MATCHING": "Pareamento de preço",
+            "MARKETPLACE_CAMPAIGN": "Campanha Mercado Livre",
+            "VOLUME": "Desconto por volume",
+        }.get(promo_type, promo_type or "Promoção")
+        status_friendly = {
+            "candidate": "candidato",
+            "started": "em andamento",
+            "finished": "finalizado",
+            "pending": "pendente",
+        }.get(status, status)
+
         if discount_pct:
-            label = f"Nova promoção {type_label}: −{discount_pct}%"
+            label = f"Nova promoção: {type_friendly} −{discount_pct}%"
+        else:
+            label = f"Nova promoção: {type_friendly} ({status_friendly})"
+
+        def _money(v: Any) -> Optional[str]:
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return None
+            return f"R$ {f:.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+        def _short_date(v: Any) -> Optional[str]:
+            if not v:
+                return None
+            s = str(v)[:10]
+            try:
+                from datetime import datetime as _dt
+                return _dt.fromisoformat(s).strftime("%d/%m/%Y")
+            except Exception:  # noqa: BLE001
+                return s
 
         desc_lines: list[str] = []
-        if item_id:
-            desc_lines.append(f"Item: {item_id}")
-        if deal_price is not None and original_price is not None:
-            desc_lines.append(
-                f"Preço: R$ {original_price} → R$ {deal_price}"
-            )
-        elif deal_price is not None:
-            desc_lines.append(f"Preço promocional: R$ {deal_price}")
-        if finish_date:
-            desc_lines.append(f"Termina: {finish_date}")
-        desc_lines.append(f"Status: {status}")
+        if item_title:
+            t = item_title if len(item_title) <= 90 else item_title[:87] + "..."
+            desc_lines.append(f"📦 {t}")
+        desc_lines.append(f"🆔 {item_id}")
+        desc_lines.append("")
+        desc_lines.append(f"🏷 Tipo: {type_friendly}")
+        desc_lines.append(f"📊 Status: {status_friendly}")
+        desc_lines.append("")
+
+        orig_str = _money(original_price)
+        deal_str = _money(deal_price)
+        if orig_str and deal_str:
+            if discount_pct:
+                desc_lines.append(f"💰 Preço: {orig_str} → {deal_str} (−{discount_pct}%)")
+            else:
+                desc_lines.append(f"💰 Preço: {orig_str} → {deal_str}")
+        elif orig_str:
+            desc_lines.append(f"💰 Preço atual: {orig_str}")
+            if promo_type == "LIGHTNING":
+                desc_lines.append("ℹ️ Desconto exato será definido pela ML antes do início")
+
+        s_str = _short_date(start_date)
+        f_str = _short_date(finish_date)
+        if s_str and f_str:
+            desc_lines.append(f"📅 Período: {s_str} → {f_str}")
+        elif f_str:
+            desc_lines.append(f"📅 Termina: {f_str}")
+        elif promo_type == "LIGHTNING":
+            desc_lines.append("📅 Datas serão definidas pela ML")
+
+        if status == "candidate":
+            desc_lines.append("")
+            desc_lines.append("⏰ Aceite agora para participar")
 
         return {
             **base,
@@ -243,7 +309,10 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
             # Inline TG buttons are added by telegram_notify.send_notice when
             # topic == "promotions". Actions list stays empty so the message
             # body doesn't double the link.
-            "actions": [],
+            "actions": (
+                [{"label": "Abrir produto", "url": item_permalink}]
+                if item_permalink else []
+            ),
         }
 
     if topic == "messages":

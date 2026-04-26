@@ -200,6 +200,18 @@ async def _refresh_promotions_job() -> None:
             for offer in result.get("new_offers", []):
                 enriched = dict(offer.get("raw") or {})
                 enriched["item_id"] = offer["item_id"]
+                async with pool.acquire() as _conn:
+                    _item = await _conn.fetchrow(
+                        "SELECT title, permalink, thumbnail, price"
+                        "  FROM ml_user_items WHERE user_id = $1 AND item_id = $2",
+                        uid, offer["item_id"],
+                    )
+                if _item:
+                    enriched["_item_title"] = _item["title"]
+                    enriched["_item_permalink"] = _item["permalink"]
+                    enriched["_item_thumbnail"] = _item["thumbnail"]
+                    if enriched.get("original_price") is None and _item["price"] is not None:
+                        enriched["original_price"] = float(_item["price"])
                 notice = ml_normalize_svc.normalize_event("promotions", None, enriched)
                 notice["notice_id"] = (
                     f"promotions:{offer['item_id']}:{offer['promotion_id']}"
