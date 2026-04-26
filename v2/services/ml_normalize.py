@@ -352,6 +352,36 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
         elif promo_type == "LIGHTNING":
             desc_lines.append("📅 Datas: a ML decide próximo ao início")
 
+        # Margin block — same opex formulas as the OPiU dashboard, allocated
+        # per item by units (publi/armaz/fulfillment) and revenue (DAS/aluguel).
+        # See ml_item_margin.get_item_margin for the calculation.
+        margin = enriched.get("_margin_3m") or {}
+        margin_after = enriched.get("_margin_after_promo") or {}
+        if margin.get("ok"):
+            units = margin.get("units_sold")
+            now_pct = margin.get("margin_pct")
+            after_pct = margin_after.get("margin_pct") if margin_after.get("ok") else None
+            desc_lines.append("")
+            if margin.get("missing_cost"):
+                desc_lines.append(
+                    f"📊 Margem 3M: indisponível — cadastre custo do produto"
+                    f" ({units} un. vendidas)"
+                )
+            elif now_pct is not None:
+                base_line = f"📊 Margem 3M: {now_pct}% ({units} un. vendidas)"
+                if after_pct is not None:
+                    base_line += f" → após promo: {after_pct}%"
+                desc_lines.append(base_line)
+                lucro = margin.get("net_profit")
+                if lucro is not None:
+                    desc_lines.append(f"💵 Lucro líquido 3M: {_money(lucro) or '—'}")
+        elif margin.get("error") == "no_sales_in_period":
+            desc_lines.append("")
+            desc_lines.append("📊 Sem vendas nos últimos 3 meses — margem indisponível")
+        elif margin.get("error") in ("no_vendas_data", "vendas_load_failed"):
+            desc_lines.append("")
+            desc_lines.append("📊 Margem indisponível: carregue relatório Vendas ML")
+
         if status == "candidate":
             desc_lines.append("")
             desc_lines.append("⏰ Aceite agora para participar")
