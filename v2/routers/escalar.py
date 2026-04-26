@@ -538,12 +538,15 @@ async def answer_question(
 ):
     """Post answer to ML, then update the cached row so UI reflects the reply
     immediately — no need to wait for the next refresh cycle."""
+    from fastapi import HTTPException
+    import logging
+    log = logging.getLogger("escalar.answer")
     if pool is None:
-        return {"error": "no_db"}
+        raise HTTPException(status_code=503, detail={"error": "no_db"})
     try:
         token, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user.id)
     except ml_oauth_svc.MLRefreshError as err:
-        return {"error": "ml_oauth_required", "detail": str(err)}
+        raise HTTPException(status_code=401, detail={"error": "ml_oauth_required", "message": str(err)})
     async with httpx.AsyncClient() as http:
         r = await http.post(
             "https://api.mercadolibre.com/answers",
@@ -555,10 +558,26 @@ async def answer_question(
             timeout=15.0,
         )
         if r.status_code >= 400:
-            return {"error": "ml_error", "status": r.status_code, "body": r.text[:500]}
+            log.warning(
+                "ML /answers rejected qid=%s user=%s status=%s body=%s",
+                body.questionId, user.id, r.status_code, r.text[:300],
+            )
+            raise HTTPException(
+                status_code=502 if r.status_code >= 500 else r.status_code,
+                detail={"error": "ml_error", "mlStatus": r.status_code, "mlBody": r.text[:500]},
+            )
     await ml_user_questions_svc.ensure_schema(pool)
-    await ml_user_questions_svc.upsert_one_answered(pool, user.id, body.questionId, body.text)
-    return {"success": True}
+    updated = await ml_user_questions_svc.upsert_one_answered(
+        pool, user.id, body.questionId, body.text,
+    )
+    if not updated:
+        # ML accepted the answer but our cache row is missing — log loudly so
+        # we know to investigate (questionId mismatch, refresh hadn't run, etc).
+        log.warning(
+            "answer_question: ml_ok but cache UPDATE matched 0 rows qid=%s user=%s",
+            body.questionId, user.id,
+        )
+    return {"success": True, "cacheUpdated": bool(updated)}
 
 
 # ── Claims (cached ML /post-purchase/v1/claims/search + enrich) ───────────────
@@ -938,11 +957,47 @@ async def get_item_context(
     except Exception:  # noqa: BLE001
         sku = None
 
+    # Q&A history — past answered questions for this user, prioritising the
+    # same item but falling back to the seller's broader history so general
+    # policies (NF/devolução/garantia/prazo) propagate across listings.
+    qa_history: list[dict] = []
+    try:
+        async with pool.acquire() as conn:
+            qa_rows = await conn.fetch(
+                """
+                SELECT question_id, item_id, text, answer_text,
+                       to_char(answer_date AT TIME ZONE 'UTC',
+                               'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS answer_date,
+                       (item_id = $2)::int AS same_item
+                  FROM ml_user_questions
+                 WHERE user_id = $1
+                   AND status = 'ANSWERED'
+                   AND answer_text IS NOT NULL
+                   AND answer_text <> ''
+                 ORDER BY same_item DESC, answer_date DESC NULLS LAST
+                 LIMIT 10
+                """,
+                user.id, mlb,
+            )
+            qa_history = [
+                {
+                    "questionId": int(r["question_id"]),
+                    "itemId": r["item_id"],
+                    "sameItem": bool(r["same_item"]),
+                    "question": r["text"],
+                    "answer": r["answer_text"],
+                    "answeredAt": r["answer_date"],
+                }
+                for r in qa_rows
+            ]
+    except Exception:  # noqa: BLE001
+        qa_history = []
+
     if not ml_ctx:
         return {
             "itemId": mlb, "sku": sku, "title": None, "permalink": None,
             "attributes": [], "description": "", "pictures": [],
-            "customDocs": docs,
+            "customDocs": docs, "qaHistory": qa_history,
             "fetchedAt": None, "cacheStatus": "empty",
         }
 
@@ -961,6 +1016,7 @@ async def get_item_context(
         "description": ml_ctx.get("description") or "",
         "pictures": ml_ctx.get("pictures") or [],
         "customDocs": docs,
+        "qaHistory": qa_history,
         "fetchedAt": ml_ctx.get("fetched_at"),
         "cacheStatus": "fresh",
     }

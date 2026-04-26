@@ -165,12 +165,13 @@ async def upsert_one_answered(
     user_id: int,
     question_id: int,
     answer_text: str,
-) -> None:
+) -> int:
     """Called after POST /answers succeeds — marks the row ANSWERED locally
-    so UI reflects the reply without waiting for the next full refresh."""
+    so UI reflects the reply without waiting for the next full refresh.
+    Returns the number of rows updated (0 if no cached row matched)."""
     from datetime import datetime, timezone
     async with pool.acquire() as conn:
-        await conn.execute(
+        result = await conn.execute(
             """
             UPDATE ml_user_questions
                SET status = 'ANSWERED',
@@ -184,6 +185,11 @@ async def upsert_one_answered(
             answer_text,
             datetime.now(timezone.utc),
         )
+    # asyncpg execute returns command tag like "UPDATE 1" / "UPDATE 0".
+    try:
+        return int(result.rsplit(" ", 1)[-1])
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 # ── Cache readback ────────────────────────────────────────────────────────────
