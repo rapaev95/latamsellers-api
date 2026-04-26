@@ -177,8 +177,31 @@ async def _upsert_offer(
     if offer_id is not None:
         offer_id = str(offer_id)
     original_price = _parse_num(offer.get("original_price"))
-    deal_price = _parse_num(offer.get("deal_price"))
+    # ML returns the discounted price under different keys per offer type:
+    #   DEAL/SELLER_CAMPAIGN  → deal_price
+    #   LIGHTNING/SMART/PRICE_MATCHING/UNHEALTHY_STOCK → price (current promo
+    #     price) or suggested_discounted_price (recommended)
+    deal_price = _parse_num(
+        offer.get("deal_price")
+        or offer.get("price")
+        or offer.get("suggested_discounted_price")
+    )
     discount_pct = _parse_num(offer.get("discount_percentage"))
+    # Some offer types only carry meli_percentage + seller_percentage;
+    # the effective buyer-facing discount is the sum.
+    if discount_pct is None:
+        meli_pct = _parse_num(offer.get("meli_percentage"))
+        seller_pct = _parse_num(offer.get("seller_percentage"))
+        if meli_pct is not None or seller_pct is not None:
+            discount_pct = (meli_pct or 0.0) + (seller_pct or 0.0)
+    # Fall back to computing discount from the price pair when ML gave neither.
+    if discount_pct is None and original_price and deal_price:
+        try:
+            discount_pct = round(
+                (1 - deal_price / original_price) * 100, 1,
+            )
+        except (ZeroDivisionError, TypeError):
+            discount_pct = None
     start_date = _parse_dt(offer.get("start_date"))
     finish_date = _parse_dt(offer.get("finish_date"))
 

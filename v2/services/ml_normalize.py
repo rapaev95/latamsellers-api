@@ -214,8 +214,24 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
         item_title = str(enriched.get("_item_title") or "")
         item_permalink = str(enriched.get("_item_permalink") or "")
         original_price = enriched.get("original_price")
-        deal_price = enriched.get("deal_price")
+        # ML uses different field names per offer type:
+        #   DEAL/SELLER_CAMPAIGN  → deal_price
+        #   LIGHTNING/SMART/PRICE_MATCHING/UNHEALTHY_STOCK → price or
+        #     suggested_discounted_price
+        deal_price = (
+            enriched.get("deal_price")
+            or enriched.get("price")
+            or enriched.get("suggested_discounted_price")
+        )
         discount_pct = enriched.get("discount_percentage")
+        if discount_pct is None:
+            mp = enriched.get("meli_percentage")
+            sp = enriched.get("seller_percentage")
+            if mp is not None or sp is not None:
+                try:
+                    discount_pct = round((float(mp or 0) + float(sp or 0)), 1)
+                except (TypeError, ValueError):
+                    discount_pct = None
         if discount_pct is None and original_price and deal_price:
             try:
                 discount_pct = round(
@@ -232,10 +248,18 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
             "LIGHTNING": "Promoção Relâmpago",
             "SELLER_CAMPAIGN": "Campanha do vendedor",
             "PRICE_DISCOUNT": "Desconto de preço",
-            "PRICE_MATCHING": "Pareamento de preço",
+            "PRICE_MATCHING": "Pareamento de preço (reduz tarifas)",
             "MARKETPLACE_CAMPAIGN": "Campanha Mercado Livre",
             "VOLUME": "Desconto por volume",
+            "SMART": "Promoção SMART (ativada automaticamente pela ML)",
+            "UNHEALTHY_STOCK": "Estoque parado no Full",
         }.get(promo_type, promo_type or "Promoção")
+        promo_name = str(enriched.get("name") or "").strip()
+        meli_pct = enriched.get("meli_percentage")
+        seller_pct = enriched.get("seller_percentage")
+        max_disc = enriched.get("max_discounted_price")
+        min_disc = enriched.get("min_discounted_price")
+        suggested = enriched.get("suggested_discounted_price")
         status_friendly = {
             "candidate": "candidato",
             "started": "em andamento",
@@ -272,20 +296,52 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
         desc_lines.append(f"🆔 {item_id}")
         desc_lines.append("")
         desc_lines.append(f"🏷 Tipo: {type_friendly}")
+        if promo_name and promo_name.lower() != type_friendly.lower():
+            desc_lines.append(f"📌 Promoção: {promo_name}")
         desc_lines.append(f"📊 Status: {status_friendly}")
         desc_lines.append("")
 
         orig_str = _money(original_price)
         deal_str = _money(deal_price)
+        sug_str = _money(suggested)
+        max_str = _money(max_disc)
+        min_str = _money(min_disc)
+
         if orig_str and deal_str:
             if discount_pct:
                 desc_lines.append(f"💰 Preço: {orig_str} → {deal_str} (−{discount_pct}%)")
             else:
                 desc_lines.append(f"💰 Preço: {orig_str} → {deal_str}")
+        elif orig_str and sug_str:
+            desc_lines.append(f"💰 Preço atual: {orig_str}")
+            if discount_pct:
+                desc_lines.append(f"💸 Sugerido pela ML: {sug_str} (−{discount_pct}%)")
+            else:
+                desc_lines.append(f"💸 Sugerido pela ML: {sug_str}")
         elif orig_str:
             desc_lines.append(f"💰 Preço atual: {orig_str}")
-            if promo_type == "LIGHTNING":
-                desc_lines.append("ℹ️ Desconto exato será definido pela ML antes do início")
+            if discount_pct:
+                desc_lines.append(f"💸 Desconto previsto: −{discount_pct}%")
+
+        # Quem-paga breakdown — most useful for SMART / UNHEALTHY_STOCK /
+        # PRICE_MATCHING where ML and seller split the discount.
+        try:
+            mp = float(enriched.get("meli_percentage")) if enriched.get("meli_percentage") is not None else None
+            sp = float(enriched.get("seller_percentage")) if enriched.get("seller_percentage") is not None else None
+        except (TypeError, ValueError):
+            mp, sp = None, None
+        if (mp is not None and mp > 0) or (sp is not None and sp > 0):
+            parts: list[str] = []
+            if sp is not None and sp > 0:
+                parts.append(f"você cobre {sp:g}%")
+            if mp is not None and mp > 0:
+                parts.append(f"ML cobre {mp:g}%")
+            if parts:
+                desc_lines.append("📐 Custo do desconto: " + " + ".join(parts))
+
+        # Price range when ML lets the seller pick (LIGHTNING, FLEXIBLE_PERCENTAGE).
+        if max_str and min_str and not deal_str:
+            desc_lines.append(f"📊 Faixa permitida: {min_str} → {max_str}")
 
         s_str = _short_date(start_date)
         f_str = _short_date(finish_date)
@@ -294,7 +350,7 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
         elif f_str:
             desc_lines.append(f"📅 Termina: {f_str}")
         elif promo_type == "LIGHTNING":
-            desc_lines.append("📅 Datas serão definidas pela ML")
+            desc_lines.append("📅 Datas: a ML decide próximo ao início")
 
         if status == "candidate":
             desc_lines.append("")
