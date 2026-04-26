@@ -804,6 +804,11 @@ def save_sku_mapping(body: SkuBulkSaveIn, user: CurrentUser = Depends(current_us
     save_catalog(list(by_key.values()))
     invalidate_catalog_project_index()
     _invalidate_projects_cache()
+    # Vendas DataFrame кеширует __project per-row при загрузке. После
+    # переназначения SKU→project старые строки в кеше остаются с прежним
+    # проектом, поэтому PnL не подхватывал новые маппинги. Сбрасываем.
+    from v2.legacy.reports import invalidate_vendas_cache
+    invalidate_vendas_cache(user.id)
     return {"saved": saved, "catalog_total": len(by_key)}
 
 
