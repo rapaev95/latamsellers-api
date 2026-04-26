@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS ml_item_context (
   permalink TEXT,
   attributes JSONB DEFAULT '[]'::jsonb,
   description TEXT DEFAULT '',
+  pictures JSONB DEFAULT '[]'::jsonb,
   fetched_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE(user_id, item_id)
 );
@@ -67,10 +68,16 @@ CREATE INDEX IF NOT EXISTS idx_ml_item_context_user ON ml_item_context(user_id);
 CREATE INDEX IF NOT EXISTS idx_ml_item_context_fetched ON ml_item_context(fetched_at);
 """
 
+ALTER_SQL = """
+ALTER TABLE ml_item_context
+  ADD COLUMN IF NOT EXISTS pictures JSONB DEFAULT '[]'::jsonb;
+"""
+
 
 async def ensure_schema(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
         await conn.execute(CREATE_SQL)
+        await conn.execute(ALTER_SQL)
 
 
 # ── ML API ────────────────────────────────────────────────────────────────────
@@ -91,6 +98,7 @@ async def fetch_from_ml(
     attrs_q = ",".join([
         "id", "title", "condition", "price", "currency_id", "permalink",
         "available_quantity", "attributes", "shipping", "warranty",
+        "pictures",
     ])
 
     async def _item():
@@ -133,6 +141,17 @@ async def fetch_from_ml(
         if name and val:
             attrs.append({"name": str(name), "value": str(val)})
 
+    pictures: list[dict[str, str]] = []
+    for p in (item.get("pictures") or [])[:6]:
+        pid = p.get("id")
+        if not pid:
+            continue
+        pictures.append({
+            "id": str(pid),
+            "url": str(p.get("url") or ""),
+            "secure_url": str(p.get("secure_url") or ""),
+        })
+
     sh = item.get("shipping") or {}
     return {
         "item_id": mlb,
@@ -146,6 +165,7 @@ async def fetch_from_ml(
         "permalink": item.get("permalink"),
         "attributes": attrs,
         "description": desc or "",
+        "pictures": pictures,
     }
 
 
@@ -154,10 +174,10 @@ async def fetch_from_ml(
 UPSERT_SQL = """
 INSERT INTO ml_item_context (
   user_id, item_id, title, condition, price, currency, available_quantity,
-  warranty, shipping_free, permalink, attributes, description, fetched_at
+  warranty, shipping_free, permalink, attributes, description, pictures, fetched_at
 )
 VALUES (
-  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, NOW()
+  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13::jsonb, NOW()
 )
 ON CONFLICT (user_id, item_id) DO UPDATE SET
   title = EXCLUDED.title,
@@ -170,6 +190,7 @@ ON CONFLICT (user_id, item_id) DO UPDATE SET
   permalink = EXCLUDED.permalink,
   attributes = EXCLUDED.attributes,
   description = EXCLUDED.description,
+  pictures = EXCLUDED.pictures,
   fetched_at = NOW();
 """
 
@@ -192,6 +213,7 @@ async def upsert(pool: asyncpg.Pool, user_id: int, data: dict[str, Any]) -> None
             data.get("permalink"),
             json.dumps(data.get("attributes") or []),
             data.get("description") or "",
+            json.dumps(data.get("pictures") or []),
         )
 
 
@@ -210,7 +232,7 @@ async def get_cached(
             """
             SELECT item_id, title, condition, price, currency, available_quantity,
                    warranty, shipping_free, permalink, attributes, description,
-                   fetched_at
+                   pictures, fetched_at
               FROM ml_item_context
              WHERE user_id = $1 AND item_id = $2
             """,
@@ -226,6 +248,14 @@ async def get_cached(
             attrs = []
     if not isinstance(attrs, list):
         attrs = []
+    pictures = row["pictures"]
+    if isinstance(pictures, str):
+        try:
+            pictures = json.loads(pictures)
+        except Exception:  # noqa: BLE001
+            pictures = []
+    if not isinstance(pictures, list):
+        pictures = []
     return {
         "item_id": row["item_id"],
         "title": row["title"] or "",
@@ -238,6 +268,7 @@ async def get_cached(
         "permalink": row["permalink"],
         "attributes": attrs,
         "description": row["description"] or "",
+        "pictures": pictures,
         "fetched_at": row["fetched_at"].isoformat() if row["fetched_at"] else None,
     }
 

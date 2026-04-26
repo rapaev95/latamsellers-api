@@ -941,7 +941,8 @@ async def get_item_context(
     if not ml_ctx:
         return {
             "itemId": mlb, "sku": sku, "title": None, "permalink": None,
-            "attributes": [], "description": "", "customDocs": docs,
+            "attributes": [], "description": "", "pictures": [],
+            "customDocs": docs,
             "fetchedAt": None, "cacheStatus": "empty",
         }
 
@@ -958,6 +959,7 @@ async def get_item_context(
         "permalink": ml_ctx.get("permalink"),
         "attributes": ml_ctx.get("attributes") or [],
         "description": ml_ctx.get("description") or "",
+        "pictures": ml_ctx.get("pictures") or [],
         "customDocs": docs,
         "fetchedAt": ml_ctx.get("fetched_at"),
         "cacheStatus": "fresh",
