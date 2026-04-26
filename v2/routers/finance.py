@@ -418,25 +418,48 @@ def _build_sku_mapping(user_id: int, ml_sku_map: dict[str, dict[str, str]] | Non
     except Exception:
         pass
 
-    # 2) Catalog overlay (project, cost, supplier — saved values win)
+    # 2) Catalog overlay (project, cost, supplier + Dados Fiscais поля)
     for it in load_catalog():
         nk = normalize_sku(str(it.get("sku", "")))
         if not nk:
             continue
+        cat_titulo = (it.get("titulo") or "").strip() if it.get("titulo") else ""
+        cat_mlb = (it.get("mlb") or "").strip() if it.get("mlb") else ""
+
         if nk in all_skus:
-            all_skus[nk]["project"] = it.get("project", "") or ""
-            all_skus[nk]["supplier_type"] = it.get("supplier_type", "local")
-            all_skus[nk]["unit_cost_brl"] = it.get("unit_cost_brl")
-            all_skus[nk]["note"] = it.get("note", "") or ""
+            entry = all_skus[nk]
+            entry["project"] = it.get("project", "") or ""
+            entry["supplier_type"] = it.get("supplier_type", "local")
+            entry["unit_cost_brl"] = it.get("unit_cost_brl")
+            entry["note"] = it.get("note", "") or ""
+            # Dados Fiscais заполняют пустые поля (vendas/cache title — приоритет)
+            if not entry.get("title") and cat_titulo:
+                entry["title"] = cat_titulo[:80]
+            if not entry.get("mlb") and cat_mlb:
+                entry["mlb"] = cat_mlb
+                entry["link"] = mlb_url(cat_mlb)
         else:
             all_skus[nk] = {
                 "sku": str(it.get("sku", "")).strip(),
-                "title": "", "mlb": "", "link": "",
+                "title": cat_titulo[:80] if cat_titulo else "",
+                "mlb": cat_mlb,
+                "link": mlb_url(cat_mlb) if cat_mlb else "",
                 "project": it.get("project", "") or "",
                 "supplier_type": it.get("supplier_type", "local"),
                 "unit_cost_brl": it.get("unit_cost_brl"),
                 "note": it.get("note", "") or "",
             }
+
+        # Пробросить остальные Dados Fiscais поля (если есть в каталоге)
+        entry = all_skus[nk]
+        for key in (
+            "ncm", "origem_type", "origem_code", "ean", "csosn_venda",
+            "peso_bruto_kg", "peso_liquido_kg", "supplier_state",
+            "lead_time_days", "dados_fiscais_synced_at",
+        ):
+            val = it.get(key)
+            if val not in (None, "") and not entry.get(key):
+                entry[key] = val
 
     # 3) Fill missing projects via prefix/MLB resolver
     for nk, info in all_skus.items():
@@ -579,7 +602,7 @@ async def debug_sku_mapping(
     except Exception as err:  # noqa: BLE001
         report["sources"]["stock_full"] = {"error": str(err)}
 
-    # 3) sku_catalog (legacy/db)
+    # 3) sku_catalog (legacy/db) — включая Dados Fiscais поля
     try:
         catalog = load_catalog()
         found = False
@@ -592,6 +615,13 @@ async def debug_sku_mapping(
                     "project": it.get("project", "") or "",
                     "unit_cost_brl": it.get("unit_cost_brl"),
                     "supplier_type": it.get("supplier_type", "local"),
+                    "titulo": it.get("titulo"),
+                    "mlb": it.get("mlb"),
+                    "ncm": it.get("ncm"),
+                    "origem_type": it.get("origem_type"),
+                    "ean": it.get("ean"),
+                    "peso_bruto_kg": it.get("peso_bruto_kg"),
+                    "dados_fiscais_synced_at": it.get("dados_fiscais_synced_at"),
                 }
                 break
         report["sources"]["sku_catalog"] = {
