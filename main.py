@@ -107,8 +107,8 @@ async def _dispatch_questions_to_tg_job() -> None:
             return
         result = await ml_questions_dispatch_svc.dispatch_all_users(pool)
         _ml_log.info(
-            "Questions dispatch tick: users=%s sent=%s",
-            result.get("users"), result.get("sent"),
+            "Questions dispatch tick: users=%s sent=%s reminded=%s",
+            result.get("users"), result.get("sent"), result.get("reminded"),
         )
     except Exception as err:  # noqa: BLE001
         _ml_log.exception("Questions dispatch job failed: %s", err)

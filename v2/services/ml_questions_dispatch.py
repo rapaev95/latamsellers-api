@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import asyncpg
@@ -33,6 +34,12 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 LLM_MODEL = "openai/gpt-4o-mini"
 TG_BATCH_CAP = 10  # max questions per user per tick (avoid TG rate limit)
 TG_THROTTLE = 1.1  # 1 sec between TG sends per chat
+
+# Reminder cadence for questions still UNANSWERED after the first dispatch.
+# All three are env-tunable so cadence can change without a redeploy.
+REMINDER_FIRST_HOURS = float(os.environ.get("QUESTIONS_REMINDER_FIRST_HOURS", "12"))
+REMINDER_INTERVAL_HOURS = float(os.environ.get("QUESTIONS_REMINDER_INTERVAL_HOURS", "12"))
+REMINDER_MAX_COUNT = int(os.environ.get("QUESTIONS_REMINDER_MAX_COUNT", "1"))
 
 # MarkdownV2 escape per Telegram spec
 _MD_ESCAPE = str.maketrans({c: f"\\{c}" for c in r"_*[]()~`>#+-=|{}.!"})
@@ -228,9 +235,14 @@ ALTER_SQL = """
 ALTER TABLE ml_user_questions
   ADD COLUMN IF NOT EXISTS tg_dispatched_at TIMESTAMPTZ,
   ADD COLUMN IF NOT EXISTS tg_message_id TEXT,
-  ADD COLUMN IF NOT EXISTS tg_suggestion TEXT;
+  ADD COLUMN IF NOT EXISTS tg_suggestion TEXT,
+  ADD COLUMN IF NOT EXISTS tg_reminder_count INT NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS tg_last_reminder_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_ml_questions_tg_pending
   ON ml_user_questions(user_id) WHERE status = 'UNANSWERED' AND tg_dispatched_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_ml_questions_tg_reminders
+  ON ml_user_questions(user_id, tg_dispatched_at)
+  WHERE status = 'UNANSWERED' AND tg_dispatched_at IS NOT NULL;
 """
 
 
@@ -400,6 +412,94 @@ async def _tg_send_question(
         return None
 
 
+async def _tg_send_reminder(
+    http: httpx.AsyncClient,
+    bot_token: str,
+    chat_id: str,
+    question_id: int,
+    item_title: str,
+    item_permalink: Optional[str],
+    buyer_nickname: Optional[str],
+    question_text: str,
+    suggestion: Optional[str],
+    hours_pending: int,
+    reply_to_message_id: Optional[str],
+) -> Optional[str]:
+    """Send a compact reminder for an unanswered question. Threads as a reply
+    to the original card when possible; falls back to a standalone message
+    if reply_to fails (original message deleted)."""
+    body_lines = [f"🔔 *LEMBRETE \\(sem resposta há ~{hours_pending}h\\)*"]
+    if item_title:
+        body_lines.append(f"📦 {_esc(item_title)}")
+    if buyer_nickname:
+        body_lines.append(f"👤 @{_esc(buyer_nickname)}")
+    body_lines.append("")
+    body_lines.append(f"💬 _{_esc(question_text)}_")
+    if suggestion:
+        body_lines.append("")
+        body_lines.append("🪄 *Sugestão anterior:*")
+        body_lines.append(_esc(suggestion))
+    text = "\n".join(body_lines)
+    if len(text) > 4000:
+        text = text[:3990] + "…"
+
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Aprovar", "callback_data": f"qa:{question_id}"},
+                {"text": "✏️ Editar", "callback_data": f"qe:{question_id}"},
+            ],
+            [
+                {"text": "🔄 Outra sugestão", "callback_data": f"qr:{question_id}"},
+                *([{"text": "🔗 Ver no ML", "url": item_permalink}] if item_permalink else []),
+            ],
+        ],
+    }
+
+    async def _post(payload: dict[str, Any]) -> tuple[int, Optional[str]]:
+        r = await http.post(
+            f"{TG_API_BASE}/bot{bot_token}/sendMessage",
+            json=payload,
+            timeout=10.0,
+        )
+        msg_id: Optional[str] = None
+        if r.status_code == 200:
+            mid = (r.json() or {}).get("result", {}).get("message_id")
+            msg_id = str(mid) if mid else None
+        return r.status_code, msg_id
+
+    try:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "MarkdownV2",
+            "reply_markup": keyboard,
+            "disable_web_page_preview": True,
+        }
+        if reply_to_message_id:
+            # allow_sending_without_reply: still send the reminder if the
+            # original card was deleted from the chat (TG would otherwise 400).
+            payload["reply_parameters"] = {
+                "message_id": int(reply_to_message_id),
+                "allow_sending_without_reply": True,
+            }
+        status, msg_id = await _post(payload)
+        if status == 200 and msg_id:
+            return msg_id
+
+        plain_text = _strip_md2_escapes(text)
+        payload["text"] = plain_text
+        payload.pop("parse_mode", None)
+        status2, msg_id2 = await _post(payload)
+        if status2 == 200 and msg_id2:
+            return msg_id2
+        log.warning("TG reminder send failed (q=%s): status=%s", question_id, status2)
+        return None
+    except Exception as err:  # noqa: BLE001
+        log.exception("TG reminder send failed: %s", err)
+        return None
+
+
 # ── Per-user dispatch ─────────────────────────────────────────────────────────
 
 async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int) -> dict[str, int]:
@@ -519,7 +619,99 @@ async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int) -> dict[str, int]
                     )
             await asyncio.sleep(TG_THROTTLE)
 
-    return {"sent": sent, "skipped": 0}
+    reminded = await _send_reminders_for_user(pool, user_id, bot_token, chat_id)
+
+    return {"sent": sent, "skipped": 0, "reminded": reminded}
+
+
+async def _send_reminders_for_user(
+    pool: asyncpg.Pool,
+    user_id: int,
+    bot_token: str,
+    chat_id: str,
+) -> int:
+    """Re-ping questions still UNANSWERED past the reminder threshold.
+
+    Cadence:
+      - first reminder: REMINDER_FIRST_HOURS after initial dispatch
+      - subsequent:     REMINDER_INTERVAL_HOURS after the previous reminder
+      - capped at REMINDER_MAX_COUNT total reminders per question
+    """
+    if REMINDER_MAX_COUNT <= 0:
+        return 0
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT question_id, item_id, text, raw, from_nickname,
+                   tg_message_id, tg_suggestion, tg_dispatched_at,
+                   tg_reminder_count
+              FROM ml_user_questions
+             WHERE user_id = $1
+               AND status = 'UNANSWERED'
+               AND tg_dispatched_at IS NOT NULL
+               AND tg_reminder_count < $2
+               AND (
+                 (tg_last_reminder_at IS NULL
+                   AND tg_dispatched_at + ($3 * INTERVAL '1 hour') < NOW())
+                 OR (tg_last_reminder_at IS NOT NULL
+                   AND tg_last_reminder_at + ($4 * INTERVAL '1 hour') < NOW())
+               )
+             ORDER BY tg_dispatched_at ASC
+             LIMIT $5
+            """,
+            user_id, REMINDER_MAX_COUNT,
+            REMINDER_FIRST_HOURS, REMINDER_INTERVAL_HOURS,
+            TG_BATCH_CAP,
+        )
+
+    if not rows:
+        return 0
+
+    reminded = 0
+    async with httpx.AsyncClient() as http:
+        for row in rows:
+            qid = int(row["question_id"])
+            raw = row["raw"]
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except Exception:  # noqa: BLE001
+                    raw = {}
+            elif raw is None:
+                raw = {}
+            item = (raw or {}).get("item") or {}
+            item_title = item.get("title") or ""
+            item_permalink = item.get("permalink")
+
+            dispatched_at = row["tg_dispatched_at"]
+            hours_pending = max(
+                1,
+                int((datetime.now(timezone.utc) - dispatched_at).total_seconds() // 3600),
+            )
+
+            new_msg_id = await _tg_send_reminder(
+                http, bot_token, chat_id, qid,
+                item_title, item_permalink, row["from_nickname"],
+                row["text"] or "", row["tg_suggestion"],
+                hours_pending, row["tg_message_id"],
+            )
+
+            if new_msg_id:
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE ml_user_questions
+                           SET tg_reminder_count = tg_reminder_count + 1,
+                               tg_last_reminder_at = NOW()
+                         WHERE user_id = $1 AND question_id = $2
+                        """,
+                        user_id, qid,
+                    )
+                reminded += 1
+            await asyncio.sleep(TG_THROTTLE)
+
+    return reminded
 
 
 # ── Cron entry point (called from main.py APScheduler) ────────────────────────
@@ -540,12 +732,13 @@ async def dispatch_all_users(pool: asyncpg.Pool) -> dict[str, int]:
             """
         )
     user_ids = [r["user_id"] for r in rows]
-    totals = {"users": 0, "sent": 0}
+    totals = {"users": 0, "sent": 0, "reminded": 0}
     for uid in user_ids:
         try:
             res = await _dispatch_for_user(pool, uid)
             totals["users"] += 1
-            totals["sent"] += res["sent"]
+            totals["sent"] += res.get("sent", 0)
+            totals["reminded"] += res.get("reminded", 0)
         except Exception as err:  # noqa: BLE001
             log.exception("questions dispatch user %s failed: %s", uid, err)
         await asyncio.sleep(0.5)
