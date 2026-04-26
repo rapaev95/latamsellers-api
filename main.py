@@ -8,9 +8,17 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 import sys
 from datetime import datetime
+
+# Configure root logger before importing service modules — without an attached
+# handler, module-level logger.info(...) calls are silently dropped.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
 # Playwright (used by v2/services/ml_scraper.py) needs subprocess support
 # from the asyncio loop. On Windows uvicorn defaults to a Selector loop
