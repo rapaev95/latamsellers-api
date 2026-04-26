@@ -380,6 +380,44 @@ def _build_sku_mapping(user_id: int, ml_sku_map: dict[str, dict[str, str]] | Non
                 "note": "",
             }
 
+    # 1.6) Обогатить из stock_full.xlsx — там колонка "Código do Anúncio" даёт
+    # sku→MLB напрямую, без ML API. Покрывает SKU которые есть в стоке Full
+    # но ещё не продавались (новые партии, свежие вариации).
+    try:
+        from v2.legacy.reports import load_stock_full
+        stock = load_stock_full() or {}
+        for proj_block in stock.values():
+            sku_mlbs = (proj_block or {}).get("sku_mlbs") or {}
+            sku_titles = (proj_block or {}).get("sku_titles") or {}
+            for sku_raw, mlb_raw in sku_mlbs.items():
+                nk = normalize_sku(sku_raw)
+                if not nk:
+                    continue
+                mlb = str(mlb_raw or "").strip()
+                if not mlb or mlb.lower() == "nan":
+                    continue
+                title = str(sku_titles.get(sku_raw) or "").strip()
+                if nk in all_skus:
+                    entry = all_skus[nk]
+                    if not entry.get("mlb"):
+                        entry["mlb"] = mlb
+                        entry["link"] = mlb_url(mlb)
+                    if not entry.get("title") and title:
+                        entry["title"] = title[:80]
+                else:
+                    all_skus[nk] = {
+                        "sku": str(sku_raw).strip(),
+                        "title": title[:80],
+                        "mlb": mlb,
+                        "link": mlb_url(mlb),
+                        "project": "",
+                        "supplier_type": "local",
+                        "unit_cost_brl": None,
+                        "note": "",
+                    }
+    except Exception:
+        pass
+
     # 2) Catalog overlay (project, cost, supplier — saved values win)
     for it in load_catalog():
         nk = normalize_sku(str(it.get("sku", "")))
