@@ -145,11 +145,14 @@ async def _enrich_one(http: httpx.AsyncClient, token: str, claim: dict) -> dict:
     except Exception:  # noqa: BLE001
         return claim
 
-    # 2. Returns (devolução) if referenced
+    # 2. Returns (devolução) if referenced.
+    # ML uses "return" (singular) in related_entities — accept both forms;
+    # the original strict check was the reason claim["returns"] was always
+    # missing in cached payloads.
     related = claim.get("related_entities") or []
     has_returns = any(
-        (isinstance(e, str) and e == "returns")
-        or (isinstance(e, dict) and e.get("type") == "returns")
+        (isinstance(e, str) and e in ("returns", "return"))
+        or (isinstance(e, dict) and e.get("type") in ("returns", "return"))
         for e in related
     )
     if has_returns:
@@ -162,12 +165,12 @@ async def _enrich_one(http: httpx.AsyncClient, token: str, claim: dict) -> dict:
             if r.status_code == 200:
                 rd = r.json()
                 returns = rd.get("data") if isinstance(rd, dict) and isinstance(rd.get("data"), list) else (rd if isinstance(rd, list) else [rd] if rd else [])
-                # 3. Reviews per return
+                # 3. Reviews per return — same singular/plural quirk.
                 for ret in returns:
                     ret_related = (ret or {}).get("related_entities") or []
                     has_reviews = any(
-                        (isinstance(e, str) and e == "reviews")
-                        or (isinstance(e, dict) and e.get("type") == "reviews")
+                        (isinstance(e, str) and e in ("reviews", "review"))
+                        or (isinstance(e, dict) and e.get("type") in ("reviews", "review"))
                         for e in ret_related
                     )
                     if has_reviews and ret.get("id"):
@@ -185,6 +188,26 @@ async def _enrich_one(http: httpx.AsyncClient, token: str, claim: dict) -> dict:
                 claim["returns"] = returns
         except Exception:  # noqa: BLE001
             pass
+
+    # 4. Mediation details (only for type=mediations / stage=dispute claims).
+    # The base /claims/{id} response is sparse for disputes — the rich data
+    # (due_date, affects_reputation, last_action_player, expected_actions)
+    # lives on /post-purchase/v1/mediations/{id}. Without this we cannot
+    # filter "needs my action" the way ML's UI does.
+    if claim.get("type") == "mediations" or claim.get("stage") == "dispute":
+        try:
+            r = await http.get(
+                f"{ML_API_BASE}/post-purchase/v1/mediations/{cid}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15.0,
+            )
+            if r.status_code == 200:
+                claim["mediation"] = r.json()
+            elif r.status_code not in (403, 404):
+                log.info("mediations/%s status=%s body=%s", cid, r.status_code, r.text[:200])
+        except Exception as err:  # noqa: BLE001
+            log.warning("mediations/%s exception: %s", cid, err)
+
     return claim
 
 
