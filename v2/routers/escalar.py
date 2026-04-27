@@ -167,11 +167,85 @@ async def get_products(
             p["visitsDaily"] = v["daily"]
             p["visitsFetchedAt"] = v["fetchedAt"]
 
+    # Join cached ml_user_items meta (status / sub_status / tags) so the
+    # /escalar/moderation UI can compute severity client-side without
+    # firing N × 2 ML API calls on every page load. Includes paused /
+    # closed / under_review items that backfill brings into the cache.
+    items_meta_map: dict[str, dict[str, Any]] = {}
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT item_id, status, raw FROM ml_user_items WHERE user_id = $1",
+                    user.id,
+                )
+            import json as _json_mod
+            for r in rows:
+                raw = r["raw"]
+                if isinstance(raw, str):
+                    try:
+                        raw = _json_mod.loads(raw)
+                    except Exception:  # noqa: BLE001
+                        raw = {}
+                if not isinstance(raw, dict):
+                    raw = {}
+                items_meta_map[r["item_id"]] = {
+                    "status": r["status"],
+                    "sub_status": raw.get("sub_status") or [],
+                    "tags": raw.get("tags") or [],
+                }
+            _step(f"after items meta load ({len(items_meta_map)} items)")
+        except Exception as err:  # noqa: BLE001
+            _log.warning("items meta load failed: %s", err)
+
+    # Severity classification (mirror of /api/escalar/items/[itemId]/moderation
+    # so the page sees the same buckets without extra fetches).
+    _PROBLEMATIC_TAGS = {
+        "incomplete_compatibilities", "incomplete_technical_specs",
+        "incomplete_position_compatibilities", "moderation_penalty",
+        "catalog_forewarning", "poor_quality_picture", "poor_quality_thumbnail",
+        "not_market_price", "lost_me2_by_dimensions",
+    }
+
+    def _severity(status: Any, sub_status: Any, tags: Any) -> str:
+        subs = [s.lower() for s in (sub_status or []) if isinstance(s, str)]
+        if status == "closed":
+            return "red"
+        if "forbidden" in subs or "waiting_for_patch" in subs:
+            return "red"
+        if any(s in subs for s in ("pending_documentation", "held", "warning")):
+            return "amber"
+        if any("picture_download" in s for s in subs):
+            return "gray"
+        if status == "under_review":
+            return "amber"
+        if status == "paused":
+            return "gray"
+        problematic = [t for t in (tags or []) if isinstance(t, str) and t in _PROBLEMATIC_TAGS]
+        if problematic:
+            return "amber"
+        return "ok"
+
+    moderation_coverage = 0
+    for p in products_out:
+        item_id = p.get("itemId")
+        if not item_id:
+            continue
+        meta = items_meta_map.get(item_id)
+        if not meta:
+            continue
+        moderation_coverage += 1
+        p["itemStatus"] = meta["status"]
+        p["itemSubStatus"] = meta["sub_status"]
+        p["itemTags"] = meta["tags"]
+        p["severity"] = _severity(meta["status"], meta["sub_status"], meta["tags"])
+
     meta = dict(summary["meta"])
     meta["qualityFetchedAt"] = latest_fetched_at
     meta["qualityCoverage"] = quality_coverage
     meta["visitsFetchedAt"] = visits_latest_fetched_at
     meta["visitsCoverage"] = visits_coverage
+    meta["moderationCoverage"] = moderation_coverage
     # Diagnostic — surfaces whether the DB cache actually has rows and whether
     # keys align with product itemIds. Temporary until visits UI is verified.
     sample_db_keys = list(visits_map.keys())[:3] if visits_map else []
