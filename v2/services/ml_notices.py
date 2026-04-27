@@ -232,6 +232,14 @@ async def _dispatch_to_telegram(
             "fbm_stock_operations:",
             "catalog_item_competition",
             "catalog_suggestions",
+            # Promotions webhook events: useful for triggering refresh
+            # (so ml_user_promotions cache + topic=promotions notice get
+            # produced), but the events themselves carry only an internal
+            # OFFER-/CANDIDATE- id, not the actionable promotion_id. Mark
+            # silent — the seller gets ONE rich promotions: notice with
+            # Aceitar/Rejeitar buttons instead of a stub here.
+            "public_offers:",
+            "public_candidates:",
         )
         # First pass: bulk-mark noisy notices as sent so they drop out of the
         # queue without consuming a TG send slot. Idempotent — once cleared,
