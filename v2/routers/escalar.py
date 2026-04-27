@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any, Optional, Union
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
 
 from v2.deps import CurrentUser, current_user, get_pool
 from v2.legacy import db_storage as legacy_db
@@ -997,6 +997,56 @@ async def claim_attachments_probe(
             out["returns_error"] = str(err)
 
     return out
+
+
+@router.post("/user-claims/{claim_id}/send-message")
+async def send_claim_message(
+    claim_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+    body: dict[str, Any] = Body(...),
+):
+    """Post a message into a claim's mediation chat. For dispute/mediation
+    stage claims, this is how the seller "selects" a resolution — by
+    replying to the ML mediator's question.
+
+    Body: { "text": "..." } — the message content.
+
+    Returns ML's raw response so we can iterate on the right text format
+    ("1" vs "Aceitar devolução" vs "Devolução").
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    text = (body or {}).get("text") or ""
+    if not text or not isinstance(text, str):
+        return {"error": "text_required"}
+    try:
+        token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except Exception as err:  # noqa: BLE001
+        return {"error": "oauth_failed", "detail": str(err)}
+
+    base = "https://api.mercadolibre.com"
+    url = f"{base}/post-purchase/v1/claims/{claim_id}/messages"
+    payload = {"message": text}
+    async with httpx.AsyncClient() as http:
+        try:
+            r = await http.post(
+                url, json=payload,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=20.0,
+            )
+            ct = r.headers.get("content-type", "")
+            return {
+                "ok": r.status_code < 400,
+                "status": r.status_code,
+                "content_type": ct,
+                "body": r.json() if "json" in ct else r.text[:600],
+            }
+        except Exception as err:  # noqa: BLE001
+            return {"error": "exception", "detail": str(err)}
 
 
 @router.post("/user-claims/resend-tg")
