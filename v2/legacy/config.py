@@ -405,9 +405,98 @@ def invalidate_catalog_project_index():
     _build_catalog_project_index_cached.cache_clear()
 
 
+def _build_mlb_to_sku_from_ml_items() -> dict:
+    """MLB → seller_sku map (per-user) из кеша ml_user_items.
+    Используется как fallback в get_project_by_sku когда vendas-строка
+    пришла без SKU но с MLB. Источники seller_sku в raw JSONB:
+    seller_custom_field, attributes[].SELLER_SKU,
+    variations[].attributes[].SELLER_SKU,
+    variations[].attribute_combinations[].SELLER_SKU.
+    """
+    from .db_storage import _current_user_id
+    return _build_mlb_to_sku_from_ml_items_cached(_current_user_id())
+
+
+@functools.lru_cache(maxsize=32)
+def _build_mlb_to_sku_from_ml_items_cached(user_id: int | None) -> dict:
+    import json as _json
+    idx: dict = {}
+    if user_id is None:
+        return idx
+    from .db_storage import _get_db, _put_db
+    conn = _get_db()
+    if conn is None:
+        return idx
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT item_id, raw FROM ml_user_items WHERE user_id = %s",
+            (user_id,),
+        )
+        for item_id, raw in cur.fetchall():
+            iid = (item_id or "").strip()
+            if not iid:
+                continue
+            if isinstance(raw, str):
+                try:
+                    raw = _json.loads(raw)
+                except Exception:
+                    raw = {}
+            if not isinstance(raw, dict):
+                raw = {}
+
+            picked_sku = ""
+
+            def _take(val):
+                nonlocal picked_sku
+                if picked_sku:
+                    return
+                s = str(val or "").strip()
+                if s and s.lower() != "nan":
+                    picked_sku = s
+
+            if raw.get("seller_custom_field"):
+                _take(raw.get("seller_custom_field"))
+            for attr in raw.get("attributes") or []:
+                if isinstance(attr, dict) and attr.get("id") == "SELLER_SKU":
+                    _take(attr.get("value_name") or attr.get("value_id"))
+            # Для вариаций берём SKU первой вариации (для родительского MLB
+            # любая вариация ведёт на тот же листинг → проект один)
+            for var in raw.get("variations") or []:
+                if not isinstance(var, dict):
+                    continue
+                for attr in var.get("attributes") or []:
+                    if isinstance(attr, dict) and attr.get("id") == "SELLER_SKU":
+                        _take(attr.get("value_name") or attr.get("value_id"))
+                for attr in var.get("attribute_combinations") or []:
+                    if isinstance(attr, dict) and attr.get("id") == "SELLER_SKU":
+                        _take(attr.get("value_name") or attr.get("value_id"))
+                if picked_sku:
+                    break
+
+            if picked_sku:
+                idx[iid] = picked_sku
+    except Exception:
+        pass
+    finally:
+        _put_db(conn)
+    return idx
+
+
+def invalidate_mlb_to_sku_from_ml_items():
+    """Сброс per-user MLB→SKU индекса (звать после refresh ml_user_items)."""
+    _build_mlb_to_sku_from_ml_items_cached.cache_clear()
+
+
 def get_project_by_sku(sku: str, mlb: str = "") -> str:
     """Determine project from SKU or MLB code.
-    Priority: 1) catalog direct mapping, 2) sku_prefixes, 3) mlb_fallback, 4) single project.
+    Priority:
+      1) catalog direct mapping (sku → project)
+      2) sku_prefixes
+      3) mlb_fallback (явный список MLB на проекте)
+      4) ml_user_items lookup: MLB → seller_sku → catalog/prefix
+         (фолбэк для строк vendas с пустым SKU но с MLB)
+      5) single project (если один проект всего)
     """
     sku = sku.strip()
     mlb = mlb.strip()
@@ -418,7 +507,7 @@ def get_project_by_sku(sku: str, mlb: str = "") -> str:
     if sku_upper in cat_idx:
         return cat_idx[sku_upper]
 
-    # 2) Prefix-based matching
+    # 2) Prefix-based matching + 3) mlb_fallback
     projects = load_projects()
     for pid, p in projects.items():
         for prefix in p.get("sku_prefixes", []):
@@ -428,7 +517,20 @@ def get_project_by_sku(sku: str, mlb: str = "") -> str:
             if fb_mlb and mlb == fb_mlb:
                 return pid
 
-    # 3) Single project fallback
+    # 4) ML cache fallback: SKU пустой/неизвестный, но MLB есть → look up seller_sku
+    if mlb and not sku_upper:
+        mlb_idx = _build_mlb_to_sku_from_ml_items()
+        resolved_sku = mlb_idx.get(mlb, "")
+        if resolved_sku:
+            resolved_upper = resolved_sku.strip().upper()
+            if resolved_upper in cat_idx:
+                return cat_idx[resolved_upper]
+            for pid, p in projects.items():
+                for prefix in p.get("sku_prefixes", []):
+                    if prefix and resolved_sku.lower().startswith(prefix.lower()):
+                        return pid
+
+    # 5) Single project fallback
     if len(projects) == 1:
         return list(projects.keys())[0]
     return "NAO_CLASSIFICADO"

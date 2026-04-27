@@ -151,6 +151,14 @@ async def refresh_user_items(
                     failed += 1
             await asyncio.sleep(RATE_SLEEP)
 
+    # Сбросить sync кеш MLB→seller_sku — он используется в get_project_by_sku
+    # как fallback для vendas-строк без SKU. Стейл после рефреша.
+    try:
+        from v2.legacy.config import invalidate_mlb_to_sku_from_ml_items
+        invalidate_mlb_to_sku_from_ml_items()
+    except Exception:
+        pass
+
     return {"fetched": len(item_ids), "saved": saved, "failed": failed}
 
 
