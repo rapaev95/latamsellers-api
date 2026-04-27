@@ -25,6 +25,7 @@ from v2.services import (
     ml_user_questions as ml_user_questions_svc,
     ml_visits as ml_visits_svc,
     projects,
+    supply as supply_svc,
 )
 from v2.settings import get_settings
 from v2.storage import user_storage
@@ -1498,4 +1499,159 @@ async def get_listing_performance(
     await category_benchmarks_svc.ensure_schema(pool)
     return {
         "items": await category_benchmarks_svc.get_listing_performance(pool, user.id, item_id),
+    }
+
+
+# ─── Supplier orders + reorder suggestions ───────────────────────────────────
+
+@router.get("/supply/orders")
+async def list_supply_orders(
+    status: Optional[str] = Query(None),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """List supplier orders, optionally filtered by status."""
+    if pool is None:
+        return {"error": "no_db", "orders": []}
+    await supply_svc.ensure_schema(pool)
+    return {"orders": await supply_svc.list_orders(pool, user.id, status)}
+
+
+class _SupplyOrderIn(__import__("pydantic").BaseModel):
+    supplierName: str
+    supplierCountry: Optional[str] = None
+    orderNumber: Optional[str] = None
+    status: str = "planned"
+    placedDate: Optional[str] = None
+    etaDate: Optional[str] = None
+    paymentStatus: str = "unpaid"
+    totalAmount: Optional[float] = None
+    currency: str = "USD"
+    notes: Optional[str] = None
+    items: Optional[list[dict]] = None  # [{sku, qtyOrdered, unitCost, notes?}]
+
+
+@router.post("/supply/orders")
+async def create_supply_order(
+    body: _SupplyOrderIn,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    if not body.supplierName.strip():
+        raise HTTPException(status_code=400, detail={"error": "supplier_name_required"})
+    await supply_svc.ensure_schema(pool)
+    try:
+        order_id = await supply_svc.create_order(
+            pool, user.id,
+            supplier_name=body.supplierName.strip(),
+            supplier_country=body.supplierCountry,
+            order_number=body.orderNumber,
+            status=body.status,
+            placed_date=body.placedDate,
+            eta_date=body.etaDate,
+            payment_status=body.paymentStatus,
+            total_amount=body.totalAmount,
+            currency=body.currency,
+            notes=body.notes,
+            items=body.items,
+        )
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail={"error": str(err)})
+    return {"ok": True, "orderId": order_id}
+
+
+class _SupplyStatusIn(__import__("pydantic").BaseModel):
+    status: str
+    actualArrivalDate: Optional[str] = None
+
+
+@router.patch("/supply/orders/{order_id}/status")
+async def update_supply_order_status(
+    order_id: int,
+    body: _SupplyStatusIn,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await supply_svc.ensure_schema(pool)
+    try:
+        ok = await supply_svc.update_order_status(
+            pool, user.id, order_id, body.status,
+            actual_arrival_date=body.actualArrivalDate,
+        )
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail={"error": str(err)})
+    if not ok:
+        raise HTTPException(status_code=404, detail={"error": "order_not_found"})
+    return {"ok": True}
+
+
+@router.delete("/supply/orders/{order_id}")
+async def delete_supply_order(
+    order_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await supply_svc.ensure_schema(pool)
+    ok = await supply_svc.delete_order(pool, user.id, order_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail={"error": "order_not_found"})
+    return {"ok": True}
+
+
+@router.get("/supply/reorder-suggestions")
+async def reorder_suggestions(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Compute suggested reorders from velocity + current Full stock + in-transit
+    POs. Uses last 30d sales velocity and stock_full data already in our DB.
+    """
+    if pool is None:
+        return {"error": "no_db", "suggestions": []}
+    await supply_svc.ensure_schema(pool)
+
+    # Compute velocity per SKU from vendas (last 30d)
+    if get_settings().storage_mode == "db" and pool is not None:
+        from datetime import datetime as _dt, timedelta
+        vendas_rows = await db_loader.load_user_vendas(pool, user.id)
+        cutoff = _dt.utcnow() - timedelta(days=30)
+        velocity_by_sku: dict[str, float] = {}
+        for row in vendas_rows:
+            sku = (getattr(row, "sku", None) or "").strip()
+            if not sku:
+                continue
+            sale_dt = getattr(row, "date", None) or getattr(row, "sale_date", None)
+            if isinstance(sale_dt, _dt) and sale_dt < cutoff:
+                continue
+            qty = int(getattr(row, "units", 1) or 1)
+            velocity_by_sku[sku] = velocity_by_sku.get(sku, 0.0) + qty
+        # Convert totals to per-day
+        for sku in list(velocity_by_sku.keys()):
+            velocity_by_sku[sku] = velocity_by_sku[sku] / 30.0
+
+        # Stock = stock_full per SKU
+        stock_full_map = await db_loader.load_user_stock_full(pool, user.id)
+        stock_by_sku: dict[str, int] = {}
+        for sku, sf in stock_full_map.items():
+            qty = getattr(sf, "total", 0) or 0
+            stock_by_sku[sku] = int(qty)
+    else:
+        velocity_by_sku = {}
+        stock_by_sku = {}
+
+    suggestions = await supply_svc.compute_reorder_suggestions(
+        pool, user.id, velocity_by_sku, stock_by_sku,
+    )
+    return {
+        "suggestions": suggestions,
+        "stats": {
+            "skuWithVelocity": len(velocity_by_sku),
+            "skuWithStock": len(stock_by_sku),
+        },
     }
