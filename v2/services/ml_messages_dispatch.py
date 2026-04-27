@@ -320,7 +320,57 @@ async def _send_message(
     return None
 
 
-# ── Per-user dispatch ────────────────────────────────────────────────
+# ── Batched per-user dispatch ────────────────────────────────────────
+# ML's messaging content API is closed to our app (10/13 endpoints 404,
+# 1 returned 403 "Invalid caller.id" on /marketplace/messages — endpoint
+# exists but we lack permissions). The webhook only delivers metadata
+# (topic, resource_id, sent), no text/pack_id/from. So per-message rich
+# cards would all be empty — useless noise.
+#
+# Strategy: ONE batched card per user per cron tick saying "you have N
+# new buyer messages". Click → ML inbox. Mark ALL pending rows as
+# dispatched together.
+
+def _build_batched_card(count: int, lang: str) -> str:
+    if lang == "ru":
+        title = "📩 *Новые сообщения от покупателей*"
+        if count == 1:
+            body = "У вас *1* новое непрочитанное сообщение\\."
+        else:
+            body = f"У вас *{count}* новых непрочитанных сообщения\\."
+        cta = "_Откройте центр сообщений Mercado Livre, чтобы прочитать и ответить\\._"
+    elif lang == "en":
+        title = "📩 *New buyer messages*"
+        body = f"You have *{count}* unread message{'s' if count > 1 else ''}\\."
+        cta = "_Open the Mercado Livre inbox to read and reply\\._"
+    else:
+        title = "📩 *Novas mensagens de compradores*"
+        plural = "ns" if count > 1 else "m"
+        body = f"Você tem *{count}* mensag{('e' + plural)} não lida{'s' if count > 1 else ''}\\."
+        cta = "_Abra a central de mensagens do Mercado Livre para ler e responder\\._"
+
+    return "\n\n".join([title, body, cta])
+
+
+def _build_batched_keyboard(app_base_url: str, lang: str) -> dict[str, Any]:
+    if lang == "ru":
+        ml_label = "💬 Открыть в ML"
+        app_label = "⚡ Перейти в app"
+    elif lang == "en":
+        ml_label = "💬 Open ML inbox"
+        app_label = "⚡ Open in app"
+    else:
+        ml_label = "💬 Abrir no ML"
+        app_label = "⚡ Abrir no app"
+    return {
+        "inline_keyboard": [
+            [
+                {"text": ml_label, "url": "https://myaccount.mercadolivre.com.br/mensagens"},
+                {"text": app_label, "url": f"{app_base_url.rstrip('/')}/escalar"},
+            ],
+        ],
+    }
+
 
 async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int, app_base_url: str) -> dict[str, int]:
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -341,73 +391,70 @@ async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int, app_base_url: str
         chat_id = str(settings["telegram_chat_id"])
         target_lang = (settings["language"] or "pt").lower()
 
+        # Pull all pending messages-topic notices for this user. We don't
+        # cap (TG_BATCH_CAP not used) because we send ONE batched card no
+        # matter how many — and we must mark all of them dispatched in the
+        # same transaction to avoid re-sending.
         rows = await conn.fetch(
             """
-            SELECT notice_id, label, description, raw, from_date,
-                   messages_tg_translation, messages_tg_translation_lang
+            SELECT notice_id
               FROM ml_notices
              WHERE user_id = $1
                AND topic = 'messages'
                AND messages_tg_dispatched_at IS NULL
-             ORDER BY from_date DESC NULLS LAST
-             LIMIT $2
             """,
-            user_id, TG_BATCH_CAP,
+            user_id,
         )
 
-    sent = 0
+    if not rows:
+        return {"sent": 0}
+
+    count = len(rows)
+    notice_ids = [r["notice_id"] for r in rows]
+
+    text = _build_batched_card(count, target_lang)
+    keyboard = _build_batched_keyboard(app_base_url, target_lang)
+
+    msg_id: Optional[str] = None
     async with httpx.AsyncClient() as http:
-        for row in rows:
-            notice = {
-                "notice_id": row["notice_id"],
-                "label": row["label"],
-                "description": row["description"],
-                "raw": row["raw"],
-                "from_date": (
-                    row["from_date"].isoformat() if row["from_date"] else None
-                ),
-            }
-            text, _raw = _extract_message_text(notice)
+        try:
+            status, body_preview, msg_id = await _tg_post(http, bot_token, {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "MarkdownV2",
+                "reply_markup": keyboard,
+                "disable_web_page_preview": True,
+            })
+            if not (status == 200 and msg_id) and status == 400 and "parse" in body_preview.lower():
+                plain = _strip_md2(text)
+                status2, body2, msg_id = await _tg_post(http, bot_token, {
+                    "chat_id": chat_id,
+                    "text": plain,
+                    "reply_markup": keyboard,
+                    "disable_web_page_preview": True,
+                })
+                if status2 != 200:
+                    log.warning("TG plain fallback also failed: %s %s", status2, body2)
+            elif status != 200:
+                log.warning("TG batched messages send failed status=%s body=%s", status, body_preview)
+        except Exception as err:  # noqa: BLE001
+            log.exception("TG batched messages send exception: %s", err)
 
-            translation: Optional[str] = None
-            if target_lang in ("ru", "en") and text:
-                cached = row["messages_tg_translation"]
-                cached_lang = row["messages_tg_translation_lang"]
-                if cached and cached_lang == target_lang:
-                    translation = cached
-                else:
-                    translation = await _translate(http, text, target_lang)
-                    if translation:
-                        async with pool.acquire() as conn:
-                            await conn.execute(
-                                """
-                                UPDATE ml_notices
-                                   SET messages_tg_translation = $1,
-                                       messages_tg_translation_lang = $2
-                                 WHERE user_id = $3 AND notice_id = $4
-                                """,
-                                translation, target_lang, user_id, row["notice_id"],
-                            )
+    if not msg_id:
+        return {"sent": 0, "pending": count}
 
-            msg_id = await _send_message(
-                http, bot_token, chat_id, notice, app_base_url,
-                translation=translation, translation_lang=target_lang,
-            )
-            if msg_id:
-                async with pool.acquire() as conn:
-                    await conn.execute(
-                        """
-                        UPDATE ml_notices
-                           SET messages_tg_dispatched_at = NOW(),
-                               messages_tg_message_id = $1
-                         WHERE user_id = $2 AND notice_id = $3
-                        """,
-                        msg_id, user_id, row["notice_id"],
-                    )
-                sent += 1
-            await asyncio.sleep(TG_THROTTLE)
-
-    return {"sent": sent}
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE ml_notices
+               SET messages_tg_dispatched_at = NOW(),
+                   messages_tg_message_id = $1
+             WHERE user_id = $2
+               AND notice_id = ANY($3::text[])
+            """,
+            msg_id, user_id, notice_ids,
+        )
+    return {"sent": 1, "messages": count}
 
 
 # ── Cron entry point ─────────────────────────────────────────────────
