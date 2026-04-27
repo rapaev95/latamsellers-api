@@ -521,6 +521,7 @@ async def debug_pnl_gap(
     Помогает понять где недостающая выручка."""
     _bind_user(user)
     from v2.legacy.reports import load_vendas_ml_report, parse_brl
+    from v2.legacy.config import mlb_url
     import pandas as pd
 
     try:
@@ -580,6 +581,38 @@ async def debug_pnl_gap(
     target_rows = 0
     other_projects: dict[str, dict] = {}
 
+    # Заранее построим MLB → title из vendas + ml_user_items для красивого вывода
+    title_by_mlb: dict[str, str] = {}
+    title_col = next(
+        (c for c in vdf.columns if "título" in c.lower() or "titulo" in c.lower()),
+        None,
+    )
+    mlb_col_v = next(
+        (c for c in vdf.columns
+         if c.startswith("#") and ("anúncio" in c.lower() or "anuncio" in c.lower())),
+        None,
+    )
+    if title_col and mlb_col_v:
+        for _, row in vdf.iterrows():
+            m = str(row.get(mlb_col_v, "") or "").strip()
+            t = str(row.get(title_col, "") or "").strip()
+            if m and t and m not in title_by_mlb and t.lower() != "nan":
+                title_by_mlb[m] = t[:80]
+    # Также подтянем из ml_user_items (item_id, title)
+    try:
+        async with pool.acquire() as conn:
+            ml_rows = await conn.fetch(
+                "SELECT item_id, title FROM ml_user_items WHERE user_id = $1",
+                user.id,
+            )
+        for r in ml_rows:
+            iid = (r["item_id"] or "").strip()
+            t = (r["title"] or "").strip()
+            if iid and t and iid not in title_by_mlb:
+                title_by_mlb[iid] = t[:80]
+    except Exception:
+        pass
+
     for _, row in vdf.iterrows():
         rm = _row_month(str(row.get("Data da venda", "")))
         if rm != month:
@@ -597,7 +630,14 @@ async def debug_pnl_gap(
             naoclass_rows += 1
             key = sku.upper() or f"<no-sku> {mlb}"
             if key not in naoclass_by_sku:
-                naoclass_by_sku[key] = {"sku": sku, "mlb": mlb, "revenue": 0.0, "rows": 0}
+                naoclass_by_sku[key] = {
+                    "sku": sku,
+                    "mlb": mlb,
+                    "title": title_by_mlb.get(mlb, ""),
+                    "ml_url": mlb_url(mlb) if mlb else "",
+                    "revenue": 0.0,
+                    "rows": 0,
+                }
             naoclass_by_sku[key]["revenue"] += rev
             naoclass_by_sku[key]["rows"] += 1
         else:
