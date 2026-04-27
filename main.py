@@ -265,6 +265,14 @@ async def _nightly_refresh_all_users_job() -> None:
                 await ml_user_items_svc.refresh_user_items(pool, uid, status="active")
             except Exception as err:  # noqa: BLE001
                 _ml_log.warning("nightly items user %s: %s", uid, err)
+            # Pull paused/closed/under_review too so the questions UI can split
+            # them into "active vs archive" and TG dispatch can skip
+            # un-answerable ones (ML returns 400 not_active_item otherwise).
+            for _inactive in ("paused", "closed", "under_review"):
+                try:
+                    await ml_user_items_svc.refresh_user_items(pool, uid, status=_inactive)
+                except Exception as err:  # noqa: BLE001
+                    _ml_log.warning("nightly items %s user %s: %s", _inactive, uid, err)
             # Get item ids for downstream caches.
             try:
                 async with pool.acquire() as conn:
