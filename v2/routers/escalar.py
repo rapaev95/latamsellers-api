@@ -840,26 +840,28 @@ async def messages_probe(
 
     headers = {"Authorization": f"Bearer {token}"}
     base = "https://api.mercadolibre.com"
-    # First-pass probe returned 404 on all 5 — same pattern as returns probe
-    # where the UI-visible "#venda" number isn't an order_id. Now we try
-    # interpreting it as pack_id (FULL orders wrap into packs), as well as
-    # the /option/{role} variants ML's docs mention.
+    # All 10 prior candidates returned 404 even with the hex resource_id from
+    # the webhook payload. Try user-scoped paths + private/marketplace/post
+    # variants — common ML conventions we haven't hit yet.
     candidates = [
-        # Pack-scoped (most likely for FULL — id is probably pack_id)
-        ("messages_pack_seller_buyer", f"{base}/messages/packs/{order_id}/sellers/{ml_user_id}/option/seller_buyer"),
-        ("messages_pack_seller", f"{base}/messages/packs/{order_id}/sellers/{ml_user_id}"),
-        ("messages_pack_only", f"{base}/messages/packs/{order_id}"),
-        # Order-scoped legacy
-        ("messages_orders_seller", f"{base}/messages/orders/{order_id}/sellers/{ml_user_id}"),
-        ("messages_orders_legacy", f"{base}/messaging/orders/{order_id}/messages"),
-        ("orders_messages", f"{base}/sites/MLB/orders/{order_id}/messages"),
-        # Cross-resource — list all messages for seller
-        ("seller_messages", f"{base}/messages/sellers/{ml_user_id}"),
-        ("seller_messages_unread", f"{base}/messages/sellers/{ml_user_id}?status=unread"),
-        # Post-purchase
-        ("post_purchase_messages", f"{base}/post-purchase/v1/orders/{order_id}/messages"),
-        # Direct message resource (long shot)
-        ("message_direct", f"{base}/messages/{order_id}"),
+        # User-scoped
+        ("users_messages", f"{base}/users/{ml_user_id}/messages"),
+        ("users_messages_inbox", f"{base}/users/{ml_user_id}/messages/inbox"),
+        ("users_messages_received", f"{base}/users/{ml_user_id}/messages/received"),
+        # Per-resource direct (with hex id from webhook)
+        ("message_resource_id", f"{base}/messages/{order_id}"),
+        ("messages_v1_resource", f"{base}/messages/v1/{order_id}"),
+        ("private_messages", f"{base}/messages/private/{order_id}"),
+        ("marketplace_messages", f"{base}/marketplace/messages/{order_id}"),
+        ("messaging_v1_resource", f"{base}/messaging/v1/{order_id}"),
+        # Site-scoped
+        ("site_messages_user", f"{base}/sites/MLB/users/{ml_user_id}/messages"),
+        # Pack option variants (the option could be different)
+        ("messages_pack_post_sale", f"{base}/messages/packs/{order_id}/sellers/{ml_user_id}/option/post_sale"),
+        ("messages_pack_questions", f"{base}/messages/packs/{order_id}/sellers/{ml_user_id}/option/questions"),
+        # Conversations
+        ("conversations_user", f"{base}/conversations/users/{ml_user_id}"),
+        ("conversations_resource", f"{base}/conversations/{order_id}"),
     ]
 
     results = []
