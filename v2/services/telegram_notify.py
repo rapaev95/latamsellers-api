@@ -387,10 +387,15 @@ async def send_notice(
         # bytes) and MLB ids ≤16 bytes — fits comfortably with `pa:` prefix.
         if promo_id and promo_item_id:
             accept_label = {
-                "ru": "✅ Принять",
-                "en": "✅ Accept",
-                "pt": "✅ Aceitar",
-            }.get(language, "✅ Aceitar")
+                "ru": "✅ Принять (мин)",
+                "en": "✅ Accept (min)",
+                "pt": "✅ Aceitar (min)",
+            }.get(language, "✅ Aceitar (min)")
+            raise_label = {
+                "ru": "📈 Поднять цену +15% и принять",
+                "en": "📈 Raise +15% & accept",
+                "pt": "📈 Subir +15% e aceitar",
+            }.get(language, "📈 Subir +15% e aceitar")
             reject_label = {
                 "ru": "❌ Отклонить",
                 "en": "❌ Reject",
@@ -401,13 +406,23 @@ async def send_notice(
                 "en": "🔍 Details",
                 "pt": "🔍 Detalhes",
             }.get(language, "🔍 Detalhes")
-            buttons_row = [
+            # Three rows: [accept_min, reject] / [accept_with_raise] / [details].
+            # callback_data prefixes:
+            #   pa:  → accept at entrada (min discount required by ML)
+            #   pas: → raise listing price +15% then accept at entrada (lets
+            #          the seller participate in promo with apparent discount
+            #          while keeping effective sale price near original)
+            #   pr:  → reject
+            row_accept_reject = [
                 {"text": accept_label, "callback_data": f"pa:{promo_id}:{promo_item_id}"},
                 {"text": reject_label, "callback_data": f"pr:{promo_id}:{promo_item_id}"},
             ]
+            row_raise = [
+                {"text": raise_label, "callback_data": f"pas:{promo_id}:{promo_item_id}"},
+            ]
             details_url = f"https://www.mercadolivre.com.br/anuncios/promotions/{promo_id}"
             details_row = [{"text": details_label, "url": details_url}]
-            payload["reply_markup"] = {"inline_keyboard": [buttons_row, details_row]}
+            payload["reply_markup"] = {"inline_keyboard": [row_accept_reject, row_raise, details_row]}
 
     if topic == "items":
         item_id = ""

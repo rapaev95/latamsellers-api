@@ -1592,10 +1592,15 @@ async def refresh_user_promotions(
 # isn't available from Telegram's webhook context.
 
 class _PromoActionIn(__import__("pydantic").BaseModel):
-    action: str          # "accept" | "reject"
+    action: str          # "accept" | "reject" | "accept_with_raise"
     user_id: int
     promotion_id: str
     item_id: str
+    # accept_with_raise: % uplift applied to listing price BEFORE accept.
+    # Default +15% — keeps the apparent buyer-facing discount around the
+    # promo's required entrada while leaving effective sale price near
+    # the original listing.
+    raise_pct: Optional[float] = None
 
 
 class _PromoRefreshInternalIn(__import__("pydantic").BaseModel):
@@ -1870,9 +1875,103 @@ async def promotions_tg_action(
     mlb = body.item_id.upper()
     url = f"https://api.mercadolibre.com/seller-promotions/items/{mlb}?app_version=v2"
 
+    raise_pct = float(body.raise_pct or 15.0)
+    raise_info: dict = {}
+
     async with httpx.AsyncClient() as http:
-        if body.action == "accept":
+        # ── Two-step "raise then accept" flow ─────────────────────────────────
+        # Lifts the listing price by raise_pct BEFORE accepting the promo so the
+        # promo's mandatory discount lands close to the seller's original price.
+        # ML auto-recomputes the offer's max_discounted_price/etc. against the
+        # new listing price, so we re-fetch after the PUT and accept at the
+        # refreshed entrada. If anything fails partway, we keep the already-
+        # raised price (rollback would need its own retry-safe path).
+        if body.action == "accept_with_raise":
+            item_url = f"https://api.mercadolibre.com/items/{mlb}"
+            try:
+                gr = await http.get(
+                    item_url,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=15.0,
+                )
+            except Exception as err:  # noqa: BLE001
+                return {"error": "ml_item_fetch_failed", "detail": str(err)}
+            if gr.status_code >= 400:
+                return {
+                    "error": "ml_item_fetch_rejected",
+                    "status": gr.status_code,
+                    "detail": gr.text[:300],
+                }
+            try:
+                old_price = float((gr.json() or {}).get("price") or 0.0)
+            except (TypeError, ValueError):
+                old_price = 0.0
+            if old_price <= 0:
+                return {"error": "no_current_price"}
+            new_price = round(old_price * (1.0 + raise_pct / 100.0), 2)
+            try:
+                pr = await http.put(
+                    item_url,
+                    json={"price": new_price},
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=15.0,
+                )
+            except Exception as err:  # noqa: BLE001
+                return {"error": "ml_price_update_failed", "detail": str(err)}
+            if pr.status_code >= 400:
+                return {
+                    "error": "ml_price_update_rejected",
+                    "status": pr.status_code,
+                    "detail": pr.text[:300],
+                    "old_price": old_price,
+                    "attempted_new_price": new_price,
+                }
+            raise_info = {
+                "old_price": old_price,
+                "new_price": new_price,
+                "raise_pct": raise_pct,
+            }
+
+            # Re-fetch the offer with the new listing price so we accept at
+            # the refreshed entrada (max_discounted_price recomputed by ML).
+            try:
+                await ml_user_promotions_svc.refresh_user_promotions(
+                    pool, body.user_id, item_ids=[mlb],
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            offer = await ml_user_promotions_svc.get_offer(
+                pool, body.user_id, body.item_id, body.promotion_id,
+            )
+            if not offer:
+                return {
+                    "error": "offer_not_in_cache_after_raise",
+                    "raise": raise_info,
+                    "hint": "Price raised but offer disappeared. Check ML side.",
+                }
+
             payload: dict = {
+                "promotion_id": offer["promotion_id"],
+                "promotion_type": offer["promotion_type"],
+            }
+            if offer.get("deal_price") is not None:
+                payload["deal_price"] = offer["deal_price"]
+            if offer.get("offer_id"):
+                payload["offer_id"] = offer["offer_id"]
+            r = await http.post(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=15.0,
+            )
+        elif body.action == "accept":
+            payload = {
                 "promotion_id": offer["promotion_id"],
                 "promotion_type": offer["promotion_type"],
             }
@@ -1904,9 +2003,10 @@ async def promotions_tg_action(
             "error": "ml_request_failed",
             "status": r.status_code,
             "detail": r.text[:300],
+            "raise": raise_info or None,
         }
 
-    if body.action == "accept":
+    if body.action in ("accept", "accept_with_raise"):
         await ml_user_promotions_svc.mark_accepted(
             pool, body.user_id, body.item_id, body.promotion_id,
         )
@@ -1922,7 +2022,11 @@ async def promotions_tg_action(
     except Exception:  # noqa: BLE001
         pass
 
-    return {"ok": True, "action": body.action}
+    out: dict = {"ok": True, "action": body.action}
+    if raise_info:
+        out["raise"] = raise_info
+        out["deal_price"] = offer.get("deal_price")
+    return out
 
 
 # ── Full Operations probe (TEST step) ─────────────────────────────────────────
