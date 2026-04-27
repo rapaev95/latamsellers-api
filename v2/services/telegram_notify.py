@@ -407,24 +407,22 @@ async def send_notice(
             except (TypeError, ValueError):
                 pass
 
-            linear_pct = max(1, int(round(entrada_pct))) if entrada_pct > 0 else 15
-            # Exact formula: D / (1 − D/100). Returns to original price exactly.
+            # Exact formula: D / (1 − D/100). Returns to original price exactly
+            # so the buyer-facing discount equals the promo's mandatory entrada
+            # while the seller's effective sale price stays unchanged.
             if 0 < entrada_pct < 100:
                 exact_pct_f = entrada_pct / (1 - entrada_pct / 100.0)
                 exact_pct = max(1, int(round(exact_pct_f)))
+            elif entrada_pct > 0:
+                exact_pct = max(1, int(round(entrada_pct)))
             else:
-                exact_pct = linear_pct
+                exact_pct = 15
 
             accept_label = {
                 "ru": "✅ Принять (мин)",
                 "en": "✅ Accept (min)",
                 "pt": "✅ Aceitar (min)",
             }.get(language, "✅ Aceitar (min)")
-            raise_label = {
-                "ru": f"📈 Поднять +{linear_pct}% и принять",
-                "en": f"📈 Raise +{linear_pct}% & accept",
-                "pt": f"📈 Subir +{linear_pct}% e aceitar",
-            }.get(language, f"📈 Subir +{linear_pct}% e aceitar")
             exact_label = {
                 "ru": f"🎯 Поднять +{exact_pct}% (точно к оригиналу)",
                 "en": f"🎯 Raise +{exact_pct}% (back to original)",
@@ -440,20 +438,17 @@ async def send_notice(
                 "en": "🔍 Details",
                 "pt": "🔍 Detalhes",
             }.get(language, "🔍 Detalhes")
-            # Four rows: [accept, reject] / [linear raise] / [exact raise] / [details].
+            # Three rows: [accept_min, reject] / [exact raise] / [details].
             # callback_data prefixes:
             #   pa:  → accept at entrada (min discount required by ML)
-            #   pas: → linear raise (+D%) then accept at entrada
-            #          → effective price ends slightly below original
-            #   paf: → exact raise (+D/(1-D/100)%) then accept
+            #   paf: → exact raise (D/(1-D/100)%) then accept
             #          → effective price = original exactly ("preço fixo")
             #   pr:  → reject
+            # The webhook router still accepts pas: (linear raise) for any
+            # old-format messages already in the seller's chat history.
             row_accept_reject = [
                 {"text": accept_label, "callback_data": f"pa:{promo_id}:{promo_item_id}"},
                 {"text": reject_label, "callback_data": f"pr:{promo_id}:{promo_item_id}"},
-            ]
-            row_raise = [
-                {"text": raise_label, "callback_data": f"pas:{promo_id}:{promo_item_id}"},
             ]
             row_raise_exact = [
                 {"text": exact_label, "callback_data": f"paf:{promo_id}:{promo_item_id}"},
@@ -461,7 +456,7 @@ async def send_notice(
             details_url = f"https://www.mercadolivre.com.br/anuncios/promotions/{promo_id}"
             details_row = [{"text": details_label, "url": details_url}]
             payload["reply_markup"] = {
-                "inline_keyboard": [row_accept_reject, row_raise, row_raise_exact, details_row],
+                "inline_keyboard": [row_accept_reject, row_raise_exact, details_row],
             }
 
     if topic == "items":
