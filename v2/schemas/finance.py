@@ -36,6 +36,8 @@ class PnLReportOut(BaseModel):
     cogs: Optional[float] = None
     net_profit: Optional[float] = None
     vendas_count: int = 0
+    vendas_delivered_count: int = 0
+    vendas_returned_count: int = 0
     margin_pct: float = 0
     # COGS diagnostics for the UI — SKUs without unit_cost_brl in sku_catalog
     # (user needs to load Dados Fiscais or fill them manually on /finance/sku-mapping).
@@ -210,6 +212,7 @@ class SkuUpdate(BaseModel):
     project: Optional[str] = None
     supplier_type: Optional[str] = None    # 'local' | 'import'
     unit_cost_brl: Optional[float] = None
+    extra_fixed_cost_brl: Optional[float] = None  # manual extra per-unit cost
     note: Optional[str] = None
 
 

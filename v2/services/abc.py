@@ -152,6 +152,21 @@ def aggregate(
         except (TypeError, ValueError):
             return 0.0
 
+    def _extra_fixed_cost_for(sku: str) -> float:
+        """Manual fixed cost per unit (embalagem, mão de obra, custos extras)
+        entered by the seller in the UI. Stored alongside unit_cost_brl in
+        sku_catalog. Default 0 — only subtracts when explicitly set."""
+        item = _catalog_by_sku.get((sku or "").upper())
+        if not item:
+            return 0.0
+        raw = item.get("extra_fixed_cost_brl")
+        if raw is None:
+            return 0.0
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+
     # Aggregate ads investment per MLB over the selected period. Publicidade
     # export rows have `desde`/`ate` (period they cover) and `investimento` (R$).
     # We sum all rows whose `ate` falls after the cutoff.
@@ -258,7 +273,10 @@ def aggregate(
         ad_pu = (ads_total / a.units) if a.units > 0 else 0.0
         # COGS — from Dados Fiscais sync (custo_brl) or manual /finance/sku-mapping.
         unit_cost = _unit_cost_for(a.sku)
-        margin = avg_price - comm_pu - ship_pu - refund_pu - ad_pu - storage_pu - unit_cost
+        # Manual extra fixed cost per unit (embalagem, mão de obra, etc.) —
+        # entered inline in the products dashboard.
+        extra_fixed = _extra_fixed_cost_for(a.sku)
+        margin = avg_price - comm_pu - ship_pu - refund_pu - ad_pu - storage_pu - unit_cost - extra_fixed
         margin_pct = (margin / avg_price * 100) if avg_price > 0 else 0.0
         # ROI = profit_per_unit / cost_per_unit. Cost = COGS + ad spend (what
         # the seller actually puts at risk). Returns 0 if no cost basis yet.
@@ -302,6 +320,7 @@ def aggregate(
             "storagePerUnit": storage_pu,
             "refundPerUnit": refund_pu,
             "unitCost": unit_cost,
+            "extraFixedCost": extra_fixed,
             "margin": margin,
             "marginPct": margin_pct,
             "roi": roi,

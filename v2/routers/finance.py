@@ -1088,6 +1088,8 @@ def save_sku_mapping(body: SkuBulkSaveIn, user: CurrentUser = Depends(current_us
             item["supplier_type"] = stp if stp in ("local", "import") else "local"
         if u.unit_cost_brl is not None:
             item["unit_cost_brl"] = u.unit_cost_brl
+        if u.extra_fixed_cost_brl is not None:
+            item["extra_fixed_cost_brl"] = u.extra_fixed_cost_brl
         if u.note is not None:
             item["note"] = u.note
         by_key[nk] = item
