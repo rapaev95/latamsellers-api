@@ -24,6 +24,7 @@ from v2.services import (
     ml_user_promotions as ml_user_promotions_svc,
     ml_user_questions as ml_user_questions_svc,
     ml_visits as ml_visits_svc,
+    onboarding as onboarding_svc,
     projects,
     supply as supply_svc,
 )
@@ -650,13 +651,25 @@ async def answer_question(
 @router.get("/user-claims")
 async def get_user_claims(
     status: str = Query("ALL"),
+    actionable: Optional[str] = Query(None, description="'true'=needs seller action, 'false'=tracked, omit=all"),
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ):
     if pool is None:
         return {"error": "no_db", "claims": [], "total": 0}
     await ml_user_claims_svc.ensure_schema(pool)
-    return await ml_user_claims_svc.get_cached(pool, user.id, status=status)
+    actionable_flag: Optional[bool]
+    if actionable is None or actionable == "":
+        actionable_flag = None
+    elif actionable.lower() in ("true", "1", "yes"):
+        actionable_flag = True
+    elif actionable.lower() in ("false", "0", "no"):
+        actionable_flag = False
+    else:
+        actionable_flag = None
+    return await ml_user_claims_svc.get_cached(
+        pool, user.id, status=status, actionable=actionable_flag,
+    )
 
 
 @router.post("/user-claims/refresh")
@@ -1655,3 +1668,85 @@ async def reorder_suggestions(
             "skuWithStock": len(stock_by_sku),
         },
     }
+
+
+# ─── Onboarding wizard ────────────────────────────────────────────────────────
+
+@router.get("/onboarding")
+async def get_onboarding_state(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Current wizard state. UI uses completedAt + skippedAt to decide whether
+    to auto-show the wizard on first /escalar visit."""
+    if pool is None:
+        return {"error": "no_db"}
+    await onboarding_svc.ensure_schema(pool)
+    return await onboarding_svc.get_state(pool, user.id)
+
+
+class _OnboardingStepIn(__import__("pydantic").BaseModel):
+    currentStep: Optional[int] = None
+    businessModel: Optional[str] = None
+    hasOwnWarehouse: Optional[bool] = None
+    alertPrefs: Optional[dict] = None
+
+
+@router.post("/onboarding/step")
+async def save_onboarding_step(
+    body: _OnboardingStepIn,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Save partial answers as the user progresses through the wizard. Idempotent."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await onboarding_svc.ensure_schema(pool)
+    try:
+        await onboarding_svc.upsert_step(
+            pool, user.id,
+            current_step=body.currentStep,
+            business_model=body.businessModel,
+            has_own_warehouse=body.hasOwnWarehouse,
+            alert_prefs=body.alertPrefs,
+        )
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail={"error": str(err)})
+    return await onboarding_svc.get_state(pool, user.id)
+
+
+@router.post("/onboarding/complete")
+async def complete_onboarding(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await onboarding_svc.ensure_schema(pool)
+    await onboarding_svc.complete(pool, user.id)
+    return {"ok": True}
+
+
+@router.post("/onboarding/skip")
+async def skip_onboarding(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await onboarding_svc.ensure_schema(pool)
+    await onboarding_svc.skip(pool, user.id)
+    return {"ok": True}
+
+
+@router.post("/onboarding/reset")
+async def reset_onboarding(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Reopen the wizard from settings — keeps prior answers as defaults."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await onboarding_svc.ensure_schema(pool)
+    await onboarding_svc.reset(pool, user.id)
+    return {"ok": True}

@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, Optional
 
 import asyncpg
 import httpx
@@ -335,11 +335,47 @@ async def _upsert(conn: asyncpg.Connection, user_id: int, c: dict) -> None:
 
 # ── Cache readback ────────────────────────────────────────────────────────────
 
+def _compute_needs_action(claim: dict[str, Any]) -> bool:
+    """Decide whether this claim needs immediate seller action.
+
+    Rules derived from ML's "Reclamações" view (where the seller sees only
+    cards with the prominent "Atender reclamação" CTA):
+
+    1. If status != opened → no action needed (already resolved)
+    2. If returns array is empty/missing → seller hasn't chosen a solution
+       yet, ML is asking for one → ACTION
+    3. If returns[0].status == 'delivered' → return parcel arrived back at
+       the seller, must inspect + decide refund/replace → ACTION
+    4. Otherwise (label_generated / shipped / in_transit / etc.) → return
+       in motion, no immediate action required → NO ACTION
+    """
+    if (claim.get("status") or "").lower() != "opened":
+        return False
+    returns = claim.get("returns")
+    if not returns or not isinstance(returns, list):
+        return True
+    head = returns[0] if returns else {}
+    if not isinstance(head, dict):
+        return True
+    head_status = (head.get("status") or "").lower()
+    if head_status == "delivered":
+        return True
+    return False
+
+
 async def get_cached(
     pool: asyncpg.Pool,
     user_id: int,
     status: str = "ALL",
+    actionable: Optional[bool] = None,
 ) -> dict[str, Any]:
+    """Read cached claims.
+
+    `actionable`:
+      - None → no filter (return all matching the status filter)
+      - True → only claims where _compute_needs_action() is True
+      - False → only claims where it's False
+    """
     where = "WHERE user_id = $1"
     params: list[Any] = [user_id]
     if status and status.upper() != "ALL":
@@ -370,11 +406,53 @@ async def get_cached(
             totals[s] = int(t or 0)
 
     claims = []
+    actionable_count = 0
     for r in rows:
         enriched = r["enriched"]
         if isinstance(enriched, str):
             enriched = json.loads(enriched or "{}")
+        if not isinstance(enriched, dict):
+            continue
+        needs = _compute_needs_action(enriched)
+        # Stash on the payload so the UI can render per-card without
+        # recomputing the rule client-side.
+        enriched["needsAction"] = needs
+        if needs:
+            actionable_count += 1
+        if actionable is True and not needs:
+            continue
+        if actionable is False and needs:
+            continue
         claims.append(enriched)
+
+    # Compute the count separately by walking ALL opened rows (not just the
+    # filtered ones) so the UI badge for "Требуют действия" is correct
+    # regardless of which filter is active.
+    if actionable is None:
+        opened_actionable = actionable_count if status.lower() in ("opened", "open") else None
+    else:
+        # Need to walk again across all opened rows to get true total.
+        opened_actionable = None
+
+    if opened_actionable is None:
+        async with pool.acquire() as conn:
+            opened_rows = await conn.fetch(
+                """
+                SELECT enriched FROM ml_user_claims
+                 WHERE user_id = $1 AND status = 'opened'
+                """,
+                user_id,
+            )
+        opened_actionable = 0
+        for r in opened_rows:
+            payload = r["enriched"]
+            if isinstance(payload, str):
+                payload = json.loads(payload or "{}")
+            if isinstance(payload, dict) and _compute_needs_action(payload):
+                opened_actionable += 1
+
+    totals["actionable"] = opened_actionable
+
     return {
         "total": len(claims),
         "totals": totals,
