@@ -73,10 +73,25 @@ CREATE INDEX IF NOT EXISTS idx_ml_notices_messages_pending
   WHERE topic = 'messages' AND messages_tg_dispatched_at IS NULL;
 """
 
+# One-shot backfill: messages already delivered via the legacy translate
+# pipeline are marked dispatched in the new system too, so the rich-format
+# cron doesn't re-send them as duplicates. Idempotent — once a row's
+# messages_tg_dispatched_at is set it stays set; new incoming messages
+# (with telegram_sent_at IS NULL because we now skip them in legacy)
+# remain NULL and get picked up by the new dispatch.
+BACKFILL_SQL = """
+UPDATE ml_notices
+   SET messages_tg_dispatched_at = telegram_sent_at
+ WHERE topic = 'messages'
+   AND telegram_sent_at IS NOT NULL
+   AND messages_tg_dispatched_at IS NULL;
+"""
+
 
 async def ensure_schema(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
         await conn.execute(ALTER_SQL)
+        await conn.execute(BACKFILL_SQL)
 
 
 # ── AI translation (same OpenRouter setup as questions/claims) ──────
