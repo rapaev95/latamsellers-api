@@ -1,7 +1,7 @@
 """ABC products + snooze endpoints for the Escalar (Promotion) section."""
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 
@@ -19,6 +19,7 @@ from v2.services import (
     ml_notices as ml_notices_svc,
     ml_oauth as ml_oauth_svc,
     ml_quality as ml_quality_svc,
+    listing_journey as listing_journey_svc,
     ml_user_claims as ml_user_claims_svc,
     ml_user_items as ml_user_items_svc,
     ml_user_promotions as ml_user_promotions_svc,
@@ -1161,22 +1162,31 @@ async def refresh_user_promotions(
     await ml_user_items_svc.ensure_schema(pool)
     result = await ml_user_promotions_svc.refresh_user_promotions(pool, user.id)
 
-    # Push new offers into ml_notices for TG dispatch.
+    # Push pending candidates into ml_notices via the same logic the cron uses.
+    # Smarter than the prior "newly-inserted only" path: also dispatches
+    # candidates that exist in DB but have no notified_at yet (e.g. first
+    # successful refresh after onboarding, or freshly-uploaded items).
     pushed = 0
-    for offer in result.get("new_offers", []):
-        enriched = dict(offer.get("raw") or {})
-        # Inject item_id so the normalizer + TG button code can recover it
-        # without parsing notice_id.
-        enriched["item_id"] = offer["item_id"]
-        notice = ml_normalize_svc.normalize_event("promotions", None, enriched)
-        # Override notice_id with our (item_id, promo_id) pair so the same
-        # promo for two different items doesn't collide on the UNIQUE key.
-        notice["notice_id"] = f"promotions:{offer['item_id']}:{offer['promotion_id']}"
-        if await ml_notices_svc.upsert_normalized(pool, user.id, notice):
-            pushed += 1
-            await ml_user_promotions_svc.mark_notified(
-                pool, user.id, offer["item_id"], offer["promotion_id"],
-            )
+    try:
+        disp = await ml_user_promotions_svc.dispatch_pending_candidates(
+            pool, user.id,
+            normalize_event=ml_normalize_svc.normalize_event,
+            upsert_notice=ml_notices_svc.upsert_normalized,
+        )
+        pushed = (disp.get("sent_first") or 0) + (disp.get("sent_reminder") or 0)
+    except Exception as err:  # noqa: BLE001
+        # Fallback to the legacy new-offers path so we still push something
+        # if dispatch_pending fails for any reason.
+        for offer in result.get("new_offers", []):
+            enriched = dict(offer.get("raw") or {})
+            enriched["item_id"] = offer["item_id"]
+            notice = ml_normalize_svc.normalize_event("promotions", None, enriched)
+            notice["notice_id"] = f"promotions:{offer['item_id']}:{offer['promotion_id']}"
+            if await ml_notices_svc.upsert_normalized(pool, user.id, notice):
+                pushed += 1
+                await ml_user_promotions_svc.mark_notified(
+                    pool, user.id, offer["item_id"], offer["promotion_id"],
+                )
 
     return {
         "fetched": result["fetched"],
@@ -1242,6 +1252,140 @@ async def refresh_user_promotions_internal(
         "newOffers": len(result["new_offers"]),
         "pushedToTelegram": pushed,
     }
+
+
+@router.get("/user-promotions/diagnostic")
+async def promotions_diagnostic(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Visibility into the promotions cache + dispatch state.
+
+    Surfaces the gates that can keep candidates out of TG:
+      1. ml_user_promotions counts by status (candidate/started/finished)
+      2. How many candidates pending dispatch (notified_at IS NULL)
+      3. How many already accepted/dismissed by user
+      4. Sample 5 pending candidates so we can see what's actually queued
+      5. Alert prefs — is notify_ml_news ON? (cron skips users with it off)
+      6. Latest fetched_at — is the cache stale?
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    await ml_user_promotions_svc.ensure_schema(pool)
+
+    out: dict = {}
+    async with pool.acquire() as conn:
+        # By status
+        rows = await conn.fetch(
+            """
+            SELECT status, COUNT(*) AS n
+              FROM ml_user_promotions
+             WHERE user_id = $1
+             GROUP BY status
+            """,
+            user.id,
+        )
+        out["countsByStatus"] = {r["status"] or "(null)": int(r["n"]) for r in rows}
+
+        out["totals"] = {
+            "all": int(await conn.fetchval(
+                "SELECT COUNT(*) FROM ml_user_promotions WHERE user_id = $1", user.id,
+            ) or 0),
+            "candidatesPendingDispatch": int(await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM ml_user_promotions
+                 WHERE user_id = $1 AND status = 'candidate'
+                   AND notified_at IS NULL
+                   AND accepted_at IS NULL AND dismissed_at IS NULL
+                """,
+                user.id,
+            ) or 0),
+            "candidatesNotified": int(await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM ml_user_promotions
+                 WHERE user_id = $1 AND status = 'candidate'
+                   AND notified_at IS NOT NULL
+                """,
+                user.id,
+            ) or 0),
+            "accepted": int(await conn.fetchval(
+                "SELECT COUNT(*) FROM ml_user_promotions WHERE user_id = $1 AND accepted_at IS NOT NULL",
+                user.id,
+            ) or 0),
+            "dismissed": int(await conn.fetchval(
+                "SELECT COUNT(*) FROM ml_user_promotions WHERE user_id = $1 AND dismissed_at IS NOT NULL",
+                user.id,
+            ) or 0),
+        }
+
+        sample = await conn.fetch(
+            """
+            SELECT item_id, promotion_id, promotion_type, sub_type,
+                   original_price, deal_price, discount_percentage,
+                   to_char(fetched_at AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS fetched_at,
+                   notified_at IS NOT NULL AS notified
+              FROM ml_user_promotions
+             WHERE user_id = $1 AND status = 'candidate'
+               AND accepted_at IS NULL AND dismissed_at IS NULL
+             ORDER BY notified_at ASC NULLS FIRST, fetched_at DESC
+             LIMIT 5
+            """,
+            user.id,
+        )
+        out["sampleCandidates"] = [
+            {
+                "itemId": r["item_id"],
+                "promotionId": r["promotion_id"],
+                "type": r["promotion_type"],
+                "subType": r["sub_type"],
+                "originalPrice": float(r["original_price"]) if r["original_price"] else None,
+                "dealPrice": float(r["deal_price"]) if r["deal_price"] else None,
+                "discountPct": float(r["discount_percentage"]) if r["discount_percentage"] else None,
+                "fetchedAt": r["fetched_at"],
+                "alreadyNotified": bool(r["notified"]),
+            }
+            for r in sample
+        ]
+
+        latest = await conn.fetchval(
+            """
+            SELECT to_char(MAX(fetched_at) AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+              FROM ml_user_promotions WHERE user_id = $1
+            """,
+            user.id,
+        )
+        out["latestFetchedAt"] = latest
+
+        # Alert prefs gate — cron checks this; if False, no TG dispatch happens
+        prefs = await conn.fetchrow(
+            """
+            SELECT notify_ml_news, telegram_chat_id
+              FROM notification_settings
+             WHERE user_id = $1
+            """,
+            user.id,
+        )
+        out["alertPrefs"] = {
+            "notifyMlNews": bool(prefs and prefs["notify_ml_news"]),
+            "telegramConnected": bool(prefs and prefs["telegram_chat_id"]),
+        }
+
+        # Active items count — cron iterates these to fetch offers
+        out["activeItemsCount"] = int(await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM ml_user_items
+             WHERE user_id = $1 AND status = 'active'
+            """,
+            user.id,
+        ) or 0)
+
+    out["hint"] = (
+        "candidatesPendingDispatch > 0 + alertPrefs.notifyMlNews=True + telegramConnected=True "
+        "⇒ POST /user-promotions/refresh should push them to TG within seconds."
+    )
+    return out
 
 
 @router.post("/user-promotions/tg-action")
@@ -1750,3 +1894,59 @@ async def reset_onboarding(
     await onboarding_svc.ensure_schema(pool)
     await onboarding_svc.reset(pool, user.id)
     return {"ok": True}
+
+
+# ─── Listing Journey + KPI snapshots + Anomalies ──────────────────────────────
+
+@router.get("/items/{item_id}/journey")
+async def get_item_journey(
+    item_id: str,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Aggregated journey payload for the per-item drawer:
+    stage / KPI history (30d) / changelog (30 events) / today's anomaly."""
+    if pool is None:
+        return {"error": "no_db"}
+    await listing_journey_svc.ensure_schema(pool)
+    return await listing_journey_svc.get_journey(pool, user.id, item_id)
+
+
+class _ChangelogEventIn(__import__("pydantic").BaseModel):
+    eventType: str  # 'photo_change' | 'price_change' | 'promo_start' | 'video_added' | 'note' | etc.
+    note: Optional[str] = None
+    beforeValue: Optional[Any] = None
+    afterValue: Optional[Any] = None
+
+
+@router.post("/items/{item_id}/changelog")
+async def add_changelog_event(
+    item_id: str,
+    body: _ChangelogEventIn,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Manual log entry — seller pressed "+ Зафиксировать тест"."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await listing_journey_svc.ensure_schema(pool)
+    evt_id = await listing_journey_svc.add_event(
+        pool, user.id, item_id,
+        event_type=body.eventType, source="manual",
+        before_value=body.beforeValue, after_value=body.afterValue,
+        note=body.note,
+    )
+    return {"ok": True, "eventId": evt_id}
+
+
+@router.get("/anomalies")
+async def get_anomalies(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """List today's anomaly flags across all the user's items.
+    Powers the dashboard widget."""
+    if pool is None:
+        return {"error": "no_db", "anomalies": []}
+    await listing_journey_svc.ensure_schema(pool)
+    return {"anomalies": await listing_journey_svc.detect_anomalies(pool, user.id)}

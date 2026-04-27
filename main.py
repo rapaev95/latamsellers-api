@@ -261,6 +261,98 @@ async def _refresh_promotions_job() -> None:
         _ml_log.exception("Promotions refresh job failed: %s", err)
 
 
+async def _daily_kpi_snapshot_job() -> None:
+    """Snapshot per-item KPIs daily into listing_kpi_daily — the canonical
+    time-series for trend / anomaly / journey analysis.
+
+    Sources:
+      - Visits 30d total per item (from ml_visits cache)
+      - Sales last 30d per item (from vendas)
+      - Available quantity (from ml_user_items)
+
+    Runs once per day. Also diffs ml_item_context vs the latest changelog
+    entries to auto-log price/photo/title changes.
+    """
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("Daily KPI snapshot skipped: no DB pool")
+            return
+        from v2.services import (
+            listing_journey as _journey_svc,
+            ml_visits as _visits_svc,
+            ml_user_items as _items_svc,
+        )
+        from v2.parsers import db_loader as _db_loader
+        from v2.settings import get_settings as _get_settings
+        from datetime import datetime as _dt, timedelta as _td
+
+        await _journey_svc.ensure_schema(pool)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT user_id FROM ml_user_tokens WHERE access_token IS NOT NULL"
+            )
+        user_ids = [r["user_id"] for r in rows]
+        total_kpi_rows = 0
+        total_change_events = 0
+        for uid in user_ids:
+            try:
+                # Visits per item — sum across 30d window from cache
+                async with pool.acquire() as conn:
+                    visit_rows = await conn.fetch(
+                        "SELECT item_id, visits_30d FROM ml_item_visits WHERE user_id = $1",
+                        uid,
+                    )
+                visits_by_item = {r["item_id"]: int(r["visits_30d"] or 0) for r in visit_rows}
+
+                # Sales / units / revenue last 30d per item from vendas
+                units_by_item: dict[str, int] = {}
+                revenue_by_item: dict[str, float] = {}
+                if _get_settings().storage_mode == "db":
+                    vendas_rows = await _db_loader.load_user_vendas(pool, uid)
+                    cutoff = _dt.utcnow() - _td(days=30)
+                    for row in vendas_rows:
+                        sale_dt = getattr(row, "date", None) or getattr(row, "sale_date", None)
+                        if isinstance(sale_dt, _dt) and sale_dt < cutoff:
+                            continue
+                        mlb = (getattr(row, "mlb", None) or "").strip()
+                        if not mlb:
+                            continue
+                        units_by_item[mlb] = units_by_item.get(mlb, 0) + int(getattr(row, "units", 1) or 1)
+                        rev = float(getattr(row, "revenue", 0) or 0)
+                        revenue_by_item[mlb] = revenue_by_item.get(mlb, 0.0) + rev
+
+                # Available qty from ml_user_items
+                async with pool.acquire() as conn:
+                    qty_rows = await conn.fetch(
+                        "SELECT item_id, available_quantity FROM ml_user_items WHERE user_id = $1",
+                        uid,
+                    )
+                qty_by_item = {r["item_id"]: int(r["available_quantity"] or 0) for r in qty_rows}
+
+                saved = await _journey_svc.snapshot_today(
+                    pool, uid,
+                    visits_by_item=visits_by_item,
+                    units_by_item=units_by_item,
+                    revenue_by_item=revenue_by_item,
+                    available_qty_by_item=qty_by_item,
+                )
+                total_kpi_rows += saved
+
+                # Auto-detect changes (price/photos/title)
+                ch = await _journey_svc.detect_context_changes(pool, uid)
+                total_change_events += ch.get("events_logged", 0)
+            except Exception as err:  # noqa: BLE001
+                _ml_log.exception("Daily KPI snapshot user %s failed: %s", uid, err)
+            await _asyncio.sleep(0.5)
+        _ml_log.info(
+            "Daily KPI snapshot: users=%s kpi_rows=%s change_events=%s",
+            len(user_ids), total_kpi_rows, total_change_events,
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("Daily KPI snapshot job failed: %s", err)
+
+
 async def _nightly_refresh_all_users_job() -> None:
     """03:00 UTC = 00:00 BRT. Refresh every ML cache for every connected user
     so the morning's first dashboard load reads from DB instantly instead of
@@ -487,6 +579,16 @@ async def _v2_startup() -> None:
         _nightly_refresh_all_users_job,
         CronTrigger(hour=3, minute=0, timezone="UTC"),
         id="nightly_refresh_all_caches",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Daily KPI snapshot at 04:00 UTC — runs after nightly refresh so caches
+    # are warm. Populates listing_kpi_daily for trend / anomaly / journey.
+    _ml_scheduler.add_job(
+        _daily_kpi_snapshot_job,
+        CronTrigger(hour=4, minute=0, timezone="UTC"),
+        id="listing_kpi_daily_snapshot",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
