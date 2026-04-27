@@ -19,6 +19,9 @@ class ABCProduct(BaseModel):
     storagePerUnit: float
     refundPerUnit: float
     unitCost: float
+    extraFixedCost: float = 0.0
+    aluguelPerUnit: float = 0.0
+    fulfillmentPerUnit: float = 0.0
     margin: float
     marginPct: float
     roi: float
@@ -63,6 +66,12 @@ class ABCProduct(BaseModel):
     visits30d: Optional[int] = None
     visitsDaily: Optional[list[dict]] = None     # [{date: "YYYY-MM-DD", total: int}]
     visitsFetchedAt: Optional[str] = None
+    # Moderation (from ml_user_items cache — populated server-side so the
+    # /escalar/moderation page can filter / colour-code immediately).
+    itemStatus: Optional[str] = None
+    itemSubStatus: Optional[list[str]] = None
+    itemTags: Optional[list[str]] = None
+    severity: Optional[Literal["red", "amber", "gray", "ok"]] = None
 
 
 class ABCMeta(BaseModel):
