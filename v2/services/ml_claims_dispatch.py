@@ -190,6 +190,131 @@ def _extract_buyer_complaint(claim: dict[str, Any]) -> Optional[str]:
     return candidates[0][1]
 
 
+def _extract_photo_urls(claim: dict[str, Any]) -> list[dict[str, str]]:
+    """Pull buyer-uploaded photo URLs from claim messages + returns.
+
+    Two sources we've seen in ML's payload:
+      - claim.messages[*].attachments[*]   (when buyer attaches to chat msg)
+      - claim.returns[*].evidences[*]      (when buyer uploads on return flow)
+
+    Returns list of {url, name?, source} dicts (deduped). Caller sends each
+    via TG sendPhoto. Empty list = nothing to send.
+    """
+    seen_urls: set[str] = set()
+    out: list[dict[str, str]] = []
+
+    # 1. Message-level attachments
+    messages = claim.get("messages")
+    if isinstance(messages, list):
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            attachments = m.get("attachments") or []
+            if not isinstance(attachments, list):
+                continue
+            for a in attachments:
+                if not isinstance(a, dict):
+                    continue
+                url = a.get("url") or a.get("source") or a.get("file_url")
+                if not url or not isinstance(url, str):
+                    continue
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                out.append({
+                    "url": url,
+                    "name": str(a.get("name") or a.get("filename") or ""),
+                    "source": "message",
+                })
+
+    # 2. Return-level evidences
+    returns = claim.get("returns")
+    if isinstance(returns, list):
+        for ret in returns:
+            if not isinstance(ret, dict):
+                continue
+            evidences = ret.get("evidences") or ret.get("attachments") or []
+            if not isinstance(evidences, list):
+                continue
+            for e in evidences:
+                if not isinstance(e, dict):
+                    continue
+                url = e.get("url") or e.get("source") or e.get("file_url")
+                if not url or not isinstance(url, str):
+                    continue
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                out.append({
+                    "url": url,
+                    "name": str(e.get("name") or e.get("filename") or ""),
+                    "source": "return",
+                })
+
+    return out
+
+
+async def _send_photos(
+    http: httpx.AsyncClient,
+    bot_token: str,
+    chat_id: str,
+    claim_id: int,
+    photos: list[dict[str, str]],
+    access_token: Optional[str] = None,
+) -> int:
+    """Send buyer-uploaded photos to TG via sendPhoto. Cap at 5 to avoid
+    spam. Tries URL-direct first; if TG fails (auth-protected URL), we
+    fetch via ML token and re-upload as multipart.
+    Returns count actually sent.
+    """
+    sent = 0
+    for i, p in enumerate(photos[:5]):
+        url = p["url"]
+        caption = f"📎 Evidência #{i + 1} · claim `{claim_id}`"
+        # Attempt 1: TG fetches the URL directly
+        try:
+            r = await http.post(
+                f"{TG_API_BASE}/bot{bot_token}/sendPhoto",
+                json={
+                    "chat_id": chat_id,
+                    "photo": url,
+                    "caption": caption,
+                    "parse_mode": "MarkdownV2",
+                },
+                timeout=15.0,
+            )
+            if r.status_code == 200:
+                sent += 1
+                continue
+            log.info("TG sendPhoto direct claim=%s photo=%s status=%s body=%s",
+                     claim_id, i, r.status_code, r.text[:200])
+        except Exception as err:  # noqa: BLE001
+            log.warning("TG sendPhoto direct exception: %s", err)
+
+        # Attempt 2: download via ML, re-upload to TG as multipart
+        if access_token:
+            try:
+                pr = await http.get(
+                    url,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    timeout=20.0,
+                )
+                if pr.status_code != 200:
+                    continue
+                files = {"photo": (p.get("name") or f"evidence_{i}.jpg", pr.content)}
+                data = {"chat_id": chat_id, "caption": caption.replace("`", "")}
+                tr = await http.post(
+                    f"{TG_API_BASE}/bot{bot_token}/sendPhoto",
+                    data=data, files=files, timeout=30.0,
+                )
+                if tr.status_code == 200:
+                    sent += 1
+            except Exception as err:  # noqa: BLE001
+                log.warning("TG sendPhoto multipart exception: %s", err)
+        await asyncio.sleep(0.5)
+    return sent
+
+
 async def _summarize_complaint(
     http: httpx.AsyncClient,
     complaint: str,
@@ -543,6 +668,21 @@ async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int, app_base_url: str
                         msg_id, user_id, cid,
                     )
                 sent += 1
+
+                # After main card lands, send any buyer-uploaded photos so
+                # the seller can inspect evidence inline. Empty list = no-op.
+                photos = _extract_photo_urls(enriched)
+                if photos:
+                    try:
+                        from . import ml_oauth as _oauth
+                        photo_token, *_ = await _oauth.get_valid_access_token(pool, user_id)
+                    except Exception:  # noqa: BLE001
+                        photo_token = None
+                    photo_count = await _send_photos(
+                        http, bot_token, chat_id, cid, photos, access_token=photo_token,
+                    )
+                    if photo_count:
+                        log.info("claims dispatch: sent %s photos for claim %s", photo_count, cid)
             await asyncio.sleep(TG_THROTTLE)
 
     return {"sent": sent, "skipped": skipped}
