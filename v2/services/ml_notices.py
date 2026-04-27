@@ -255,16 +255,20 @@ async def _dispatch_to_telegram(
                 user_id,
             )
 
-        # Questions are dispatched by ml_questions_dispatch (rich format with
-        # AI suggestion + Aprovar/Editar buttons + product context). Mark
-        # questions notices as sent here so we don't double-notify.
+        # Questions and messages are dispatched by their dedicated services
+        # (ml_questions_dispatch, ml_messages_dispatch) — both produce rich
+        # cards with AI translation/summary + action buttons. Bulk-mark them
+        # sent here so the legacy translate-once dispatch doesn't double-
+        # notify. The new dispatchers track their own state via separate
+        # columns (questions: ml_user_questions.tg_dispatched_at; messages:
+        # ml_notices.messages_tg_dispatched_at).
         await conn.execute(
             """
             UPDATE ml_notices
                SET telegram_sent_at = NOW()
              WHERE user_id = $1
                AND telegram_sent_at IS NULL
-               AND topic IN ('questions', 'questions_v2')
+               AND topic IN ('questions', 'questions_v2', 'messages')
             """,
             user_id,
         )

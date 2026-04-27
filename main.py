@@ -62,6 +62,7 @@ from v2.db import close_pool, create_pool, get_pool  # noqa: E402
 from v2.services import ml_backfill as ml_backfill_svc  # noqa: E402
 from v2.services import ml_claims_dispatch as ml_claims_dispatch_svc  # noqa: E402
 from v2.services import ml_item_context as ml_item_context_svc  # noqa: E402
+from v2.services import ml_messages_dispatch as ml_messages_dispatch_svc  # noqa: E402
 from v2.services import ml_notices as ml_notices_svc  # noqa: E402
 from v2.services import ml_normalize as ml_normalize_svc  # noqa: E402
 from v2.services import ml_oauth as ml_oauth_svc  # noqa: E402
@@ -135,6 +136,27 @@ async def _dispatch_claims_to_tg_job() -> None:
         )
     except Exception as err:  # noqa: BLE001
         _ml_log.exception("Claims dispatch job failed: %s", err)
+
+
+async def _dispatch_messages_to_tg_job() -> None:
+    """Send buyer order-messages to seller's Telegram (cron, default 5 min).
+
+    Reads ml_notices rows with topic='messages' (populated by ML webhook)
+    and dispatches them with rich format: original text + AI translation
+    in seller's language + Responder no ML / Abrir no app buttons.
+    """
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("Messages dispatch tick skipped: no DB pool")
+            return
+        result = await ml_messages_dispatch_svc.dispatch_all_users(pool)
+        _ml_log.info(
+            "Messages dispatch tick: users=%s sent=%s",
+            result.get("users"), result.get("sent"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("Messages dispatch job failed: %s", err)
 
 
 async def _sync_ml_notices_job() -> None:
@@ -477,6 +499,10 @@ async def _v2_startup() -> None:
             await ml_claims_dispatch_svc.ensure_schema(pool)
         except Exception as err:  # noqa: BLE001
             _ml_log.exception("ML claims dispatch schema bootstrap failed: %s", err)
+        try:
+            await ml_messages_dispatch_svc.ensure_schema(pool)
+        except Exception as err:  # noqa: BLE001
+            _ml_log.exception("ML messages dispatch schema bootstrap failed: %s", err)
 
     # Spin up the headless Chromium used by /escalar/positions scraper.
     # Failure here is logged but non-fatal — the scraper self-heals on first use.
@@ -543,6 +569,19 @@ async def _v2_startup() -> None:
         "interval",
         minutes=_claims_interval,
         id="claims_tg_dispatch",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Messages auto-dispatch to Telegram for new buyer order-messages.
+    # Default 5 min. Reads ml_notices(topic='messages') directly — webhook
+    # is the only data source since ML's public messaging API is restricted.
+    _msg_interval = int(os.environ.get("MESSAGES_TG_INTERVAL_MIN", "5"))
+    _ml_scheduler.add_job(
+        _dispatch_messages_to_tg_job,
+        "interval",
+        minutes=_msg_interval,
+        id="messages_tg_dispatch",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
