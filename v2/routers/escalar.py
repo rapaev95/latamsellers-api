@@ -1,6 +1,7 @@
 """ABC products + snooze endpoints for the Escalar (Promotion) section."""
 from __future__ import annotations
 
+import json
 from typing import Any, Optional, Union
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
@@ -1152,6 +1153,39 @@ async def notifications_diagnostic(
             user.id,
         )
     out["topicCounts"] = {r["topic"]: int(r["n"]) for r in topic_rows}
+
+    # Sample raw payloads for the messages topic — needed to fix the empty
+    # rich-card we saw in production (cron sent 3 cards with only the title
+    # because raw didn't have the fields ml_normalize expected).
+    async with pool.acquire() as conn:
+        msg_rows = await conn.fetch(
+            """
+            SELECT notice_id, label, description, raw,
+                   to_char(from_date AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS from_date
+              FROM ml_notices
+             WHERE user_id = $1 AND topic = 'messages'
+             ORDER BY from_date DESC NULLS LAST
+             LIMIT 3
+            """,
+            user.id,
+        )
+    out["messagesSample"] = []
+    for r in msg_rows:
+        raw = r["raw"]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                pass
+        out["messagesSample"].append({
+            "notice_id": r["notice_id"],
+            "label": r["label"],
+            "description": r["description"],
+            "from_date": r["from_date"],
+            "raw_keys": sorted(raw.keys()) if isinstance(raw, dict) else None,
+            "raw": raw,
+        })
 
     # 4. ENV config (masked)
     bot_token = _os.environ.get("TELEGRAM_BOT_TOKEN") or ""
