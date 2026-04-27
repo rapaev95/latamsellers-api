@@ -163,6 +163,58 @@ async def skip(pool: asyncpg.Pool, user_id: int) -> None:
         )
 
 
+async def should_alert(
+    pool: asyncpg.Pool, user_id: int, key: str, default: bool = True,
+) -> bool:
+    """Should we send a TG alert of this kind to this user?
+    Returns the user's stored preference, or `default` if no onboarding row
+    exists yet (user hasn't gone through the wizard — assume opt-in)."""
+    async with pool.acquire() as conn:
+        prefs = await conn.fetchval(
+            "SELECT alert_prefs FROM user_onboarding WHERE user_id = $1",
+            user_id,
+        )
+    if not prefs:
+        return default
+    if isinstance(prefs, str):
+        try:
+            prefs = json.loads(prefs)
+        except Exception:  # noqa: BLE001
+            return default
+    if not isinstance(prefs, dict):
+        return default
+    val = prefs.get(key)
+    if isinstance(val, bool):
+        return val
+    # If a preference is missing entirely, we honour the runtime default.
+    return default
+
+
+async def get_alert_prefs_for_users(
+    pool: asyncpg.Pool, user_ids: list[int],
+) -> dict[int, dict[str, bool]]:
+    """Bulk-fetch alert preferences for a set of users — used by cron jobs to
+    avoid N+1 queries when iterating all active sellers."""
+    if not user_ids:
+        return {}
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT user_id, alert_prefs FROM user_onboarding WHERE user_id = ANY($1)",
+            user_ids,
+        )
+    out: dict[int, dict[str, bool]] = {}
+    for r in rows:
+        prefs = r["alert_prefs"]
+        if isinstance(prefs, str):
+            try:
+                prefs = json.loads(prefs)
+            except Exception:  # noqa: BLE001
+                prefs = {}
+        if isinstance(prefs, dict):
+            out[r["user_id"]] = {**DEFAULT_ALERT_PREFS, **prefs}
+    return out
+
+
 async def reset(pool: asyncpg.Pool, user_id: int) -> None:
     """Reopen the wizard — keeps prior answers as defaults, clears completed/skipped."""
     async with pool.acquire() as conn:

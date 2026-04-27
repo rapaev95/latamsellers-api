@@ -738,8 +738,19 @@ async def dispatch_all_users(pool: asyncpg.Pool) -> dict[str, int]:
             """
         )
     user_ids = [r["user_id"] for r in rows]
-    totals = {"users": 0, "sent": 0, "reminded": 0}
+
+    # Honour onboarding alert_prefs.questions: users who explicitly disabled
+    # the new-questions push are skipped here (they can still answer from UI).
+    from v2.services import onboarding as _onboarding_svc
+    await _onboarding_svc.ensure_schema(pool)
+    prefs_map = await _onboarding_svc.get_alert_prefs_for_users(pool, user_ids)
+
+    totals = {"users": 0, "sent": 0, "reminded": 0, "skipped_pref": 0}
     for uid in user_ids:
+        user_prefs = prefs_map.get(uid)
+        if user_prefs is not None and user_prefs.get("questions") is False:
+            totals["skipped_pref"] += 1
+            continue
         try:
             res = await _dispatch_for_user(pool, uid)
             totals["users"] += 1
