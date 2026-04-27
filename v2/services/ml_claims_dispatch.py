@@ -279,10 +279,28 @@ def _build_claim_card(
 
     lines: list[str] = [title]
     lines.append("")
+    # Product title + variation hint — what the buyer is complaining ABOUT.
+    # Without it the seller sees only an order_id and has to open ML to
+    # know what product is involved.
+    order_item = claim.get("order_item") or {}
+    product_title = order_item.get("title") if isinstance(order_item, dict) else None
+    qty = order_item.get("quantity") if isinstance(order_item, dict) else None
+    if product_title:
+        title_line = f"🛍 *{_esc(product_title[:120])}*"
+        if qty and isinstance(qty, int) and qty > 1:
+            title_line += f" · {qty}×"
+        lines.append(title_line)
     lines.append(f"🆔 `{_esc_code(cid)}` · {_esc(reason)} · `{_esc_code(stage)}`")
     if age:
         lines.append(f"🕒 {_esc(age)}")
     lines.append(f"📦 *Pedido:* `{_esc_code(order_id)}`")
+
+    # Buyer nickname when ML's order endpoint surfaces it.
+    buyer_block = claim.get("order_buyer") or {}
+    nickname = buyer_block.get("nickname") if isinstance(buyer_block, dict) else None
+    if nickname:
+        lines.append(f"👤 @{_esc(nickname)}")
+
     if ret_summary:
         lines.append(f"↩️ *Devolução:* `{_esc_code(ret_summary)}`")
 

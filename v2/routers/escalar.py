@@ -721,6 +721,44 @@ async def claim_messages_probe(
     return {"claim_id": claim_id, "results": results}
 
 
+@router.get("/user-claims/{claim_id}/attachments-probe")
+async def claim_attachments_probe(
+    claim_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Probe ML for buyer-uploaded photos/evidences attached to a claim.
+    Tries several documented + likely paths so we know which one returns
+    media URLs we can ship to TG via sendPhoto.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    try:
+        token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except Exception as err:  # noqa: BLE001
+        return {"error": "oauth_failed", "detail": str(err)}
+
+    base = "https://api.mercadolibre.com"
+    headers = {"Authorization": f"Bearer {token}"}
+    candidates = [
+        ("v1_attachments", f"{base}/post-purchase/v1/claims/{claim_id}/attachments"),
+        ("v2_attachments", f"{base}/post-purchase/v2/claims/{claim_id}/attachments"),
+        ("v1_evidences", f"{base}/post-purchase/v1/claims/{claim_id}/evidences"),
+        ("v1_files", f"{base}/post-purchase/v1/claims/{claim_id}/files"),
+        ("v1_media", f"{base}/post-purchase/v1/claims/{claim_id}/media"),
+        ("v2_returns_evidences", f"{base}/post-purchase/v2/claims/{claim_id}/returns/reviews"),
+    ]
+    results = []
+    async with httpx.AsyncClient() as http:
+        for label, url in candidates:
+            try:
+                r = await http.get(url, headers=headers, timeout=15.0)
+                results.append({"label": label, "url": url, "status": r.status_code, "body_preview": r.text[:600]})
+            except Exception as err:  # noqa: BLE001
+                results.append({"label": label, "url": url, "error": str(err)})
+    return {"claim_id": claim_id, "results": results}
+
+
 @router.post("/user-claims/resend-tg")
 async def resend_user_claims_tg(
     user: CurrentUser = Depends(current_user),

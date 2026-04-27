@@ -228,6 +228,42 @@ async def _enrich_one(http: httpx.AsyncClient, token: str, claim: dict) -> dict:
     except Exception as err:  # noqa: BLE001
         log.warning("claims/%s/messages exception: %s", cid, err)
 
+    # 6. Order item — surface the product title in the TG card so the seller
+    # sees WHAT the claim is about, not just the order id. resource_id is
+    # the order_id; one /orders/{id} call gives us the title + item_id.
+    order_id = claim.get("resource_id")
+    if order_id:
+        try:
+            r = await http.get(
+                f"{ML_API_BASE}/orders/{order_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15.0,
+            )
+            if r.status_code == 200:
+                order_data = r.json() or {}
+                items = order_data.get("order_items") or []
+                if items and isinstance(items[0], dict):
+                    item_inner = items[0].get("item") or {}
+                    buyer = order_data.get("buyer") or {}
+                    claim["order_item"] = {
+                        "id": item_inner.get("id"),
+                        "title": item_inner.get("title"),
+                        "variation_id": item_inner.get("variation_id"),
+                        "category_id": item_inner.get("category_id"),
+                        "quantity": items[0].get("quantity"),
+                        "unit_price": items[0].get("unit_price"),
+                    }
+                    if buyer:
+                        claim["order_buyer"] = {
+                            "id": buyer.get("id"),
+                            "nickname": buyer.get("nickname"),
+                            "first_name": buyer.get("first_name"),
+                        }
+            elif r.status_code not in (403, 404):
+                log.info("orders/%s status=%s body=%s", order_id, r.status_code, r.text[:200])
+        except Exception as err:  # noqa: BLE001
+            log.warning("orders/%s exception: %s", order_id, err)
+
     return claim
 
 
