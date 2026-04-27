@@ -98,3 +98,31 @@ async def maybe_current_user(
         return await current_user(request, pool)
     except HTTPException:
         return None
+
+
+def _is_admin(user: CurrentUser) -> bool:
+    return user.role in ("admin", "superadmin")
+
+
+def require_tier(tier: str):
+    """FastAPI dependency factory enforcing a per-feature tier.
+    Admins bypass; non-tiered users get 403 with a paywall payload."""
+    async def _dep(user: CurrentUser = Depends(current_user)) -> CurrentUser:
+        if _is_admin(user):
+            return user
+        if tier in user.tiers:
+            return user
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "tier_required", "tier": tier},
+        )
+    return _dep
+
+
+async def require_admin(user: CurrentUser = Depends(current_user)) -> CurrentUser:
+    if not _is_admin(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "admin_required"},
+        )
+    return user
