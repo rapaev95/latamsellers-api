@@ -6,6 +6,13 @@ the entire enriched object as JSONB so UI can read whatever it needs.
 
 TTL: 6h. Claim state changes by the hour (seller/buyer replies), but full-fetch
 takes ~20-40s with enrichment — worth caching.
+
+Staleness reconciliation: after each refresh we look for cached rows whose
+status='opened' but were NOT seen in this refresh (i.e. they fell off ML's
+"opened" search results page). For each one we hit /claims/{id} directly to
+learn its real current state and update accordingly. Without this step,
+once a claim is opened in our cache it stays opened forever even if ML
+already moved it to closed.
 """
 from __future__ import annotations
 
@@ -66,17 +73,60 @@ def _parse_dt(s: Any) -> Any:
 
 # ── ML API ────────────────────────────────────────────────────────────────────
 
-async def _search_claims(http: httpx.AsyncClient, token: str, status: str) -> list[dict]:
-    url = f"{ML_API_BASE}/post-purchase/v1/claims/search?status={status}&sort=date_created&limit=50"
+async def _search_claims(
+    http: httpx.AsyncClient,
+    token: str,
+    status: str,
+    max_pages: int = 4,
+) -> list[dict]:
+    """Paginate /claims/search until we exhaust results or hit max_pages.
+    50/page × 4 pages = 200 claims max per status. Old single-page fetch
+    capped at 50 silently dropped users with bigger histories.
+    """
+    out: list[dict] = []
+    offset = 0
+    headers = {"Authorization": f"Bearer {token}"}
+    for _ in range(max_pages):
+        url = (
+            f"{ML_API_BASE}/post-purchase/v1/claims/search"
+            f"?status={status}&sort=date_created&limit=50&offset={offset}"
+        )
+        try:
+            r = await http.get(url, headers=headers, timeout=20.0)
+        except Exception as err:  # noqa: BLE001
+            log.warning("claims/search status=%s offset=%s failed: %s", status, offset, err)
+            break
+        if r.status_code != 200:
+            log.warning("claims/search %s status=%s body=%s", status, r.status_code, r.text[:200])
+            break
+        data = r.json() or {}
+        page = data.get("data") or []
+        if not page:
+            break
+        out.extend(page)
+        if len(page) < 50:
+            break
+        offset += 50
+        await asyncio.sleep(RATE_SLEEP)
+    return out
+
+
+async def _fetch_one_claim(http: httpx.AsyncClient, token: str, claim_id: int) -> dict | None:
+    """Fetch a single claim by id (used by reconciliation)."""
     try:
-        r = await http.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=20.0)
+        r = await http.get(
+            f"{ML_API_BASE}/post-purchase/v1/claims/{claim_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15.0,
+        )
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code == 404:
+            return {"id": claim_id, "status": "deleted", "_not_found": True}
+        log.warning("claims/%s status=%s body=%s", claim_id, r.status_code, r.text[:200])
     except Exception as err:  # noqa: BLE001
-        log.warning("claims/search status=%s failed: %s", status, err)
-        return []
-    if r.status_code != 200:
-        return []
-    data = r.json() or {}
-    return data.get("data") or []
+        log.warning("claims/%s exception: %s", claim_id, err)
+    return None
 
 
 async def _enrich_one(http: httpx.AsyncClient, token: str, claim: dict) -> dict:
@@ -144,7 +194,7 @@ async def refresh_user_claims(pool: asyncpg.Pool, user_id: int) -> dict[str, int
     try:
         token, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user_id)
     except ml_oauth_svc.MLRefreshError:
-        return {"fetched": 0, "saved": 0}
+        return {"fetched": 0, "saved": 0, "reconciled": 0}
 
     async with httpx.AsyncClient() as http:
         opened, closed = await asyncio.gather(
@@ -152,6 +202,13 @@ async def refresh_user_claims(pool: asyncpg.Pool, user_id: int) -> dict[str, int
             _search_claims(http, token, "closed"),
         )
         all_claims = opened + closed
+        seen_ids: set[int] = set()
+        for c in all_claims:
+            try:
+                cid = int(c.get("id"))
+            except (TypeError, ValueError):
+                continue
+            seen_ids.add(cid)
 
         # Enrich in batches to respect rate limits (10 concurrent).
         enriched: list[dict] = []
@@ -163,16 +220,64 @@ async def refresh_user_claims(pool: asyncpg.Pool, user_id: int) -> dict[str, int
             enriched.extend(results)
             await asyncio.sleep(RATE_SLEEP)
 
-    saved = 0
-    for c in enriched:
-        try:
-            async with pool.acquire() as conn:
-                await _upsert(conn, user_id, c)
-            saved += 1
-        except Exception as err:  # noqa: BLE001
-            log.warning("upsert claim %s failed: %s", c.get("id"), err)
+        saved = 0
+        for c in enriched:
+            try:
+                async with pool.acquire() as conn:
+                    await _upsert(conn, user_id, c)
+                saved += 1
+            except Exception as err:  # noqa: BLE001
+                log.warning("upsert claim %s failed: %s", c.get("id"), err)
 
-    return {"fetched": len(all_claims), "saved": saved}
+        # ── Reconcile stale "opened" rows ───────────────────────────────────
+        # Cached claims marked opened that didn't appear in this refresh's
+        # opened search (and weren't picked up by the closed search either)
+        # are stale — ML moved them off the opened list but our cache still
+        # shows them. Hit /claims/{id} directly to learn their real state.
+        async with pool.acquire() as conn:
+            stale_rows = await conn.fetch(
+                """
+                SELECT claim_id FROM ml_user_claims
+                 WHERE user_id = $1 AND status = 'opened'
+                """,
+                user_id,
+            )
+        stale_ids = [int(r["claim_id"]) for r in stale_rows if int(r["claim_id"]) not in seen_ids]
+
+        reconciled = 0
+        if stale_ids:
+            log.info(
+                "claims reconcile user=%s stale_opened=%s (will fetch individually)",
+                user_id, len(stale_ids),
+            )
+            for i in range(0, len(stale_ids), ENRICH_CONCURRENCY):
+                batch = stale_ids[i:i + ENRICH_CONCURRENCY]
+                fetched = await asyncio.gather(
+                    *[_fetch_one_claim(http, token, cid) for cid in batch]
+                )
+                for cid, payload in zip(batch, fetched):
+                    if payload is None:
+                        continue
+                    if payload.get("_not_found"):
+                        # ML returned 404 — claim was deleted/purged. Drop it.
+                        async with pool.acquire() as conn:
+                            await conn.execute(
+                                "DELETE FROM ml_user_claims WHERE user_id = $1 AND claim_id = $2",
+                                user_id, cid,
+                            )
+                        reconciled += 1
+                        continue
+                    # Re-enrich + upsert with fresh status
+                    fresh = await _enrich_one(http, token, payload)
+                    try:
+                        async with pool.acquire() as conn:
+                            await _upsert(conn, user_id, fresh)
+                        reconciled += 1
+                    except Exception as err:  # noqa: BLE001
+                        log.warning("reconcile upsert claim %s failed: %s", cid, err)
+                await asyncio.sleep(RATE_SLEEP)
+
+    return {"fetched": len(all_claims), "saved": saved, "reconciled": reconciled}
 
 
 async def _upsert(conn: asyncpg.Connection, user_id: int, c: dict) -> None:
