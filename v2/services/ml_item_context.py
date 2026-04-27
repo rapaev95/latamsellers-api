@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS ml_item_context (
   warranty TEXT,
   shipping_free BOOLEAN,
   permalink TEXT,
+  status TEXT,
+  sub_status JSONB DEFAULT '[]'::jsonb,
   attributes JSONB DEFAULT '[]'::jsonb,
   description TEXT DEFAULT '',
   pictures JSONB DEFAULT '[]'::jsonb,
@@ -70,7 +72,9 @@ CREATE INDEX IF NOT EXISTS idx_ml_item_context_fetched ON ml_item_context(fetche
 
 ALTER_SQL = """
 ALTER TABLE ml_item_context
-  ADD COLUMN IF NOT EXISTS pictures JSONB DEFAULT '[]'::jsonb;
+  ADD COLUMN IF NOT EXISTS pictures JSONB DEFAULT '[]'::jsonb,
+  ADD COLUMN IF NOT EXISTS status TEXT,
+  ADD COLUMN IF NOT EXISTS sub_status JSONB DEFAULT '[]'::jsonb;
 """
 
 
@@ -98,7 +102,7 @@ async def fetch_from_ml(
     attrs_q = ",".join([
         "id", "title", "condition", "price", "currency_id", "permalink",
         "available_quantity", "attributes", "shipping", "warranty",
-        "pictures",
+        "pictures", "status", "sub_status",
     ])
 
     async def _item():
@@ -157,6 +161,11 @@ async def fetch_from_ml(
             "secure_url": str(p.get("secure_url") or ""),
         })
 
+    sub_status_raw = item.get("sub_status") or []
+    if not isinstance(sub_status_raw, list):
+        sub_status_raw = []
+    sub_status = [str(s) for s in sub_status_raw if s]
+
     sh = item.get("shipping") or {}
     return {
         "item_id": mlb,
@@ -168,6 +177,8 @@ async def fetch_from_ml(
         "warranty": item.get("warranty"),
         "shipping_free": sh.get("free_shipping"),
         "permalink": item.get("permalink"),
+        "status": item.get("status"),
+        "sub_status": sub_status,
         "attributes": attrs,
         "description": desc or "",
         "pictures": pictures,
@@ -179,10 +190,12 @@ async def fetch_from_ml(
 UPSERT_SQL = """
 INSERT INTO ml_item_context (
   user_id, item_id, title, condition, price, currency, available_quantity,
-  warranty, shipping_free, permalink, attributes, description, pictures, fetched_at
+  warranty, shipping_free, permalink, status, sub_status,
+  attributes, description, pictures, fetched_at
 )
 VALUES (
-  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13::jsonb, NOW()
+  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb,
+  $13::jsonb, $14, $15::jsonb, NOW()
 )
 ON CONFLICT (user_id, item_id) DO UPDATE SET
   title = EXCLUDED.title,
@@ -193,6 +206,8 @@ ON CONFLICT (user_id, item_id) DO UPDATE SET
   warranty = EXCLUDED.warranty,
   shipping_free = EXCLUDED.shipping_free,
   permalink = EXCLUDED.permalink,
+  status = EXCLUDED.status,
+  sub_status = EXCLUDED.sub_status,
   attributes = EXCLUDED.attributes,
   description = EXCLUDED.description,
   pictures = EXCLUDED.pictures,
@@ -216,6 +231,8 @@ async def upsert(pool: asyncpg.Pool, user_id: int, data: dict[str, Any]) -> None
             data.get("warranty"),
             data.get("shipping_free"),
             data.get("permalink"),
+            data.get("status"),
+            json.dumps(data.get("sub_status") or []),
             json.dumps(data.get("attributes") or []),
             data.get("description") or "",
             json.dumps(data.get("pictures") or []),
@@ -236,8 +253,8 @@ async def get_cached(
         row = await conn.fetchrow(
             """
             SELECT item_id, title, condition, price, currency, available_quantity,
-                   warranty, shipping_free, permalink, attributes, description,
-                   pictures, fetched_at
+                   warranty, shipping_free, permalink, status, sub_status,
+                   attributes, description, pictures, fetched_at
               FROM ml_item_context
              WHERE user_id = $1 AND item_id = $2
             """,
@@ -261,6 +278,14 @@ async def get_cached(
             pictures = []
     if not isinstance(pictures, list):
         pictures = []
+    sub_status = row["sub_status"]
+    if isinstance(sub_status, str):
+        try:
+            sub_status = json.loads(sub_status)
+        except Exception:  # noqa: BLE001
+            sub_status = []
+    if not isinstance(sub_status, list):
+        sub_status = []
     return {
         "item_id": row["item_id"],
         "title": row["title"] or "",
@@ -271,6 +296,8 @@ async def get_cached(
         "warranty": row["warranty"],
         "shipping_free": row["shipping_free"],
         "permalink": row["permalink"],
+        "status": row["status"],
+        "sub_status": sub_status,
         "attributes": attrs,
         "description": row["description"] or "",
         "pictures": pictures,

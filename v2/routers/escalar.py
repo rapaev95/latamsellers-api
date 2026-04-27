@@ -999,6 +999,7 @@ async def get_item_context(
     if not ml_ctx:
         return {
             "itemId": mlb, "sku": sku, "title": None, "permalink": None,
+            "status": None, "subStatus": [],
             "attributes": [], "description": "", "pictures": [],
             "customDocs": docs, "qaHistory": qa_history,
             "fetchedAt": None, "cacheStatus": "empty",
@@ -1015,6 +1016,8 @@ async def get_item_context(
         "warranty": ml_ctx.get("warranty"),
         "shippingFree": ml_ctx.get("shipping_free"),
         "permalink": ml_ctx.get("permalink"),
+        "status": ml_ctx.get("status"),
+        "subStatus": ml_ctx.get("sub_status") or [],
         "attributes": ml_ctx.get("attributes") or [],
         "description": ml_ctx.get("description") or "",
         "pictures": ml_ctx.get("pictures") or [],
