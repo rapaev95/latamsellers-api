@@ -999,6 +999,65 @@ async def claim_attachments_probe(
     return out
 
 
+@router.get("/user-claims/{claim_id}/decide-probe")
+async def claim_decide_probe(
+    claim_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """GET-only probe — try several plausible 'select-resolution' / 'answer'
+    endpoints with HEAD-style requests (HEAD or OPTIONS, no body) to see
+    which ones exist for this claim. We then know which POST path to wire
+    into the TG callback.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    try:
+        token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except Exception as err:  # noqa: BLE001
+        return {"error": "oauth_failed", "detail": str(err)}
+
+    base = "https://api.mercadolibre.com"
+    headers = {"Authorization": f"Bearer {token}"}
+    # Candidates: GET on listings, OPTIONS on mutating endpoints to discover
+    # what verbs they accept without actually mutating anything.
+    candidates = [
+        # GET — list-style endpoints that might exist
+        ("GET", "v1_decisions", f"{base}/post-purchase/v1/claims/{claim_id}/decisions"),
+        ("GET", "v1_answers", f"{base}/post-purchase/v1/claims/{claim_id}/answers"),
+        ("GET", "v1_resolutions", f"{base}/post-purchase/v1/claims/{claim_id}/resolutions"),
+        ("GET", "v1_dispute", f"{base}/post-purchase/v1/claims/{claim_id}/dispute"),
+        ("GET", "v1_mediation_actions", f"{base}/post-purchase/v1/mediations/{claim_id}/actions"),
+        ("GET", "v1_mediation_decisions", f"{base}/post-purchase/v1/mediations/{claim_id}/decisions"),
+        ("GET", "v1_player_actions", f"{base}/post-purchase/v1/claims/{claim_id}/player-actions"),
+        # OPTIONS preflight — tells us allowed methods on a path
+        ("OPTIONS", "options_messages", f"{base}/post-purchase/v1/claims/{claim_id}/messages"),
+        ("OPTIONS", "options_expected_resolutions", f"{base}/post-purchase/v1/claims/{claim_id}/expected-resolutions"),
+        ("OPTIONS", "options_decisions", f"{base}/post-purchase/v1/claims/{claim_id}/decisions"),
+    ]
+    results = []
+    async with httpx.AsyncClient() as http:
+        for method, label, url in candidates:
+            try:
+                if method == "GET":
+                    r = await http.get(url, headers=headers, timeout=15.0)
+                else:  # OPTIONS
+                    r = await http.options(url, headers=headers, timeout=15.0)
+                ct = (r.headers.get("content-type", "") or "").lower()
+                meta: dict[str, Any] = {
+                    "method": method,
+                    "label": label,
+                    "status": r.status_code,
+                    "allow": r.headers.get("allow", ""),  # important for OPTIONS
+                    "content_type": ct,
+                    "body_preview": r.text[:300],
+                }
+                results.append(meta)
+            except Exception as err:  # noqa: BLE001
+                results.append({"method": method, "label": label, "error": str(err)})
+    return {"claim_id": claim_id, "results": results}
+
+
 @router.post("/user-claims/{claim_id}/send-message")
 async def send_claim_message(
     claim_id: int,
