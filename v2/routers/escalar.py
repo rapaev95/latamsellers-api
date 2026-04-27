@@ -734,12 +734,15 @@ async def resend_user_claims_tg(
 
 @router.get("/returns-probe")
 async def returns_probe(
+    order_id: Optional[str] = Query(None, description="Specific order_id to probe (e.g. one shown in ML Devoluções)"),
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ):
     """Probe candidate ML endpoints for "Devoluções (Próximas a serem
-    atendidas)". Returns raw status codes + 600-char body previews so we
-    don't waste a build cycle on the wrong path."""
+    atendidas)". When order_id is passed, queries scoped to that specific
+    order — much more likely to surface the right endpoint than blind
+    listing.
+    """
     if pool is None:
         return {"error": "no_db"}
     try:
@@ -747,16 +750,34 @@ async def returns_probe(
     except Exception as err:  # noqa: BLE001
         return {"error": "oauth_failed", "detail": str(err)}
 
+    async with pool.acquire() as conn:
+        ml_user_id = await conn.fetchval(
+            "SELECT ml_user_id FROM ml_user_tokens WHERE user_id = $1", user.id,
+        )
+
     headers = {"Authorization": f"Bearer {token}"}
     base = "https://api.mercadolibre.com"
-    # Candidate endpoints — most-likely first
-    candidates = [
-        ("v1_returns_search", f"{base}/post-purchase/v1/returns/search?role=seller&limit=5"),
-        ("v1_returns_search_simple", f"{base}/post-purchase/v1/returns/search?limit=5"),
-        ("v2_returns_search", f"{base}/post-purchase/v2/returns/search?limit=5"),
-        ("v1_returns_seller", f"{base}/post-purchase/v1/returns?role=seller&limit=5"),
-        ("v1_devolutions", f"{base}/post-purchase/v1/devolutions/search?limit=5"),
-    ]
+
+    candidates: list[tuple[str, str]] = []
+    # Generic listing — kept for completeness even though prior run showed 404
+    candidates.append(("v1_returns_root", f"{base}/post-purchase/v1/returns"))
+    candidates.append(("v1_my_returns", f"{base}/post-purchase/v1/my/returns"))
+    # Seller scoped via /users/{id}/...
+    if ml_user_id:
+        candidates.append(("seller_claims_open", f"{base}/post-purchase/v1/claims/search?resource=order&seller={ml_user_id}&limit=5"))
+        candidates.append(("seller_returns_search", f"{base}/post-purchase/v1/returns/search?seller={ml_user_id}&limit=5"))
+
+    if order_id:
+        # Most informative: target the specific order shown in the seller's
+        # ML "Devoluções" view. If any of these 200, we have our hook.
+        candidates.append(("order_full", f"{base}/orders/{order_id}"))
+        candidates.append(("order_returns", f"{base}/orders/{order_id}/returns"))
+        candidates.append(("post_purchase_order", f"{base}/post-purchase/v1/orders/{order_id}"))
+        candidates.append(("claims_by_order_resource", f"{base}/post-purchase/v1/claims/search?resource_id={order_id}"))
+        candidates.append(("claims_by_resource_pair", f"{base}/post-purchase/v1/claims/search?resource=order&resource_id={order_id}"))
+        candidates.append(("v1_returns_for_order", f"{base}/post-purchase/v1/returns?order_id={order_id}"))
+        candidates.append(("v1_returns_search_by_order", f"{base}/post-purchase/v1/returns/search?order_id={order_id}"))
+        candidates.append(("v2_returns_for_order", f"{base}/post-purchase/v2/orders/{order_id}/returns"))
 
     results = []
     async with httpx.AsyncClient() as http:
@@ -771,7 +792,7 @@ async def returns_probe(
                 })
             except Exception as err:  # noqa: BLE001
                 results.append({"label": label, "url": url, "error": str(err)})
-    return {"results": results}
+    return {"ml_user_id": ml_user_id, "order_id": order_id, "results": results}
 
 
 # ── Messages probe (TEST step for Mensagens) ────────────────────────────
