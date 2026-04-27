@@ -436,11 +436,23 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                     f" ({units} un. vendidas)"
                 )
             elif now_pct is not None:
-                desc_lines.append(f"📊 *Margem atual 3M: {now_pct}%* ({units} un. vendidas)")
+                # Two views per ML product: full PnL margin (with all overhead
+                # incl. fixed Aluguel) and unit economics (variable per-sale
+                # costs only). Promo decisions usually need the unit number;
+                # the PnL number is shown for accounting consistency.
+                unit = margin.get("unit") or {}
+                unit_pct = unit.get("margin_pct")
+                unit_profit = unit.get("profit_per_unit")
+                desc_lines.append(f"📊 *Margem (PnL): {now_pct}%* ({units} un. vendidas)")
                 lucro = margin.get("net_profit")
                 if lucro is not None:
-                    desc_lines.append(f"💵 Lucro líquido 3M: {_money(lucro) or '—'}")
-                # Show margin at each price point in the range, when computed.
+                    desc_lines.append(f"💵 Lucro líquido total: {_money(lucro) or '—'}")
+                if unit_pct is not None:
+                    desc_lines.append("")
+                    desc_lines.append(f"📐 *Margem unitária: {unit_pct}%* (apenas custos variáveis)")
+                    if unit_profit is not None:
+                        desc_lines.append(f"💰 Lucro por unidade: {_money(unit_profit) or '—'}")
+                # Show unit margin at each price point in the range.
                 pts: list[tuple[str, dict]] = []
                 if margin_at_min.get("ok"):
                     pts.append(("entrada", margin_at_min))
@@ -450,15 +462,16 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                     pts.append(("máx desc", margin_at_max))
                 if pts:
                     desc_lines.append("")
-                    desc_lines.append("📈 Margem por preço promocional:")
-                    for label, m in pts:
-                        m_pct = m.get("margin_pct")
-                        m_lucro = m.get("net_profit")
-                        if m_pct is None:
+                    desc_lines.append("📈 Margem unitária após promo:")
+                    for label_pt, m in pts:
+                        u = m.get("unit") or {}
+                        u_pct = u.get("margin_pct")
+                        u_profit = u.get("profit_per_unit")
+                        if u_pct is None:
                             continue
-                        line = f"   • {label}: {m_pct}%"
-                        if m_lucro is not None:
-                            line += f" (lucro {_money(m_lucro) or '—'})"
+                        line = f"   • {label_pt}: {u_pct}%"
+                        if u_profit is not None:
+                            line += f" (lucro/un. {_money(u_profit) or '—'})"
                         desc_lines.append(line)
         elif margin.get("error") == "no_sales_in_period":
             desc_lines.append("")

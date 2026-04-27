@@ -105,6 +105,8 @@ def apply_hypothetical_price(
     if avg_unit_price <= 0:
         return dict(cached)
     scale = float(hypothetical_price) / avg_unit_price
+
+    # ── PnL margin recompute (overhead allocation stays fixed in BRL terms) ──
     new_revenue = revenue * scale
     new_ml_fees = float(cached.get("ml_fees") or 0) * scale
     cogs = cached.get("cogs")
@@ -115,11 +117,43 @@ def apply_hypothetical_price(
     else:
         new_profit = None
         new_margin = None
+
+    # ── Unit economics recompute (only variable costs scale with price) ──
+    unit_in = cached.get("unit") or {}
+    new_unit: dict[str, Any] | None = None
+    if unit_in:
+        new_avg_price = float(hypothetical_price)
+        new_ml_fee_pu = float(unit_in.get("ml_fee_per_unit") or 0) * scale
+        ful_pu = float(unit_in.get("fulfillment_per_sale") or 0)
+        cogs_pu = unit_in.get("cogs_per_unit")
+        armaz_pu = float(unit_in.get("armaz_per_unit") or 0)
+        das_rate = float(unit_in.get("das_rate") or 0.045)
+        new_das_pu = new_avg_price * das_rate
+        if cogs_pu is not None:
+            new_var_cost = new_ml_fee_pu + ful_pu + float(cogs_pu) + new_das_pu + armaz_pu
+            new_unit_profit = new_avg_price - new_var_cost
+            new_unit_margin = round(new_unit_profit / new_avg_price * 100, 1) if new_avg_price else None
+        else:
+            new_var_cost = None
+            new_unit_profit = None
+            new_unit_margin = None
+        new_unit = dict(unit_in)
+        new_unit.update({
+            "avg_price": round(new_avg_price, 2),
+            "ml_fee_per_unit": round(new_ml_fee_pu, 2),
+            "das_per_unit": round(new_das_pu, 2),
+            "variable_cost": round(new_var_cost, 2) if new_var_cost is not None else None,
+            "profit_per_unit": round(new_unit_profit, 2) if new_unit_profit is not None else None,
+            "margin_pct": new_unit_margin,
+        })
+
     out = dict(cached)
     out["revenue"] = round(new_revenue, 2)
     out["ml_fees"] = round(new_ml_fees, 2)
     out["net_profit"] = round(new_profit, 2) if new_profit is not None else None
     out["margin_pct"] = new_margin
+    if new_unit is not None:
+        out["unit"] = new_unit
     out["hypothetical_price"] = float(hypothetical_price)
     return out
 
@@ -285,8 +319,10 @@ def _build_item_payload(
         1.0,
     )
     opex_lines = list(getattr(pnl, "operating_expenses", []) or [])
+    # PnLLine field is `amount_brl`, not `value` — using the wrong attribute
+    # silently zeroed every overhead line and inflated the cached margin.
     opex_by_label = {
-        str(getattr(line, "label", "")): float(getattr(line, "value", 0) or 0)
+        str(getattr(line, "label", "")): float(getattr(line, "amount_brl", 0) or 0)
         for line in opex_lines
     }
 
@@ -317,6 +353,36 @@ def _build_item_payload(
         net_profit = None
         margin_pct = None
 
+    # ── Unit economics (variable costs only) ───────────────────────────────────
+    # PnL margin includes fixed costs (Aluguel, etc.) — useful for accounting
+    # but inflates the price floor for promo decisions. Unit economics treats
+    # only per-sale / per-unit costs:
+    #   - ML fee (% of price, scales with discount)
+    #   - Fulfillment (per shipment, fixed amount)
+    #   - COGS (per unit)
+    #   - DAS (% of revenue, scales with discount)
+    #   - Armazenagem (per unit, daily — small)
+    # Aluguel / Publicidade-as-fixed are excluded.
+    avg_price = revenue / units if units > 0 else 0.0
+    ml_fee_per_unit = ml_fees / units if units > 0 else 0.0
+    fulfillment_per_sale = fulfillment / total_units if total_units > 0 else 0.0
+    armaz_per_unit = armazenagem / total_units if total_units > 0 else 0.0
+    das_rate = das / total_revenue if total_revenue > 0 else 0.045
+    das_per_unit = avg_price * das_rate
+    cogs_per_unit = float(unit_cost) if unit_cost is not None else None
+
+    if cogs_per_unit is not None:
+        unit_variable_cost = (
+            ml_fee_per_unit + fulfillment_per_sale + cogs_per_unit
+            + das_per_unit + armaz_per_unit
+        )
+        unit_profit = avg_price - unit_variable_cost
+        unit_margin_pct = round(unit_profit / avg_price * 100, 1) if avg_price else None
+    else:
+        unit_variable_cost = None
+        unit_profit = None
+        unit_margin_pct = None
+
     return {
         "ok": True,
         "project": project,
@@ -336,6 +402,19 @@ def _build_item_payload(
         "margin_pct": margin_pct,
         "unit_cost_brl": unit_cost,
         "missing_cost": unit_cost is None,
+        # Unit-economics block — variable per-sale / per-unit costs only.
+        "unit": {
+            "avg_price": round(avg_price, 2),
+            "ml_fee_per_unit": round(ml_fee_per_unit, 2),
+            "fulfillment_per_sale": round(fulfillment_per_sale, 2),
+            "cogs_per_unit": round(cogs_per_unit, 2) if cogs_per_unit is not None else None,
+            "das_per_unit": round(das_per_unit, 2),
+            "armaz_per_unit": round(armaz_per_unit, 2),
+            "variable_cost": round(unit_variable_cost, 2) if unit_variable_cost is not None else None,
+            "profit_per_unit": round(unit_profit, 2) if unit_profit is not None else None,
+            "margin_pct": unit_margin_pct,
+            "das_rate": round(das_rate, 4),
+        },
     }
 
 
