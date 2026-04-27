@@ -741,16 +741,24 @@ async def claim_file_probe(
 
     base = "https://api.mercadolibre.com"
     headers = {"Authorization": f"Bearer {token}"}
+    base_path = f"{base}/post-purchase/v1/claims/{claim_id}/attachments/{filename}"
     candidates = [
-        ("nested_filename", f"{base}/post-purchase/v1/claims/{claim_id}/attachments/{filename}"),
-        ("query_filename", f"{base}/post-purchase/v1/claims/{claim_id}/attachments?filename={filename}"),
-        ("download_path", f"{base}/post-purchase/v1/claims/{claim_id}/attachments/download/{filename}"),
-        ("v2_nested", f"{base}/post-purchase/v2/claims/{claim_id}/attachments/{filename}"),
-        ("messages_attachments", f"{base}/post-purchase/v1/claims/{claim_id}/messages/attachments/{filename}"),
-        ("flat_attachments", f"{base}/post-purchase/v1/attachments/{filename}"),
-        ("messages_files", f"{base}/post-purchase/v1/claims/{claim_id}/messages/files/{filename}"),
+        # Confirmed-200 metadata path — re-include to capture FULL JSON
+        # so we can spot a download_url-like field.
+        ("metadata_full", base_path),
+        # Likely binary subpaths
+        ("subpath_file", f"{base_path}/file"),
+        ("subpath_binary", f"{base_path}/binary"),
+        ("subpath_download", f"{base_path}/download"),
+        ("subpath_content", f"{base_path}/content"),
+        ("subpath_raw", f"{base_path}/raw"),
+        # Query-string variants
+        ("query_download_true", f"{base_path}?download=true"),
+        ("query_source_download", f"{base_path}?source=download"),
+        ("query_format_binary", f"{base_path}?format=binary"),
     ]
     results = []
+    full_metadata: Any = None
     async with httpx.AsyncClient() as http:
         for label, url in candidates:
             try:
@@ -765,12 +773,26 @@ async def claim_file_probe(
                 }
                 if r.status_code == 200 and ("image/" in ct or "octet-stream" in ct):
                     meta["binary_size"] = len(r.content)
+                elif r.status_code == 200 and "json" in ct:
+                    try:
+                        body = r.json()
+                        meta["full_body"] = body
+                        if label == "metadata_full":
+                            full_metadata = body
+                    except Exception:  # noqa: BLE001
+                        meta["body_preview"] = r.text[:600]
                 else:
                     meta["body_preview"] = r.text[:300]
                 results.append(meta)
             except Exception as err:  # noqa: BLE001
                 results.append({"label": label, "error": str(err)})
-    return {"claim_id": claim_id, "filename": filename, "results": results}
+    metadata_keys = sorted(full_metadata.keys()) if isinstance(full_metadata, dict) else None
+    return {
+        "claim_id": claim_id,
+        "filename": filename,
+        "metadata_keys": metadata_keys,
+        "results": results,
+    }
 
 
 @router.get("/user-claims/{claim_id}/attachments-probe")
