@@ -1875,7 +1875,27 @@ async def promotions_tg_action(
     mlb = body.item_id.upper()
     url = f"https://api.mercadolibre.com/seller-promotions/items/{mlb}?app_version=v2"
 
-    raise_pct = float(body.raise_pct or 15.0)
+    # Default raise_pct = the offer's required entrada discount, so the
+    # post-raise listing × (1 − entrada%) lands close to the original price.
+    # E.g., entrada -5% → raise +5% → new entrada price ≈ original.
+    # User can still override via body.raise_pct for non-default flows.
+    auto_raise_pct: Optional[float] = body.raise_pct
+    if auto_raise_pct is None:
+        try:
+            orig_p = float(offer.get("original_price") or 0)
+            deal_p = float(offer.get("deal_price") or 0)
+            if orig_p > 0 and 0 < deal_p < orig_p:
+                auto_raise_pct = round((1 - deal_p / orig_p) * 100, 1)
+        except (TypeError, ValueError):
+            auto_raise_pct = None
+        if auto_raise_pct is None:
+            disc_pct = offer.get("discount_percentage")
+            if disc_pct is not None:
+                try:
+                    auto_raise_pct = float(disc_pct)
+                except (TypeError, ValueError):
+                    auto_raise_pct = None
+    raise_pct = float(auto_raise_pct or 15.0)
     raise_info: dict = {}
 
     async with httpx.AsyncClient() as http:

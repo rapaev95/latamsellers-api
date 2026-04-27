@@ -386,16 +386,38 @@ async def send_notice(
         # callback_data ≤ 64 bytes. Most promo ids look like "MLB-PROMO-123" (≤30
         # bytes) and MLB ids ≤16 bytes — fits comfortably with `pa:` prefix.
         if promo_id and promo_item_id:
+            # Derive the offer's required entrada discount % so the "raise &
+            # accept" button can show its actual uplift (matches what the
+            # backend will use). Falls back to 15% for offers where ML
+            # didn't surface a clear discount field.
+            raise_pct_int = 15
+            try:
+                disc = raw_block.get("discount_percentage")
+                if disc is None:
+                    op = float(raw_block.get("original_price") or 0)
+                    dp = float(
+                        raw_block.get("max_discounted_price")
+                        or raw_block.get("deal_price")
+                        or raw_block.get("price")
+                        or 0
+                    )
+                    if op > 0 and 0 < dp < op:
+                        disc = (1 - dp / op) * 100
+                if disc is not None and float(disc) > 0:
+                    raise_pct_int = max(1, int(round(float(disc))))
+            except (TypeError, ValueError):
+                pass
+
             accept_label = {
                 "ru": "✅ Принять (мин)",
                 "en": "✅ Accept (min)",
                 "pt": "✅ Aceitar (min)",
             }.get(language, "✅ Aceitar (min)")
             raise_label = {
-                "ru": "📈 Поднять цену +15% и принять",
-                "en": "📈 Raise +15% & accept",
-                "pt": "📈 Subir +15% e aceitar",
-            }.get(language, "📈 Subir +15% e aceitar")
+                "ru": f"📈 Поднять +{raise_pct_int}% и принять",
+                "en": f"📈 Raise +{raise_pct_int}% & accept",
+                "pt": f"📈 Subir +{raise_pct_int}% e aceitar",
+            }.get(language, f"📈 Subir +{raise_pct_int}% e aceitar")
             reject_label = {
                 "ru": "❌ Отклонить",
                 "en": "❌ Reject",
