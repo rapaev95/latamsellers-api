@@ -313,7 +313,11 @@ def _build_item_payload(
     historical get_item_margin response so the renderer doesn't need to change."""
     revenue, ml_fees, units = _sum_item_basics(item_df)
 
-    total_units = max(int(getattr(pnl, "vendas_delivered_count", 0) or 0), 1)
+    # PnLReport exposes vendas_count (delivered+returned in period). The
+    # field name `vendas_delivered_count` doesn't exist — using getattr with
+    # default=0 silently set total_units=1 and over-allocated every share by
+    # factor=item_units. ORGANIZADOR's 18.50 BRL armaz showed up as 4k.
+    total_units = max(int(getattr(pnl, "vendas_count", 0) or 0), 1)
     total_revenue = max(
         float(getattr(pnl, "revenue_net", 0) or getattr(pnl, "revenue_gross", 0) or 0),
         1.0,
