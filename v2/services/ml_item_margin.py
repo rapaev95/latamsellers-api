@@ -128,13 +128,17 @@ def apply_hypothetical_price(
         new_price = float(hypothetical_price)
         ml_fee_rate = float(unit_in.get("ml_fee_rate") or 0.167)
         new_ml_fee_pu = new_price * ml_fee_rate
+        envios_pu = float(unit_in.get("envios_per_sale") or 0)
         ful_pu = float(unit_in.get("fulfillment_per_sale") or 0)
         cogs_pu = unit_in.get("cogs_per_unit")
         armaz_pu = float(unit_in.get("armaz_per_unit") or 0)
         das_rate = float(unit_in.get("das_rate") or 0.045)
         new_das_pu = new_price * das_rate
         if cogs_pu is not None:
-            new_var_cost = new_ml_fee_pu + ful_pu + float(cogs_pu) + new_das_pu + armaz_pu
+            new_var_cost = (
+                new_ml_fee_pu + envios_pu + ful_pu + float(cogs_pu)
+                + new_das_pu + armaz_pu
+            )
             new_unit_profit = new_price - new_var_cost
             new_unit_margin = round(new_unit_profit / new_price * 100, 1) if new_price else None
         else:
@@ -327,7 +331,7 @@ def _build_item_payload(
     unit economics so margin reflects today's listing price, not the
     historical average over the period (which can be lower if the item ran
     a discount mid-period)."""
-    revenue, ml_fees, units = _sum_item_basics(item_df)
+    revenue, ml_fees, units, envios_net, sales_count = _sum_item_basics(item_df)
 
     # PnLReport exposes vendas_count (delivered+returned in period). The
     # field name `vendas_delivered_count` doesn't exist — using getattr with
@@ -396,6 +400,10 @@ def _build_item_payload(
 
     fulfillment_per_sale = fulfillment / total_units if total_units > 0 else 0.0
     armaz_per_unit = armazenagem / total_units if total_units > 0 else 0.0
+    # Envios fee per sale — ML's free-shipping subsidy that the seller
+    # absorbs (Tarifa de envio in vendas CSV). This is a per-sale cost,
+    # NOT % of price, so it doesn't scale with hypothetical_price.
+    envios_per_sale = envios_net / sales_count if sales_count > 0 else 0.0
     # DAS rate must come from tax_info.effective_pct (already considers RBT12
     # bracket + Anexo I/II/III). Dividing total DAS by revenue_net would
     # over-state the rate by ~1.5x because net excludes tarifa_venda /
@@ -412,8 +420,8 @@ def _build_item_payload(
 
     if cogs_per_unit is not None:
         unit_variable_cost = (
-            ml_fee_per_unit + fulfillment_per_sale + cogs_per_unit
-            + das_per_unit + armaz_per_unit
+            ml_fee_per_unit + envios_per_sale + fulfillment_per_sale
+            + cogs_per_unit + das_per_unit + armaz_per_unit
         )
         unit_profit = price_basis - unit_variable_cost
         unit_margin_pct = round(unit_profit / price_basis * 100, 1) if price_basis else None
@@ -452,6 +460,7 @@ def _build_item_payload(
             "avg_price": round(price_basis, 2),
             "ml_fee_per_unit": round(ml_fee_per_unit, 2),
             "ml_fee_rate": round(ml_fee_rate, 4),
+            "envios_per_sale": round(envios_per_sale, 2),
             "fulfillment_per_sale": round(fulfillment_per_sale, 2),
             "cogs_per_unit": round(cogs_per_unit, 2) if cogs_per_unit is not None else None,
             "das_per_unit": round(das_per_unit, 2),
@@ -469,6 +478,8 @@ _ANUNCIO_COLS = (
     "anuncio_id", "MLB", "mlb", "ID",
 )
 _DATE_COLS = ("Data da venda", "Data de venda", "date_created", "Date")
+_ENVIO_FEE_COLS = ("Tarifas de envio (BRL)", "Tarifas de envio")
+_ENVIO_REVENUE_COLS = ("Receita por envio (BRL)", "Receita por envio")
 
 # Portuguese natural-language date format used by Vendas ML CSVs:
 #   "17 de abril de 2026 13:13 hs."
@@ -564,14 +575,30 @@ def _filter_vendas_for_item(df, item_id: str, period: tuple[date, date]):
     return sub
 
 
-def _sum_item_basics(item_df) -> tuple[float, float, int]:
+def _sum_item_basics(item_df) -> tuple[float, float, int, float, int]:
+    """Returns (revenue, ml_fees, units, envios_net, sales_count).
+
+    envios_net = abs(Tarifas de envio) − Receita por envio. Positive when
+    seller pays a net shipping subsidy. ML deducts the full subsidy from
+    the seller and refunds part as Receita por envio when the buyer paid.
+
+    sales_count is the row count (one row = one sale, possibly multiple
+    units). Per-sale costs (envios, fulfillment) divide by sales_count;
+    per-unit costs (cogs) divide by units.
+    """
     rev_col = _first_col(item_df, _REVENUE_COLS)
     fee_col = _first_col(item_df, _FEE_COLS)
     qty_col = _first_col(item_df, _QTY_COLS)
+    env_fee_col = _first_col(item_df, _ENVIO_FEE_COLS)
+    env_rev_col = _first_col(item_df, _ENVIO_REVENUE_COLS)
     revenue = float(item_df[rev_col].sum()) if rev_col else 0.0
     ml_fees = abs(float(item_df[fee_col].sum())) if fee_col else 0.0
     units = int(item_df[qty_col].sum()) if qty_col else len(item_df)
-    return (revenue, ml_fees, units)
+    sales_count = len(item_df)
+    envios_fee_total = abs(float(item_df[env_fee_col].sum())) if env_fee_col else 0.0
+    envios_revenue_total = float(item_df[env_rev_col].sum()) if env_rev_col else 0.0
+    envios_net = max(envios_fee_total - envios_revenue_total, 0.0)
+    return (revenue, ml_fees, units, envios_net, sales_count)
 
 
 def _opex_pick(opex_by_label: dict, keywords: list[str]) -> float:
