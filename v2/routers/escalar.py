@@ -721,6 +721,58 @@ async def claim_messages_probe(
     return {"claim_id": claim_id, "results": results}
 
 
+@router.get("/user-claims/{claim_id}/file-probe")
+async def claim_file_probe(
+    claim_id: int,
+    filename: str = Query(..., description="Server filename from message attachment"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Probe ML for the actual binary download URL of a claim attachment.
+    Each message attachment gives us only metadata (size, type, filename) —
+    no URL. We need to find the GET path that returns the bytes.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    try:
+        token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except Exception as err:  # noqa: BLE001
+        return {"error": "oauth_failed", "detail": str(err)}
+
+    base = "https://api.mercadolibre.com"
+    headers = {"Authorization": f"Bearer {token}"}
+    candidates = [
+        ("nested_filename", f"{base}/post-purchase/v1/claims/{claim_id}/attachments/{filename}"),
+        ("query_filename", f"{base}/post-purchase/v1/claims/{claim_id}/attachments?filename={filename}"),
+        ("download_path", f"{base}/post-purchase/v1/claims/{claim_id}/attachments/download/{filename}"),
+        ("v2_nested", f"{base}/post-purchase/v2/claims/{claim_id}/attachments/{filename}"),
+        ("messages_attachments", f"{base}/post-purchase/v1/claims/{claim_id}/messages/attachments/{filename}"),
+        ("flat_attachments", f"{base}/post-purchase/v1/attachments/{filename}"),
+        ("messages_files", f"{base}/post-purchase/v1/claims/{claim_id}/messages/files/{filename}"),
+    ]
+    results = []
+    async with httpx.AsyncClient() as http:
+        for label, url in candidates:
+            try:
+                r = await http.get(url, headers=headers, timeout=15.0, follow_redirects=False)
+                ct = (r.headers.get("content-type", "") or "").lower()
+                meta: dict[str, Any] = {
+                    "label": label,
+                    "status": r.status_code,
+                    "content_type": ct,
+                    "content_length": r.headers.get("content-length", ""),
+                    "location": r.headers.get("location", ""),
+                }
+                if r.status_code == 200 and ("image/" in ct or "octet-stream" in ct):
+                    meta["binary_size"] = len(r.content)
+                else:
+                    meta["body_preview"] = r.text[:300]
+                results.append(meta)
+            except Exception as err:  # noqa: BLE001
+                results.append({"label": label, "error": str(err)})
+    return {"claim_id": claim_id, "filename": filename, "results": results}
+
+
 @router.get("/user-claims/{claim_id}/attachments-probe")
 async def claim_attachments_probe(
     claim_id: int,
