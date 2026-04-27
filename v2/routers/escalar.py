@@ -684,6 +684,47 @@ async def refresh_user_claims(
     return await ml_user_claims_svc.refresh_user_claims(pool, user.id)
 
 
+@router.post("/user-claims/resend-tg")
+async def resend_user_claims_tg(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """One-shot helper: reset tg_dispatched_at=NULL for the seller's
+    currently-opened claims so they get re-sent with the fresh format
+    (motivo + RU/EN summary + action buttons). Runs dispatch immediately
+    so the seller doesn't have to wait for the next cron tick.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    await ml_user_claims_svc.ensure_schema(pool)
+    from v2.services import ml_claims_dispatch as claims_dispatch_svc
+    await claims_dispatch_svc.ensure_schema(pool)
+
+    async with pool.acquire() as conn:
+        reset = await conn.execute(
+            """
+            UPDATE ml_user_claims
+               SET tg_dispatched_at = NULL,
+                   tg_message_id = NULL
+             WHERE user_id = $1 AND status = 'opened'
+            """,
+            user.id,
+        )
+    reset_count = 0
+    if isinstance(reset, str):
+        parts = reset.rsplit(" ", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            reset_count = int(parts[1])
+
+    import os as _os
+    app_base = _os.environ.get("APP_BASE_URL", "https://app.lsprofit.app")
+    try:
+        result = await claims_dispatch_svc._dispatch_for_user(pool, user.id, app_base)
+    except Exception as err:  # noqa: BLE001
+        return {"reset": reset_count, "dispatchError": str(err)}
+    return {"reset": reset_count, **result}
+
+
 # ── Clips probe (TEST step) ──────────────────────────────────────────────────
 # ML deprecated youtube `video_id` on items as of 2024-09-09 — only Clips
 # uploads work now. The endpoint uses cbt_item_id (Cross-Border Trading), so
@@ -1381,9 +1422,65 @@ async def promotions_diagnostic(
             user.id,
         ) or 0)
 
+    # ml_notices state — where the dispatch pipeline actually sits
+    async with pool.acquire() as conn:
+        nc_total = int(await conn.fetchval(
+            "SELECT COUNT(*) FROM ml_notices WHERE user_id=$1 AND topic='promotions'", user.id,
+        ) or 0)
+        nc_pending = int(await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM ml_notices
+             WHERE user_id=$1 AND topic='promotions' AND telegram_sent_at IS NULL
+            """,
+            user.id,
+        ) or 0)
+        nc_sent = int(await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM ml_notices
+             WHERE user_id=$1 AND topic='promotions' AND telegram_sent_at IS NOT NULL
+            """,
+            user.id,
+        ) or 0)
+        nc_recent_sent = await conn.fetch(
+            """
+            SELECT notice_id,
+                   to_char(telegram_sent_at AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS sent_at,
+                   label
+              FROM ml_notices
+             WHERE user_id=$1 AND topic='promotions' AND telegram_sent_at IS NOT NULL
+             ORDER BY telegram_sent_at DESC LIMIT 5
+            """,
+            user.id,
+        )
+        nc_recent_pending = await conn.fetch(
+            """
+            SELECT notice_id, label
+              FROM ml_notices
+             WHERE user_id=$1 AND topic='promotions' AND telegram_sent_at IS NULL
+             ORDER BY from_date DESC NULLS LAST LIMIT 5
+            """,
+            user.id,
+        )
+    out["mlNoticesPromotions"] = {
+        "total": nc_total,
+        "pending": nc_pending,
+        "sent": nc_sent,
+        "recentSent": [
+            {"noticeId": r["notice_id"], "sentAt": r["sent_at"], "label": r["label"]}
+            for r in nc_recent_sent
+        ],
+        "recentPending": [
+            {"noticeId": r["notice_id"], "label": r["label"]}
+            for r in nc_recent_pending
+        ],
+    }
+
     out["hint"] = (
-        "candidatesPendingDispatch > 0 + alertPrefs.notifyMlNews=True + telegramConnected=True "
-        "⇒ POST /user-promotions/refresh should push them to TG within seconds."
+        "If candidatesNotified is high but mlNoticesPromotions.sent is 0 "
+        "→ dispatch never reached TG (bot token / chat blocked / job not running). "
+        "If mlNoticesPromotions.sent > 0 but no messages in your TG → bot was rate-limited "
+        "or chat was muted/blocked when those went out."
     )
     return out
 
