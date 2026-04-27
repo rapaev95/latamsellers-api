@@ -230,20 +230,33 @@ def _detect_recommended_action(claim: dict[str, Any]) -> Optional[str]:
     return None
 
 
+ML_API_BASE = "https://api.mercadolibre.com"
+
+
 def _extract_photo_urls(claim: dict[str, Any]) -> list[dict[str, str]]:
     """Pull buyer-uploaded photo URLs from claim messages + returns.
 
-    Two sources we've seen in ML's payload:
-      - claim.messages[*].attachments[*]   (when buyer attaches to chat msg)
-      - claim.returns[*].evidences[*]      (when buyer uploads on return flow)
+    ML doesn't put a URL on each attachment — only metadata (filename,
+    type, size). The actual binary lives at:
+      GET /post-purchase/v1/claims/{claim_id}/attachments/{filename}/download
+    confirmed via /file-probe (returns image/jpeg matching size).
 
-    Returns list of {url, name?, source} dicts (deduped). Caller sends each
-    via TG sendPhoto. Empty list = nothing to send.
+    Two sources we've seen:
+      - claim.messages[*].attachments[*]   (chat message attachments)
+      - claim.returns[*].evidences[*]      (return-flow uploads)
+
+    Returns list of {url, name, source, auth_required} dicts. Auth-required
+    URLs go through the multipart fallback in _send_photos (we fetch with
+    bearer, re-upload to TG as binary).
     """
+    claim_id = claim.get("id")
+    if not claim_id:
+        return []
+
     seen_urls: set[str] = set()
     out: list[dict[str, str]] = []
 
-    # 1. Message-level attachments
+    # 1. Message-level attachments — construct download URL from filename
     messages = claim.get("messages")
     if isinstance(messages, list):
         for m in messages:
@@ -255,19 +268,28 @@ def _extract_photo_urls(claim: dict[str, Any]) -> list[dict[str, str]]:
             for a in attachments:
                 if not isinstance(a, dict):
                     continue
-                url = a.get("url") or a.get("source") or a.get("file_url")
-                if not url or not isinstance(url, str):
+                filename = a.get("filename")
+                mime_type = (a.get("type") or "").lower()
+                if not filename or not isinstance(filename, str):
                     continue
+                # Skip non-images (PDFs, docs would render badly via sendPhoto)
+                if not mime_type.startswith("image/"):
+                    continue
+                url = (
+                    f"{ML_API_BASE}/post-purchase/v1/claims/{claim_id}"
+                    f"/attachments/{filename}/download"
+                )
                 if url in seen_urls:
                     continue
                 seen_urls.add(url)
                 out.append({
                     "url": url,
-                    "name": str(a.get("name") or a.get("filename") or ""),
+                    "name": str(a.get("original_filename") or filename),
                     "source": "message",
+                    "auth_required": "true",  # always — endpoint requires bearer
                 })
 
-    # 2. Return-level evidences
+    # 2. Return-level evidences (kept generic — schema TBD when we see real data)
     returns = claim.get("returns")
     if isinstance(returns, list):
         for ret in returns:
@@ -279,7 +301,18 @@ def _extract_photo_urls(claim: dict[str, Any]) -> list[dict[str, str]]:
             for e in evidences:
                 if not isinstance(e, dict):
                     continue
+                # Returns may have explicit URLs (some flows) — try them first
                 url = e.get("url") or e.get("source") or e.get("file_url")
+                # If only filename, try the same /attachments/{filename}/download
+                # path (haven't probed it for returns specifically; fallback
+                # is harmless — _send_photos will skip on 4xx).
+                if not url:
+                    fname = e.get("filename")
+                    if fname:
+                        url = (
+                            f"{ML_API_BASE}/post-purchase/v1/claims/{claim_id}"
+                            f"/attachments/{fname}/download"
+                        )
                 if not url or not isinstance(url, str):
                     continue
                 if url in seen_urls:
@@ -289,6 +322,7 @@ def _extract_photo_urls(claim: dict[str, Any]) -> list[dict[str, str]]:
                     "url": url,
                     "name": str(e.get("name") or e.get("filename") or ""),
                     "source": "return",
+                    "auth_required": "true",
                 })
 
     return out
@@ -310,45 +344,58 @@ async def _send_photos(
     sent = 0
     for i, p in enumerate(photos[:5]):
         url = p["url"]
-        caption = f"📎 Evidência #{i + 1} · claim `{claim_id}`"
-        # Attempt 1: TG fetches the URL directly
-        try:
-            r = await http.post(
-                f"{TG_API_BASE}/bot{bot_token}/sendPhoto",
-                json={
-                    "chat_id": chat_id,
-                    "photo": url,
-                    "caption": caption,
-                    "parse_mode": "MarkdownV2",
-                },
-                timeout=15.0,
-            )
-            if r.status_code == 200:
-                sent += 1
-                continue
-            log.info("TG sendPhoto direct claim=%s photo=%s status=%s body=%s",
-                     claim_id, i, r.status_code, r.text[:200])
-        except Exception as err:  # noqa: BLE001
-            log.warning("TG sendPhoto direct exception: %s", err)
+        caption = f"📎 Evidência #{i + 1} · claim {claim_id}"
+        auth_required = p.get("auth_required") == "true"
 
-        # Attempt 2: download via ML, re-upload to TG as multipart
+        # If the URL is auth-required (ML's /attachments/{name}/download),
+        # skip URL-direct — TG can't pass our bearer header. Go straight
+        # to multipart download+upload.
+        if not auth_required:
+            try:
+                r = await http.post(
+                    f"{TG_API_BASE}/bot{bot_token}/sendPhoto",
+                    json={
+                        "chat_id": chat_id,
+                        "photo": url,
+                        "caption": caption,
+                    },
+                    timeout=15.0,
+                )
+                if r.status_code == 200:
+                    sent += 1
+                    await asyncio.sleep(0.5)
+                    continue
+                log.info("TG sendPhoto direct claim=%s photo=%s status=%s body=%s",
+                         claim_id, i, r.status_code, r.text[:200])
+            except Exception as err:  # noqa: BLE001
+                log.warning("TG sendPhoto direct exception: %s", err)
+
+        # Multipart: fetch via ML token, re-upload to TG as binary
         if access_token:
             try:
                 pr = await http.get(
                     url,
                     headers={"Authorization": f"Bearer {access_token}"},
-                    timeout=20.0,
+                    timeout=30.0,
                 )
                 if pr.status_code != 200:
+                    log.warning("ML attachment download failed claim=%s photo=%s status=%s",
+                                claim_id, i, pr.status_code)
+                    await asyncio.sleep(0.5)
                     continue
-                files = {"photo": (p.get("name") or f"evidence_{i}.jpg", pr.content)}
-                data = {"chat_id": chat_id, "caption": caption.replace("`", "")}
+                content_type = pr.headers.get("content-type", "image/jpeg")
+                fname = p.get("name") or f"evidence_{i}.jpg"
+                files = {"photo": (fname, pr.content, content_type)}
+                data = {"chat_id": chat_id, "caption": caption}
                 tr = await http.post(
                     f"{TG_API_BASE}/bot{bot_token}/sendPhoto",
-                    data=data, files=files, timeout=30.0,
+                    data=data, files=files, timeout=60.0,
                 )
                 if tr.status_code == 200:
                     sent += 1
+                else:
+                    log.warning("TG sendPhoto multipart claim=%s photo=%s status=%s body=%s",
+                                claim_id, i, tr.status_code, tr.text[:200])
             except Exception as err:  # noqa: BLE001
                 log.warning("TG sendPhoto multipart exception: %s", err)
         await asyncio.sleep(0.5)
