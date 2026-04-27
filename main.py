@@ -60,6 +60,7 @@ app.add_middleware(
 from v2.app import router as v2_router  # noqa: E402
 from v2.db import close_pool, create_pool, get_pool  # noqa: E402
 from v2.services import ml_backfill as ml_backfill_svc  # noqa: E402
+from v2.services import ml_claims_dispatch as ml_claims_dispatch_svc  # noqa: E402
 from v2.services import ml_item_context as ml_item_context_svc  # noqa: E402
 from v2.services import ml_notices as ml_notices_svc  # noqa: E402
 from v2.services import ml_normalize as ml_normalize_svc  # noqa: E402
@@ -112,6 +113,28 @@ async def _dispatch_questions_to_tg_job() -> None:
         )
     except Exception as err:  # noqa: BLE001
         _ml_log.exception("Questions dispatch job failed: %s", err)
+
+
+async def _dispatch_claims_to_tg_job() -> None:
+    """Send actionable opened claims to seller's Telegram (cron, default 5 min).
+
+    Independent of the legacy ml_notices path — reads ml_user_claims directly
+    so a webhook miss or a notice-translation failure doesn't drop claim
+    notifications. Only sends claims where _compute_needs_action is True
+    (no return record yet, or return parcel arrived back at seller).
+    """
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("Claims dispatch tick skipped: no DB pool")
+            return
+        result = await ml_claims_dispatch_svc.dispatch_all_users(pool)
+        _ml_log.info(
+            "Claims dispatch tick: users=%s sent=%s skipped=%s",
+            result.get("users"), result.get("sent"), result.get("skipped"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("Claims dispatch job failed: %s", err)
 
 
 async def _sync_ml_notices_job() -> None:
@@ -196,13 +219,24 @@ async def _refresh_promotions_job() -> None:
         user_ids = [r["user_id"] for r in rows]
         dispatch_limit = int(os.environ.get("PROMOTIONS_DISPATCH_LIMIT_PER_TICK", "15"))
         reminder_hours = float(os.environ.get("PROMOTIONS_REMINDER_HOURS", "24"))
+        # Honour user alert preferences from onboarding wizard. Users who
+        # explicitly disabled `promocoes` still get their cache refreshed
+        # (so the in-app /escalar/promotions page is fresh) but no TG push.
+        from v2.services import onboarding as _onboarding_svc
+        await _onboarding_svc.ensure_schema(pool)
+        prefs_map = await _onboarding_svc.get_alert_prefs_for_users(pool, user_ids)
         total_first = 0
         total_reminder = 0
+        skipped_dispatch = 0
         for uid in user_ids:
             try:
                 await ml_user_promotions_svc.refresh_user_promotions(pool, uid)
             except Exception as err:  # noqa: BLE001
                 _ml_log.exception("promotions refresh user %s failed: %s", uid, err)
+                continue
+            user_prefs = prefs_map.get(uid)
+            if user_prefs is not None and user_prefs.get("promocoes") is False:
+                skipped_dispatch += 1
                 continue
             try:
                 disp = await ml_user_promotions_svc.dispatch_pending_candidates(
@@ -220,8 +254,8 @@ async def _refresh_promotions_job() -> None:
                 )
             await _asyncio.sleep(0.3)
         _ml_log.info(
-            "Promotions refresh tick: users=%s sent_first=%s sent_reminder=%s",
-            len(user_ids), total_first, total_reminder,
+            "Promotions refresh tick: users=%s sent_first=%s sent_reminder=%s skipped_pref=%s",
+            len(user_ids), total_first, total_reminder, skipped_dispatch,
         )
     except Exception as err:  # noqa: BLE001
         _ml_log.exception("Promotions refresh job failed: %s", err)
@@ -347,6 +381,10 @@ async def _v2_startup() -> None:
             await ml_item_context_svc.ensure_schema(pool)
         except Exception as err:  # noqa: BLE001
             _ml_log.exception("ML item context schema bootstrap failed: %s", err)
+        try:
+            await ml_claims_dispatch_svc.ensure_schema(pool)
+        except Exception as err:  # noqa: BLE001
+            _ml_log.exception("ML claims dispatch schema bootstrap failed: %s", err)
 
     # Spin up the headless Chromium used by /escalar/positions scraper.
     # Failure here is logged but non-fatal — the scraper self-heals on first use.
@@ -399,6 +437,20 @@ async def _v2_startup() -> None:
         "interval",
         minutes=_qa_interval,
         id="questions_tg_dispatch",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Claims auto-dispatch to Telegram for actionable opened claims (no
+    # return record yet, or return parcel arrived back at seller). Default
+    # 5 min. Reads ml_user_claims directly — does not depend on the legacy
+    # ml_notices path.
+    _claims_interval = int(os.environ.get("CLAIMS_TG_INTERVAL_MIN", "5"))
+    _ml_scheduler.add_job(
+        _dispatch_claims_to_tg_job,
+        "interval",
+        minutes=_claims_interval,
+        id="claims_tg_dispatch",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
