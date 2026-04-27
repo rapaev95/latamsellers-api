@@ -167,6 +167,46 @@ def aggregate(
         except (TypeError, ValueError):
             return 0.0
 
+    # Project-level fixed costs (Aluguel, Fulfillment from PnL) allocated per
+    # unit by total project deliveries. Cached per call so we hit compute_pnl
+    # at most once per project.
+    from datetime import date
+    if isinstance(days, int):
+        _pnl_period = (date.today() - timedelta(days=int(days)), date.today())
+    elif isinstance(days, str) and days.isdigit():
+        _pnl_period = (date.today() - timedelta(days=int(days)), date.today())
+    else:
+        _pnl_period = (date(2000, 1, 1), date.today())
+    _project_alloc_cache: dict[str, tuple[float, float]] = {}
+
+    def _project_fixed_per_unit(project_name: str) -> tuple[float, float]:
+        """Returns (aluguel_per_unit, fulfillment_per_unit) for the project."""
+        key = (project_name or "").strip()
+        if not key:
+            return (0.0, 0.0)
+        cached = _project_alloc_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            from v2.legacy.finance import compute_pnl
+            pnl = compute_pnl(key, _pnl_period)
+        except Exception:
+            _project_alloc_cache[key] = (0.0, 0.0)
+            return _project_alloc_cache[key]
+        aluguel_total = 0.0
+        fulfillment_total = 0.0
+        for line in (getattr(pnl, "operating_expenses", None) or []):
+            label_lower = (getattr(line, "label", "") or "").lower()
+            amount = float(getattr(line, "amount_brl", 0) or 0)
+            if "aluguel" in label_lower:
+                aluguel_total += amount
+            elif "fulfillment" in label_lower or "доставка" in label_lower:
+                fulfillment_total += amount
+        units_total = max(int(getattr(pnl, "vendas_count", 0) or 0), 1)
+        result = (aluguel_total / units_total, fulfillment_total / units_total)
+        _project_alloc_cache[key] = result
+        return result
+
     # Aggregate ads investment per MLB over the selected period. Publicidade
     # export rows have `desde`/`ate` (period they cover) and `investimento` (R$).
     # We sum all rows whose `ate` falls after the cutoff.
@@ -276,7 +316,14 @@ def aggregate(
         # Manual extra fixed cost per unit (embalagem, mão de obra, etc.) —
         # entered inline in the products dashboard.
         extra_fixed = _extra_fixed_cost_for(a.sku)
-        margin = avg_price - comm_pu - ship_pu - refund_pu - ad_pu - storage_pu - unit_cost - extra_fixed
+        # Project-level fixed costs allocated per unit (Aluguel + Fulfillment
+        # from PnL). Same per-unit value across all SKUs in the same project.
+        project_for_pnl = (resolver.resolve(a.sku, a.mlb) if resolver else "") or ""
+        aluguel_pu, fulfillment_pu = _project_fixed_per_unit(project_for_pnl)
+        margin = (
+            avg_price - comm_pu - ship_pu - refund_pu - ad_pu - storage_pu
+            - unit_cost - extra_fixed - aluguel_pu - fulfillment_pu
+        )
         margin_pct = (margin / avg_price * 100) if avg_price > 0 else 0.0
         # ROI = profit_per_unit / cost_per_unit. Cost = COGS + ad spend (what
         # the seller actually puts at risk). Returns 0 if no cost basis yet.
@@ -321,6 +368,8 @@ def aggregate(
             "refundPerUnit": refund_pu,
             "unitCost": unit_cost,
             "extraFixedCost": extra_fixed,
+            "aluguelPerUnit": aluguel_pu,
+            "fulfillmentPerUnit": fulfillment_pu,
             "margin": margin,
             "marginPct": margin_pct,
             "roi": roi,
