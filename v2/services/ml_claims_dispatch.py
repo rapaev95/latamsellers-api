@@ -39,8 +39,37 @@ from . import ml_user_claims as claims_svc
 log = logging.getLogger(__name__)
 
 TG_API_BASE = "https://api.telegram.org"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+LLM_MODEL = "openai/gpt-4o-mini"
 TG_BATCH_CAP = 10  # max claims per user per tick
 TG_THROTTLE = 1.1  # 1 sec between TG sends per chat
+
+
+SUMMARY_SYSTEM_PROMPT_RU = """Ты — ассистент продавца Mercado Livre. Твоя задача — кратко и тезисно объяснить продавцу суть рекламации покупателя.
+
+ПРАВИЛА:
+1. Перевод на русский, но НЕ дословный — выдели только важное.
+2. Формат: 2-4 коротких тезиса, каждый с новой строки, начинается с «• ».
+3. Что включать:
+   • Что не так с товаром (брак, не соответствует описанию, не работает и т.д.)
+   • Что покупатель уже сделал/сообщил (прислал фото, попробовал инструкции и т.д.)
+   • Какое решение предлагает ML или просит покупатель (если упомянуто)
+4. НЕ цитируй покупателя дословно. НЕ пиши «покупатель пишет что...». Сразу к сути.
+5. Без преамбулы, без заголовка, без «Тезисно:» — только сами тезисы.
+6. Максимум 350 символов всего."""
+
+SUMMARY_SYSTEM_PROMPT_EN = """You are a Mercado Livre seller's assistant. Summarize the buyer's claim message into bullet points so the seller can triage instantly.
+
+RULES:
+1. Translate to English, but NOT literally — keep only what matters.
+2. Format: 2-4 short bullets, each on its own line, starting with "• ".
+3. Include:
+   • What is wrong with the product (defect, mismatch, doesn't work, etc.)
+   • What the buyer has already done/reported (sent photos, tried instructions, etc.)
+   • What resolution the ML mediator or buyer is suggesting (if mentioned)
+4. Don't quote the buyer verbatim. No "The buyer says...". Get to the point.
+5. No preamble, no headers, no "Summary:" — just the bullets.
+6. Max 350 characters total."""
 
 # MarkdownV2 escape per Telegram spec
 _MD_ESCAPE = str.maketrans({c: f"\\{c}" for c in r"_*[]()~`>#+-=|{}.!"})
@@ -68,7 +97,9 @@ def _strip_md2_escapes(text: str) -> str:
 ALTER_SQL = """
 ALTER TABLE ml_user_claims
   ADD COLUMN IF NOT EXISTS tg_dispatched_at TIMESTAMPTZ,
-  ADD COLUMN IF NOT EXISTS tg_message_id TEXT;
+  ADD COLUMN IF NOT EXISTS tg_message_id TEXT,
+  ADD COLUMN IF NOT EXISTS tg_summary TEXT,
+  ADD COLUMN IF NOT EXISTS tg_summary_lang TEXT;
 CREATE INDEX IF NOT EXISTS idx_ml_user_claims_tg_pending
   ON ml_user_claims(user_id)
   WHERE status = 'opened' AND tg_dispatched_at IS NULL;
@@ -159,7 +190,72 @@ def _extract_buyer_complaint(claim: dict[str, Any]) -> Optional[str]:
     return candidates[0][1]
 
 
-def _build_claim_card(claim: dict[str, Any]) -> str:
+async def _summarize_complaint(
+    http: httpx.AsyncClient,
+    complaint: str,
+    target_lang: str = "ru",
+) -> Optional[str]:
+    """Use OpenRouter (same model as ml_questions_dispatch) to produce a 2-4
+    bullet summary of the buyer's claim message in the seller's language.
+
+    Returns None if the API key is missing, the call fails, or the response
+    is empty. Caller should fall back to raw complaint text.
+    """
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        log.warning("OPENROUTER_API_KEY not set — claim summary skipped")
+        return None
+    if not complaint or not complaint.strip():
+        return None
+
+    target = (target_lang or "ru").lower()
+    if target == "en":
+        system_prompt = SUMMARY_SYSTEM_PROMPT_EN
+    else:
+        system_prompt = SUMMARY_SYSTEM_PROMPT_RU
+
+    try:
+        r = await http.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://app.lsprofit.app",
+                "X-Title": "LS Profit App",
+            },
+            json={
+                "model": LLM_MODEL,
+                "max_tokens": 250,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": complaint[:3000]},
+                ],
+            },
+            timeout=15.0,
+        )
+        if r.status_code != 200:
+            log.warning("OpenRouter summary %s: %s", r.status_code, r.text[:200])
+            return None
+        data = r.json()
+        content = (data.get("choices") or [{}])[0].get("message", {}).get("content")
+        text = content.strip() if isinstance(content, str) else None
+        if text and not text.startswith("•"):
+            # Some models prepend a header — strip empty lines, keep only
+            # the bullet block.
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            text = "\n".join(ln for ln in lines if ln.startswith("•") or ln.startswith("-"))
+            text = text.replace("- ", "• ") or None
+        return text
+    except Exception as err:  # noqa: BLE001
+        log.exception("claim summary failed: %s", err)
+        return None
+
+
+def _build_claim_card(
+    claim: dict[str, Any],
+    summary: Optional[str] = None,
+    summary_lang: str = "ru",
+) -> str:
     """MarkdownV2-formatted TG card for one actionable claim."""
     cid = claim.get("id") or "?"
     reason = claim.get("reason_id") or "?"
@@ -191,15 +287,26 @@ def _build_claim_card(claim: dict[str, Any]) -> str:
         lines.append(f"↩️ *Devolução:* `{_esc_code(ret_summary)}`")
 
     # Buyer's complaint / mediator summary — the "why" of the claim.
-    # Truncate to keep the message under TG's 4096 cap.
-    complaint = _extract_buyer_complaint(claim)
-    if complaint:
-        clip = complaint[:600].rstrip()
-        if len(complaint) > 600:
-            clip += "…"
+    # Prefer the AI-generated bullet summary in the seller's language; fall
+    # back to the raw mediator/buyer message if the summary failed (no API
+    # key, OpenRouter down, etc.).
+    if summary and summary.strip():
+        header = "💬 *Суть жалобы:*" if summary_lang == "ru" else (
+            "💬 *Buyer's claim summary:*" if summary_lang == "en"
+            else "💬 *Resumo da reclamação:*"
+        )
         lines.append("")
-        lines.append("💬 *Motivo do comprador:*")
-        lines.append(_esc(clip))
+        lines.append(header)
+        lines.append(_esc(summary.strip()))
+    else:
+        complaint = _extract_buyer_complaint(claim)
+        if complaint:
+            clip = complaint[:600].rstrip()
+            if len(complaint) > 600:
+                clip += "…"
+            lines.append("")
+            lines.append("💬 *Motivo do comprador:*")
+            lines.append(_esc(clip))
 
     lines.append("")
     if needs_review:
@@ -261,6 +368,8 @@ async def _send_claim(
     chat_id: str,
     claim: dict[str, Any],
     app_base_url: str,
+    summary: Optional[str] = None,
+    summary_lang: str = "ru",
 ) -> Optional[str]:
     """Send one claim card. Returns TG message_id on success."""
     cid_raw = claim.get("id")
@@ -269,7 +378,7 @@ async def _send_claim(
     except (TypeError, ValueError):
         return None
 
-    text = _build_claim_card(claim)
+    text = _build_claim_card(claim, summary=summary, summary_lang=summary_lang)
     if len(text) > 4000:
         text = text[:3990] + "…"
     keyboard = _build_keyboard(cid, app_base_url)
@@ -334,11 +443,17 @@ async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int, app_base_url: str
     except Exception as err:  # noqa: BLE001
         log.warning("claims refresh user=%s failed: %s", user_id, err)
 
-    # Pull pending actionable claims
+    # The seller's preferred language drives both the AI summary language
+    # and the in-card section header.
+    summary_lang = (settings["language"] or "pt").lower()
+
+    # Pull pending actionable claims (over-fetch — many will fail
+    # needs_action filter). Also pull cached summary so we don't pay for
+    # OpenRouter on every retry.
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT claim_id, enriched
+            SELECT claim_id, enriched, tg_summary, tg_summary_lang
               FROM ml_user_claims
              WHERE user_id = $1
                AND status = 'opened'
@@ -346,7 +461,7 @@ async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int, app_base_url: str
              ORDER BY date_created DESC NULLS LAST
              LIMIT $2
             """,
-            user_id, TG_BATCH_CAP * 4,  # over-fetch — many will fail needs_action filter
+            user_id, TG_BATCH_CAP * 4,
         )
 
     sent = 0
@@ -364,17 +479,40 @@ async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int, app_base_url: str
             if not isinstance(enriched, dict):
                 continue
             if not claims_svc._compute_needs_action(enriched):
-                # Not actionable right now — skip this tick. We DO mark it
-                # dispatched so we don't re-evaluate it forever; if its state
-                # changes later (e.g. return arrives → delivered) we'll get
-                # a fresh row when refresh re-upserts it... but the upsert
-                # doesn't reset tg_dispatched_at. So leave the flag NULL for
-                # now and rely on per-tick filtering.
                 skipped += 1
                 continue
 
             cid = int(row["claim_id"])
-            msg_id = await _send_claim(http, bot_token, chat_id, enriched, app_base_url)
+
+            # Generate (or reuse cached) bullet summary in the seller's
+            # language. Skip for pt — sellers comfortable with pt-BR see the
+            # original mediator/buyer text, no AI roundtrip needed.
+            summary: Optional[str] = None
+            if summary_lang in ("ru", "en"):
+                cached = row["tg_summary"]
+                cached_lang = row["tg_summary_lang"]
+                if cached and cached_lang == summary_lang:
+                    summary = cached
+                else:
+                    complaint = _extract_buyer_complaint(enriched)
+                    if complaint:
+                        summary = await _summarize_complaint(http, complaint, summary_lang)
+                        if summary:
+                            async with pool.acquire() as conn:
+                                await conn.execute(
+                                    """
+                                    UPDATE ml_user_claims
+                                       SET tg_summary = $1,
+                                           tg_summary_lang = $2
+                                     WHERE user_id = $3 AND claim_id = $4
+                                    """,
+                                    summary, summary_lang, user_id, cid,
+                                )
+
+            msg_id = await _send_claim(
+                http, bot_token, chat_id, enriched, app_base_url,
+                summary=summary, summary_lang=summary_lang,
+            )
             if msg_id:
                 async with pool.acquire() as conn:
                     await conn.execute(
