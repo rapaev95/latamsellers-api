@@ -386,11 +386,10 @@ async def send_notice(
         # callback_data ≤ 64 bytes. Most promo ids look like "MLB-PROMO-123" (≤30
         # bytes) and MLB ids ≤16 bytes — fits comfortably with `pa:` prefix.
         if promo_id and promo_item_id:
-            # Derive the offer's required entrada discount % so the "raise &
-            # accept" button can show its actual uplift (matches what the
-            # backend will use). Falls back to 15% for offers where ML
-            # didn't surface a clear discount field.
-            raise_pct_int = 15
+            # Derive the offer's required entrada discount % (D) — used to
+            # render the per-offer % on both raise buttons (backend re-derives
+            # the same value, so labels and actual uplift always match).
+            entrada_pct: float = 0.0
             try:
                 disc = raw_block.get("discount_percentage")
                 if disc is None:
@@ -403,10 +402,18 @@ async def send_notice(
                     )
                     if op > 0 and 0 < dp < op:
                         disc = (1 - dp / op) * 100
-                if disc is not None and float(disc) > 0:
-                    raise_pct_int = max(1, int(round(float(disc))))
+                if disc is not None:
+                    entrada_pct = max(0.0, float(disc))
             except (TypeError, ValueError):
                 pass
+
+            linear_pct = max(1, int(round(entrada_pct))) if entrada_pct > 0 else 15
+            # Exact formula: D / (1 − D/100). Returns to original price exactly.
+            if 0 < entrada_pct < 100:
+                exact_pct_f = entrada_pct / (1 - entrada_pct / 100.0)
+                exact_pct = max(1, int(round(exact_pct_f)))
+            else:
+                exact_pct = linear_pct
 
             accept_label = {
                 "ru": "✅ Принять (мин)",
@@ -414,10 +421,15 @@ async def send_notice(
                 "pt": "✅ Aceitar (min)",
             }.get(language, "✅ Aceitar (min)")
             raise_label = {
-                "ru": f"📈 Поднять +{raise_pct_int}% и принять",
-                "en": f"📈 Raise +{raise_pct_int}% & accept",
-                "pt": f"📈 Subir +{raise_pct_int}% e aceitar",
-            }.get(language, f"📈 Subir +{raise_pct_int}% e aceitar")
+                "ru": f"📈 Поднять +{linear_pct}% и принять",
+                "en": f"📈 Raise +{linear_pct}% & accept",
+                "pt": f"📈 Subir +{linear_pct}% e aceitar",
+            }.get(language, f"📈 Subir +{linear_pct}% e aceitar")
+            exact_label = {
+                "ru": f"🎯 Поднять +{exact_pct}% (точно к оригиналу)",
+                "en": f"🎯 Raise +{exact_pct}% (back to original)",
+                "pt": f"🎯 Subir +{exact_pct}% (preço original)",
+            }.get(language, f"🎯 Subir +{exact_pct}% (preço original)")
             reject_label = {
                 "ru": "❌ Отклонить",
                 "en": "❌ Reject",
@@ -428,12 +440,13 @@ async def send_notice(
                 "en": "🔍 Details",
                 "pt": "🔍 Detalhes",
             }.get(language, "🔍 Detalhes")
-            # Three rows: [accept_min, reject] / [accept_with_raise] / [details].
+            # Four rows: [accept, reject] / [linear raise] / [exact raise] / [details].
             # callback_data prefixes:
             #   pa:  → accept at entrada (min discount required by ML)
-            #   pas: → raise listing price +15% then accept at entrada (lets
-            #          the seller participate in promo with apparent discount
-            #          while keeping effective sale price near original)
+            #   pas: → linear raise (+D%) then accept at entrada
+            #          → effective price ends slightly below original
+            #   paf: → exact raise (+D/(1-D/100)%) then accept
+            #          → effective price = original exactly ("preço fixo")
             #   pr:  → reject
             row_accept_reject = [
                 {"text": accept_label, "callback_data": f"pa:{promo_id}:{promo_item_id}"},
@@ -442,9 +455,14 @@ async def send_notice(
             row_raise = [
                 {"text": raise_label, "callback_data": f"pas:{promo_id}:{promo_item_id}"},
             ]
+            row_raise_exact = [
+                {"text": exact_label, "callback_data": f"paf:{promo_id}:{promo_item_id}"},
+            ]
             details_url = f"https://www.mercadolivre.com.br/anuncios/promotions/{promo_id}"
             details_row = [{"text": details_label, "url": details_url}]
-            payload["reply_markup"] = {"inline_keyboard": [row_accept_reject, row_raise, details_row]}
+            payload["reply_markup"] = {
+                "inline_keyboard": [row_accept_reject, row_raise, row_raise_exact, details_row],
+            }
 
     if topic == "items":
         item_id = ""

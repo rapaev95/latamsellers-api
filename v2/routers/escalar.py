@@ -1649,10 +1649,13 @@ class _PromoActionIn(__import__("pydantic").BaseModel):
     promotion_id: str
     item_id: str
     # accept_with_raise: % uplift applied to listing price BEFORE accept.
-    # Default +15% — keeps the apparent buyer-facing discount around the
-    # promo's required entrada while leaving effective sale price near
-    # the original listing.
+    # If raise_pct is explicit, used as-is. Otherwise raise_mode picks:
+    #   "linear" (default) → raise_pct = entrada_discount_pct
+    #     → effective price ends slightly below original (≈ −D% of D%).
+    #   "exact" → raise_pct = D / (1 − D/100)
+    #     → effective price lands on original exactly.
     raise_pct: Optional[float] = None
+    raise_mode: Optional[str] = None  # "linear" | "exact"
 
 
 class _PromoRefreshInternalIn(__import__("pydantic").BaseModel):
@@ -1927,27 +1930,38 @@ async def promotions_tg_action(
     mlb = body.item_id.upper()
     url = f"https://api.mercadolibre.com/seller-promotions/items/{mlb}?app_version=v2"
 
-    # Default raise_pct = the offer's required entrada discount, so the
-    # post-raise listing × (1 − entrada%) lands close to the original price.
-    # E.g., entrada -5% → raise +5% → new entrada price ≈ original.
-    # User can still override via body.raise_pct for non-default flows.
-    auto_raise_pct: Optional[float] = body.raise_pct
-    if auto_raise_pct is None:
+    # Resolve the entrada discount % from the offer (either derived from
+    # original/deal prices or explicit discount_percentage). This is "D" in
+    # the formulas below.
+    entrada_pct: Optional[float] = None
+    try:
+        orig_p = float(offer.get("original_price") or 0)
+        deal_p = float(offer.get("deal_price") or 0)
+        if orig_p > 0 and 0 < deal_p < orig_p:
+            entrada_pct = round((1 - deal_p / orig_p) * 100, 2)
+    except (TypeError, ValueError):
+        entrada_pct = None
+    if entrada_pct is None:
         try:
-            orig_p = float(offer.get("original_price") or 0)
-            deal_p = float(offer.get("deal_price") or 0)
-            if orig_p > 0 and 0 < deal_p < orig_p:
-                auto_raise_pct = round((1 - deal_p / orig_p) * 100, 1)
+            entrada_pct = float(offer.get("discount_percentage") or 0) or None
         except (TypeError, ValueError):
-            auto_raise_pct = None
-        if auto_raise_pct is None:
-            disc_pct = offer.get("discount_percentage")
-            if disc_pct is not None:
-                try:
-                    auto_raise_pct = float(disc_pct)
-                except (TypeError, ValueError):
-                    auto_raise_pct = None
-    raise_pct = float(auto_raise_pct or 15.0)
+            entrada_pct = None
+
+    # raise_pct selection:
+    #   1. body.raise_pct override (explicit % from caller) wins
+    #   2. raise_mode "exact" → D / (1 − D/100), so post-raise entrada
+    #      price = original exactly.
+    #   3. raise_mode "linear" (default) → raise_pct = D, simpler mental
+    #      model, lands slightly below original.
+    if body.raise_pct is not None:
+        raise_pct = float(body.raise_pct)
+    elif entrada_pct is not None and entrada_pct > 0:
+        if (body.raise_mode or "").lower() == "exact" and entrada_pct < 100:
+            raise_pct = round(entrada_pct / (1 - entrada_pct / 100.0), 2)
+        else:
+            raise_pct = round(entrada_pct, 2)
+    else:
+        raise_pct = 15.0
     raise_info: dict = {}
 
     async with httpx.AsyncClient() as http:
@@ -2005,6 +2019,8 @@ async def promotions_tg_action(
                 "old_price": old_price,
                 "new_price": new_price,
                 "raise_pct": raise_pct,
+                "raise_mode": (body.raise_mode or "linear").lower(),
+                "entrada_pct": entrada_pct,
             }
 
             # Re-fetch the offer with the new listing price so we accept at
