@@ -685,6 +685,42 @@ async def refresh_user_claims(
     return await ml_user_claims_svc.refresh_user_claims(pool, user.id)
 
 
+@router.get("/user-claims/{claim_id}/messages-probe")
+async def claim_messages_probe(
+    claim_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Probe ML's /claims/{id}/messages directly so we can see whether the
+    enrichment fetch silently 403s. Returns raw status + body — same
+    pattern as the TEST step elsewhere."""
+    if pool is None:
+        return {"error": "no_db"}
+    try:
+        token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except Exception as err:  # noqa: BLE001
+        return {"error": "oauth_failed", "detail": str(err)}
+
+    base = "https://api.mercadolibre.com"
+    headers = {"Authorization": f"Bearer {token}"}
+    candidates = [
+        ("v1_messages", f"{base}/post-purchase/v1/claims/{claim_id}/messages"),
+        ("v2_messages", f"{base}/post-purchase/v2/claims/{claim_id}/messages"),
+        ("v1_history", f"{base}/post-purchase/v1/claims/{claim_id}/history"),
+        ("v1_actions", f"{base}/post-purchase/v1/claims/{claim_id}/actions"),
+        ("v2_full", f"{base}/post-purchase/v2/claims/{claim_id}"),
+    ]
+    results = []
+    async with httpx.AsyncClient() as http:
+        for label, url in candidates:
+            try:
+                r = await http.get(url, headers=headers, timeout=15.0)
+                results.append({"label": label, "url": url, "status": r.status_code, "body_preview": r.text[:600]})
+            except Exception as err:  # noqa: BLE001
+                results.append({"label": label, "url": url, "error": str(err)})
+    return {"claim_id": claim_id, "results": results}
+
+
 @router.post("/user-claims/resend-tg")
 async def resend_user_claims_tg(
     user: CurrentUser = Depends(current_user),
