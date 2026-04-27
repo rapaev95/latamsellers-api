@@ -29,6 +29,7 @@ aggregation is the cache layer that downstream UI consumes.
 from __future__ import annotations
 
 import io
+import json
 import logging
 import re
 from datetime import date, datetime
@@ -654,6 +655,134 @@ async def get_top_listings(
         }
         for r in rows
     ]
+
+
+# ── Health Score computation ──────────────────────────────────────────────────
+
+def _score_one_item(item: dict[str, Any], bench: dict[str, Any]) -> dict[str, Any]:
+    """Compare a single item against a category benchmark. Returns score 0-100
+    and a breakdown showing which dimensions pass/fail."""
+    breakdown: dict[str, Any] = {}
+    score = 0
+    weights = {"photos": 35, "full": 25, "price": 25, "subStatus": 15}
+
+    # Photos vs avg_photos (35 pts)
+    photos_n = item.get("pictures_count") or 0
+    bench_photos = bench.get("avg_photos") or 0
+    photos_target = bench_photos * 0.7  # 70% of avg is acceptable
+    photos_ok = photos_n >= photos_target if photos_target > 0 else None
+    if photos_ok is True:
+        score += weights["photos"]
+    breakdown["photos"] = {
+        "value": photos_n,
+        "target": round(bench_photos, 1) if bench_photos else None,
+        "pass": photos_ok,
+        "weight": weights["photos"],
+    }
+
+    # Full shipping (25 pts) — logistic_type=='fulfillment' is Full
+    full_ok = (item.get("logistic_type") == "fulfillment")
+    pct_full_bench = bench.get("pct_full") or 0
+    if full_ok:
+        score += weights["full"]
+    elif pct_full_bench < 30:
+        # Category doesn't really require Full — half credit
+        score += weights["full"] // 2
+    breakdown["full"] = {
+        "value": item.get("logistic_type") or "—",
+        "target": f"{pct_full_bench:.0f}% top use Full" if pct_full_bench else None,
+        "pass": full_ok,
+        "weight": weights["full"],
+    }
+
+    # Price within healthy range vs median (25 pts)
+    price = item.get("price")
+    median_price = bench.get("median_price")
+    price_ok: Optional[bool] = None
+    if price and median_price:
+        if 0.6 * float(median_price) <= float(price) <= 1.6 * float(median_price):
+            price_ok = True
+            score += weights["price"]
+        else:
+            price_ok = False
+    breakdown["price"] = {
+        "value": float(price) if price else None,
+        "target": f"R$ {float(median_price) * 0.6:.0f}-{float(median_price) * 1.6:.0f}" if median_price else None,
+        "pass": price_ok,
+        "weight": weights["price"],
+    }
+
+    # Sub_status clean (15 pts) — any sub_status flag = -15
+    sub_status = item.get("sub_status") or []
+    sub_ok = len(sub_status) == 0
+    if sub_ok:
+        score += weights["subStatus"]
+    breakdown["subStatus"] = {
+        "value": sub_status,
+        "pass": sub_ok,
+        "weight": weights["subStatus"],
+    }
+
+    return {"score": score, "max": sum(weights.values()), "breakdown": breakdown}
+
+
+async def get_health_scores(
+    pool: asyncpg.Pool,
+    user_id: int,
+    subcategory: str,
+) -> dict[str, dict[str, Any]]:
+    """Compute health score for every cached item against the chosen benchmark.
+    Returns map keyed by item_id."""
+    async with pool.acquire() as conn:
+        bench_row = await conn.fetchrow(
+            """
+            SELECT median_price, avg_photos, pct_full, pct_video,
+                   pct_ads, pct_parcelas, pct_catalog,
+                   median_conversion, sample_size, subcategory
+              FROM category_benchmarks
+             WHERE user_id = $1 AND subcategory = $2
+            """,
+            user_id, subcategory,
+        )
+        if not bench_row:
+            return {}
+        bench = {
+            "median_price": float(bench_row["median_price"]) if bench_row["median_price"] is not None else None,
+            "avg_photos": float(bench_row["avg_photos"]) if bench_row["avg_photos"] is not None else None,
+            "pct_full": float(bench_row["pct_full"]) if bench_row["pct_full"] is not None else 0,
+            "pct_video": float(bench_row["pct_video"]) if bench_row["pct_video"] is not None else 0,
+            "pct_ads": float(bench_row["pct_ads"]) if bench_row["pct_ads"] is not None else 0,
+            "pct_parcelas": float(bench_row["pct_parcelas"]) if bench_row["pct_parcelas"] is not None else 0,
+            "pct_catalog": float(bench_row["pct_catalog"]) if bench_row["pct_catalog"] is not None else 0,
+            "median_conversion": float(bench_row["median_conversion"]) if bench_row["median_conversion"] is not None else None,
+        }
+
+        items = await conn.fetch(
+            """
+            SELECT item_id, price, logistic_type, sub_status,
+                   COALESCE(jsonb_array_length(pictures), 0) AS pictures_count
+              FROM ml_item_context
+             WHERE user_id = $1
+            """,
+            user_id,
+        )
+
+    out: dict[str, dict[str, Any]] = {}
+    for r in items:
+        sub_status = r["sub_status"]
+        if isinstance(sub_status, str):
+            try:
+                sub_status = json.loads(sub_status)
+            except Exception:  # noqa: BLE001
+                sub_status = []
+        item = {
+            "price": float(r["price"]) if r["price"] is not None else None,
+            "logistic_type": r["logistic_type"],
+            "sub_status": sub_status if isinstance(sub_status, list) else [],
+            "pictures_count": int(r["pictures_count"] or 0),
+        }
+        out[r["item_id"]] = _score_one_item(item, bench)
+    return out
 
 
 async def get_listing_performance(

@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS ml_item_context (
   available_quantity INTEGER,
   warranty TEXT,
   shipping_free BOOLEAN,
+  logistic_type TEXT,
   permalink TEXT,
   status TEXT,
   sub_status JSONB DEFAULT '[]'::jsonb,
@@ -74,7 +75,8 @@ ALTER_SQL = """
 ALTER TABLE ml_item_context
   ADD COLUMN IF NOT EXISTS pictures JSONB DEFAULT '[]'::jsonb,
   ADD COLUMN IF NOT EXISTS status TEXT,
-  ADD COLUMN IF NOT EXISTS sub_status JSONB DEFAULT '[]'::jsonb;
+  ADD COLUMN IF NOT EXISTS sub_status JSONB DEFAULT '[]'::jsonb,
+  ADD COLUMN IF NOT EXISTS logistic_type TEXT;
 """
 
 
@@ -176,6 +178,7 @@ async def fetch_from_ml(
         "available_quantity": item.get("available_quantity"),
         "warranty": item.get("warranty"),
         "shipping_free": sh.get("free_shipping"),
+        "logistic_type": sh.get("logistic_type"),
         "permalink": item.get("permalink"),
         "status": item.get("status"),
         "sub_status": sub_status,
@@ -190,12 +193,12 @@ async def fetch_from_ml(
 UPSERT_SQL = """
 INSERT INTO ml_item_context (
   user_id, item_id, title, condition, price, currency, available_quantity,
-  warranty, shipping_free, permalink, status, sub_status,
+  warranty, shipping_free, logistic_type, permalink, status, sub_status,
   attributes, description, pictures, fetched_at
 )
 VALUES (
-  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb,
-  $13::jsonb, $14, $15::jsonb, NOW()
+  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb,
+  $14::jsonb, $15, $16::jsonb, NOW()
 )
 ON CONFLICT (user_id, item_id) DO UPDATE SET
   title = EXCLUDED.title,
@@ -205,6 +208,7 @@ ON CONFLICT (user_id, item_id) DO UPDATE SET
   available_quantity = EXCLUDED.available_quantity,
   warranty = EXCLUDED.warranty,
   shipping_free = EXCLUDED.shipping_free,
+  logistic_type = EXCLUDED.logistic_type,
   permalink = EXCLUDED.permalink,
   status = EXCLUDED.status,
   sub_status = EXCLUDED.sub_status,
@@ -230,6 +234,7 @@ async def upsert(pool: asyncpg.Pool, user_id: int, data: dict[str, Any]) -> None
             int(avail) if isinstance(avail, int) else None,
             data.get("warranty"),
             data.get("shipping_free"),
+            data.get("logistic_type"),
             data.get("permalink"),
             data.get("status"),
             json.dumps(data.get("sub_status") or []),
@@ -253,7 +258,7 @@ async def get_cached(
         row = await conn.fetchrow(
             """
             SELECT item_id, title, condition, price, currency, available_quantity,
-                   warranty, shipping_free, permalink, status, sub_status,
+                   warranty, shipping_free, logistic_type, permalink, status, sub_status,
                    attributes, description, pictures, fetched_at
               FROM ml_item_context
              WHERE user_id = $1 AND item_id = $2
@@ -295,6 +300,7 @@ async def get_cached(
         "available_quantity": row["available_quantity"],
         "warranty": row["warranty"],
         "shipping_free": row["shipping_free"],
+        "logistic_type": row["logistic_type"],
         "permalink": row["permalink"],
         "status": row["status"],
         "sub_status": sub_status,

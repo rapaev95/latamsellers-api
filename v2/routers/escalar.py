@@ -1184,6 +1184,52 @@ class _PromoActionIn(__import__("pydantic").BaseModel):
     item_id: str
 
 
+class _PromoRefreshInternalIn(__import__("pydantic").BaseModel):
+    user_id: int
+    item_id: str          # MLB id
+
+
+@router.post("/user-promotions/refresh-internal")
+async def refresh_user_promotions_internal(
+    body: _PromoRefreshInternalIn,
+    pool=Depends(get_pool),
+):
+    """Server-to-server endpoint — called by Next.js ml-webhook when ML emits
+    `public_offers` / `public_candidates` for an item. Refreshes JUST the
+    affected item's offers and synthesizes a `promotions:` notice with full
+    details + Aceitar/Rejeitar buttons. Result: seller receives ONE rich TG
+    message, not a stub.
+
+    Auth: no cookie — intra-Railway call. Webhook validates ML's
+    application_id before triggering this.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    await ml_user_promotions_svc.ensure_schema(pool)
+    result = await ml_user_promotions_svc.refresh_user_promotions(
+        pool, body.user_id, item_ids=[body.item_id],
+    )
+
+    pushed = 0
+    for offer in result.get("new_offers", []):
+        enriched = dict(offer.get("raw") or {})
+        enriched["item_id"] = offer["item_id"]
+        notice = ml_normalize_svc.normalize_event("promotions", None, enriched)
+        notice["notice_id"] = (
+            f"promotions:{offer['item_id']}:{offer['promotion_id']}"
+        )
+        if await ml_notices_svc.upsert_normalized(pool, body.user_id, notice):
+            pushed += 1
+            await ml_user_promotions_svc.mark_notified(
+                pool, body.user_id, offer["item_id"], offer["promotion_id"],
+            )
+    return {
+        "fetched": result["fetched"],
+        "newOffers": len(result["new_offers"]),
+        "pushedToTelegram": pushed,
+    }
+
+
 @router.post("/user-promotions/tg-action")
 async def promotions_tg_action(
     body: _PromoActionIn,
@@ -1419,6 +1465,24 @@ async def get_top_listings(
         "subcategory": subcategory,
         "items": await category_benchmarks_svc.get_top_listings(pool, user.id, subcategory, limit),
     }
+
+
+@router.get("/benchmarks/health-scores")
+async def get_health_scores(
+    subcategory: str = Query(..., min_length=1),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Compute Health Score (0-100) for every cached item against the chosen
+    subcategory benchmark. Frontend uses this to colour the ABC table.
+
+    Returns: {scores: {itemId: {score, max, breakdown}}}.
+    """
+    if pool is None:
+        return {"error": "no_db", "scores": {}}
+    await category_benchmarks_svc.ensure_schema(pool)
+    scores = await category_benchmarks_svc.get_health_scores(pool, user.id, subcategory)
+    return {"subcategory": subcategory, "scores": scores}
 
 
 @router.get("/benchmarks/listing-performance")
