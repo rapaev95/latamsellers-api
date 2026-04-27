@@ -208,6 +208,26 @@ async def _enrich_one(http: httpx.AsyncClient, token: str, claim: dict) -> dict:
         except Exception as err:  # noqa: BLE001
             log.warning("mediations/%s exception: %s", cid, err)
 
+    # 5. Messages thread — buyer's complaint + ML mediator notes. Used by
+    # ml_claims_dispatch to surface the "why this claim opened" text in the
+    # Telegram card. Without it the seller has to open the app to triage.
+    try:
+        r = await http.get(
+            f"{ML_API_BASE}/post-purchase/v1/claims/{cid}/messages",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15.0,
+        )
+        if r.status_code == 200:
+            mdata = r.json()
+            if isinstance(mdata, dict) and isinstance(mdata.get("messages"), list):
+                claim["messages"] = mdata["messages"]
+            elif isinstance(mdata, list):
+                claim["messages"] = mdata
+        elif r.status_code not in (403, 404):
+            log.info("claims/%s/messages status=%s body=%s", cid, r.status_code, r.text[:200])
+    except Exception as err:  # noqa: BLE001
+        log.warning("claims/%s/messages exception: %s", cid, err)
+
     return claim
 
 

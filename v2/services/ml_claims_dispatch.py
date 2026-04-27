@@ -117,6 +117,48 @@ def _summarize_return(claim: dict[str, Any]) -> Optional[str]:
     return " · ".join(parts)
 
 
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _extract_buyer_complaint(claim: dict[str, Any]) -> Optional[str]:
+    """Pull the most recent buyer-relevant message from the claim thread.
+
+    ML's mediator/buyer messages live in claim.messages (added by enrich
+    via /claims/{id}/messages). Each message has shape roughly:
+      { id, sender_role: 'complainant'|'respondent'|'mediator',
+        message: 'text', date_created: ISO, ... }
+    We prefer the latest mediator/complainant message because that's where
+    "O comprador relatou que..." text shows up. Strip basic HTML tags
+    that ML occasionally embeds (e.g. <strong>...</strong>).
+    """
+    messages = claim.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+    # Look for messages from mediator/complainant; prefer mediator (richer
+    # summary including "O comprador relatou ...").
+    candidates: list[tuple[int, str]] = []  # (priority, text)
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        sender = m.get("sender_role") or ""
+        if isinstance(m.get("sender"), dict):
+            sender = m["sender"].get("role") or sender
+        if sender not in ("mediator", "complainant", "buyer"):
+            continue
+        text = (m.get("message") or m.get("text") or "").strip()
+        if not text:
+            continue
+        text = _HTML_TAG_RE.sub("", text)
+        # Replace the bullet-list markdown chars ML sometimes uses
+        text = text.replace("\n- ", "\n• ").replace("\n  - ", "\n  • ")
+        priority = 1 if sender == "mediator" else 2
+        candidates.append((priority, text))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])  # mediator first
+    return candidates[0][1]
+
+
 def _build_claim_card(claim: dict[str, Any]) -> str:
     """MarkdownV2-formatted TG card for one actionable claim."""
     cid = claim.get("id") or "?"
@@ -147,24 +189,51 @@ def _build_claim_card(claim: dict[str, Any]) -> str:
     lines.append(f"📦 *Pedido:* `{_esc_code(order_id)}`")
     if ret_summary:
         lines.append(f"↩️ *Devolução:* `{_esc_code(ret_summary)}`")
+
+    # Buyer's complaint / mediator summary — the "why" of the claim.
+    # Truncate to keep the message under TG's 4096 cap.
+    complaint = _extract_buyer_complaint(claim)
+    if complaint:
+        clip = complaint[:600].rstrip()
+        if len(complaint) > 600:
+            clip += "…"
+        lines.append("")
+        lines.append("💬 *Motivo do comprador:*")
+        lines.append(_esc(clip))
+
+    lines.append("")
     if needs_review:
-        lines.append("")
-        lines.append("_O comprador devolveu o produto\\. Inspecione e decida\\: reembolsar, trocar ou contestar\\._")
+        lines.append("_Devolução em mãos\\. Decida\\: aceitar reembolso ou contestar\\._")
     else:
-        lines.append("")
-        lines.append("_Escolha uma solução para o comprador antes do prazo expirar\\._")
+        lines.append("_Escolha uma solução abaixo antes do prazo expirar\\._")
     return "\n".join(lines)
 
 
 def _build_keyboard(claim_id: int, app_base_url: str) -> dict[str, Any]:
-    """Inline keyboard. For now: deep-links to our app + ML. Action buttons
-    via callback_query can be added later — they need a webhook handler in
-    the Next.js TG webhook route to call /api/escalar/claims/{id}/resolution.
+    """Inline keyboard with one-click resolution actions.
+
+    callback_data prefixes (handled by the Next.js telegram-webhook route):
+      cl_rf:{id}  → refund (full)
+      cl_rt:{id}  → return_product (accept return; buyer ships back)
+      cl_ex:{id}  → change_product (exchange / accept return for replacement)
+      cl_pa:{id}  → partial-refund — opens the app (needs amount input)
+
+    Both "Atender no app" and "Ver no ML" stay as URL fallbacks for the
+    cases the seller wants to handle in a richer UI (orientation, evidences,
+    custom percentage).
     """
     app_link = f"{app_base_url.rstrip('/')}/escalar/claims"
     ml_link = f"https://myaccount.mercadolivre.com.br/post-purchase/cases/{claim_id}"
     return {
         "inline_keyboard": [
+            [
+                {"text": "💵 Reembolsar", "callback_data": f"cl_rf:{claim_id}"},
+                {"text": "↩️ Aceitar devolução", "callback_data": f"cl_rt:{claim_id}"},
+            ],
+            [
+                {"text": "🔄 Trocar", "callback_data": f"cl_ex:{claim_id}"},
+                {"text": "💸 Reembolso parcial", "callback_data": f"cl_pa:{claim_id}"},
+            ],
             [
                 {"text": "⚡ Atender no app", "url": app_link},
                 {"text": "🔗 Ver no ML", "url": ml_link},
