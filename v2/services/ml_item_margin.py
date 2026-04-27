@@ -371,7 +371,17 @@ def _build_item_payload(
     ml_fee_per_unit = ml_fees / units if units > 0 else 0.0
     fulfillment_per_sale = fulfillment / total_units if total_units > 0 else 0.0
     armaz_per_unit = armazenagem / total_units if total_units > 0 else 0.0
-    das_rate = das / total_revenue if total_revenue > 0 else 0.045
+    # DAS rate must come from tax_info.effective_pct (already considers RBT12
+    # bracket + Anexo I/II/III). Dividing total DAS by revenue_net would
+    # over-state the rate by ~1.5x because net excludes tarifa_venda /
+    # cancelamentos while DAS is computed on bruto.
+    tax_info = getattr(pnl, "tax_info", None) or {}
+    das_effective_pct = tax_info.get("effective_pct")
+    if das_effective_pct is not None:
+        das_rate = float(das_effective_pct) / 100.0
+    else:
+        revenue_gross = float(getattr(pnl, "revenue_gross", 0) or 0)
+        das_rate = (das / revenue_gross) if revenue_gross > 0 else 0.045
     das_per_unit = avg_price * das_rate
     cogs_per_unit = float(unit_cost) if unit_cost is not None else None
 
