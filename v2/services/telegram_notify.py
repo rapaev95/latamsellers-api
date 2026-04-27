@@ -369,6 +369,30 @@ async def send_notice(
             actions_block = []
     if not isinstance(actions_block, list):
         actions_block = []
+    if topic in ("public_offers", "public_candidates"):
+        # Webhook events for promo invitations/offers — surface the link to
+        # /escalar/promotions where seller sees details and accepts. We can't
+        # produce accept/reject buttons here because ML's webhook payload
+        # carries an internal id (OFFER-... / CANDIDATE-...) that isn't the
+        # `promotion_id` the seller-promotions API expects.
+        details_label = {
+            "ru": "🔍 Открыть в приложении",
+            "en": "🔍 Open in app",
+            "pt": "🔍 Abrir no app",
+        }.get(language, "🔍 Abrir no app")
+        # Try to dig the MLB id out of either notice_id or actions[].url so the
+        # deeplink lands on the right item filter.
+        nid = str(notice.get("notice_id") or "")
+        import re as _re
+        m = _re.search(r"MLB\d+", nid)
+        item_id = m.group(0) if m else ""
+        url = "https://app.lsprofit.app/escalar/promotions"
+        if item_id:
+            url += f"?item_id={item_id}"
+        payload["reply_markup"] = {
+            "inline_keyboard": [[{"text": details_label, "url": url}]],
+        }
+
     if topic == "promotions":
         # Promotion id encoded in raw block; item_id was injected at normalize
         # time. callback_data is `pa:` (accept) / `pr:` (reject) — handler

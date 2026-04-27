@@ -199,6 +199,50 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
             "actions": [{"label": "Abrir no ML", "url": permalink}] if permalink else [],
         }
 
+    if topic in ("public_offers", "public_candidates"):
+        # ML emits these topics for promotion invitations / active offers.
+        # Resource id format: "{TYPE}-{MLB_ID}-{NUMERIC_ID}"
+        #   public_offers:     "OFFER-MLB6143708560-12805121122"
+        #   public_candidates: "CANDIDATE-MLB6143760498-75745703624"
+        # Extract MLB to surface a useful label and link to /escalar/promotions
+        # so the seller can act. The numeric tail is ML's internal offer/candidate
+        # id and isn't directly usable as `promotion_id` in seller-promotions API
+        # — that one comes from /seller-promotions/items/{mlb}, which the cache
+        # service refreshes asynchronously.
+        item_id = ""
+        m = re.search(r"MLB\d+", str(rid))
+        if m:
+            item_id = m.group(0).upper()
+
+        is_candidate = topic == "public_candidates"
+        if is_candidate:
+            label = "Você foi convidado para uma promoção"
+            tag = "CANDIDATE"
+        else:
+            label = "Nova oferta de promoção disponível"
+            tag = "OFFER"
+
+        desc_lines: list[str] = []
+        if item_id:
+            desc_lines.append(f"Item: {item_id}")
+        desc_lines.append("Toque em \"Detalhes\" para ver desconto e aceitar.")
+
+        item_url = (
+            f"https://produto.mercadolivre.com.br/MLB-{item_id[3:]}" if item_id else ""
+        )
+        actions: list[dict] = []
+        if item_url:
+            actions.append({"label": "Abrir item", "url": item_url})
+
+        return {
+            **base,
+            "label": label,
+            "description": "\n".join(desc_lines),
+            "from_date": enriched.get("date_created") or enriched.get("created_at"),
+            "tags": [t for t in ["PROMOTIONS", tag] if t],
+            "actions": actions,
+        }
+
     if topic == "promotions":
         # Enriched payload here is the raw offer dict from
         # /seller-promotions/items/{mlb}?app_version=v2 plus item_id and
