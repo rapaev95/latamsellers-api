@@ -728,8 +728,8 @@ async def claim_attachments_probe(
     pool=Depends(get_pool),
 ):
     """Probe ML for buyer-uploaded photos/evidences attached to a claim.
-    Tries several documented + likely paths so we know which one returns
-    media URLs we can ship to TG via sendPhoto.
+    Tries several documented + likely paths plus inspects messages and
+    returns for embedded attachments.
     """
     if pool is None:
         return {"error": "no_db"}
@@ -740,23 +740,93 @@ async def claim_attachments_probe(
 
     base = "https://api.mercadolibre.com"
     headers = {"Authorization": f"Bearer {token}"}
-    candidates = [
-        ("v1_attachments", f"{base}/post-purchase/v1/claims/{claim_id}/attachments"),
-        ("v2_attachments", f"{base}/post-purchase/v2/claims/{claim_id}/attachments"),
-        ("v1_evidences", f"{base}/post-purchase/v1/claims/{claim_id}/evidences"),
-        ("v1_files", f"{base}/post-purchase/v1/claims/{claim_id}/files"),
-        ("v1_media", f"{base}/post-purchase/v1/claims/{claim_id}/media"),
-        ("v2_returns_evidences", f"{base}/post-purchase/v2/claims/{claim_id}/returns/reviews"),
-    ]
-    results = []
+
+    out: dict = {"claim_id": claim_id}
     async with httpx.AsyncClient() as http:
+        # Direct attachment-style endpoints
+        endpoint_results = []
+        candidates = [
+            ("v1_evidences_with_role", f"{base}/post-purchase/v1/claims/{claim_id}/evidences?role=complainant"),
+            ("v1_evidences_with_player", f"{base}/post-purchase/v1/claims/{claim_id}/evidences?player_role=complainant"),
+            ("v2_evidences", f"{base}/post-purchase/v2/claims/{claim_id}/evidences"),
+            ("v1_messages_attachments", f"{base}/post-purchase/v1/claims/{claim_id}/messages/attachments"),
+        ]
         for label, url in candidates:
             try:
                 r = await http.get(url, headers=headers, timeout=15.0)
-                results.append({"label": label, "url": url, "status": r.status_code, "body_preview": r.text[:600]})
+                endpoint_results.append({
+                    "label": label, "status": r.status_code, "body_preview": r.text[:500],
+                })
             except Exception as err:  # noqa: BLE001
-                results.append({"label": label, "url": url, "error": str(err)})
-    return {"claim_id": claim_id, "results": results}
+                endpoint_results.append({"label": label, "error": str(err)})
+        out["endpoints"] = endpoint_results
+
+        # Full message thread — inspect each message for embedded attachments[]
+        try:
+            r = await http.get(
+                f"{base}/post-purchase/v1/claims/{claim_id}/messages",
+                headers=headers, timeout=15.0,
+            )
+            if r.status_code == 200:
+                try:
+                    msgs = r.json()
+                    if isinstance(msgs, dict):
+                        msgs = msgs.get("messages") or []
+                    out["messages_full"] = msgs[:5]  # first 5 with all fields
+                    # Extract attachment-like keys from each message
+                    seen_keys: set[str] = set()
+                    for m in (msgs or [])[:10]:
+                        if isinstance(m, dict):
+                            for k in m.keys():
+                                if "attach" in k.lower() or "evidenc" in k.lower() or "media" in k.lower() or "file" in k.lower() or "photo" in k.lower() or "image" in k.lower():
+                                    seen_keys.add(k)
+                    out["messages_attachment_keys"] = sorted(seen_keys)
+                except Exception as err:  # noqa: BLE001
+                    out["messages_parse_error"] = str(err)
+            else:
+                out["messages_status"] = r.status_code
+        except Exception as err:  # noqa: BLE001
+            out["messages_error"] = str(err)
+
+        # Return record (if any) — buyer evidences often live there
+        try:
+            r = await http.get(
+                f"{base}/post-purchase/v2/claims/{claim_id}/returns",
+                headers=headers, timeout=15.0,
+            )
+            if r.status_code == 200:
+                rd = r.json()
+                returns = rd.get("data") if isinstance(rd, dict) and isinstance(rd.get("data"), list) else (rd if isinstance(rd, list) else [rd] if rd else [])
+                ret_summaries = []
+                for ret in (returns or [])[:3]:
+                    if not isinstance(ret, dict):
+                        continue
+                    ret_id = ret.get("id")
+                    ret_summaries.append({
+                        "id": ret_id,
+                        "status": ret.get("status"),
+                        "keys": sorted(list(ret.keys())) if isinstance(ret, dict) else [],
+                    })
+                    # Probe per-return endpoints
+                    if ret_id:
+                        for label, sub_url in [
+                            ("return_evidences", f"{base}/post-purchase/v1/returns/{ret_id}/evidences"),
+                            ("return_attachments", f"{base}/post-purchase/v1/returns/{ret_id}/attachments"),
+                            ("return_full", f"{base}/post-purchase/v1/returns/{ret_id}"),
+                        ]:
+                            try:
+                                sr = await http.get(sub_url, headers=headers, timeout=15.0)
+                                ret_summaries[-1][label] = {
+                                    "status": sr.status_code,
+                                    "body_preview": sr.text[:400],
+                                }
+                            except Exception as err:  # noqa: BLE001
+                                ret_summaries[-1][label] = {"error": str(err)}
+                out["returns"] = ret_summaries
+        except Exception as err:  # noqa: BLE001
+            out["returns_error"] = str(err)
+
+    return out
 
 
 @router.post("/user-claims/resend-tg")
