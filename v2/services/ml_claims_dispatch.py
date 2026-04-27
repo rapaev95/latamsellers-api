@@ -45,31 +45,57 @@ TG_BATCH_CAP = 10  # max claims per user per tick
 TG_THROTTLE = 1.1  # 1 sec between TG sends per chat
 
 
-SUMMARY_SYSTEM_PROMPT_RU = """Ты — ассистент продавца Mercado Livre. Твоя задача — кратко и тезисно объяснить продавцу суть рекламации покупателя.
+SUMMARY_SYSTEM_PROMPT_RU = """Ты — ассистент продавца Mercado Livre. Твоя задача — кратко и тезисно объяснить суть рекламации + дать бизнес-анализ опций.
 
-ПРАВИЛА:
-1. Перевод на русский, но НЕ дословный — выдели только важное.
-2. Формат: 2-4 коротких тезиса, каждый с новой строки, начинается с «• ».
-3. Что включать:
-   • Что не так с товаром (брак, не соответствует описанию, не работает и т.д.)
-   • Что покупатель уже сделал/сообщил (прислал фото, попробовал инструкции и т.д.)
-   • Какое решение предлагает ML или просит покупатель (если упомянуто)
-4. НЕ цитируй покупателя дословно. НЕ пиши «покупатель пишет что...». Сразу к сути.
-5. Без преамбулы, без заголовка, без «Тезисно:» — только сами тезисы.
-6. Максимум 350 символов всего."""
+ВЫХОД (строго в этом формате, без преамбулы и заголовков):
 
-SUMMARY_SYSTEM_PROMPT_EN = """You are a Mercado Livre seller's assistant. Summarize the buyer's claim message into bullet points so the seller can triage instantly.
+СУТЬ:
+• [Что не так с товаром — 1 строка]
+• [Что покупатель уже сделал/прислал — 1 строка]
+• [Что просит покупатель / что предлагает ML — 1 строка]
 
-RULES:
-1. Translate to English, but NOT literally — keep only what matters.
-2. Format: 2-4 short bullets, each on its own line, starting with "• ".
-3. Include:
-   • What is wrong with the product (defect, mismatch, doesn't work, etc.)
-   • What the buyer has already done/reported (sent photos, tried instructions, etc.)
-   • What resolution the ML mediator or buyer is suggesting (if mentioned)
-4. Don't quote the buyer verbatim. No "The buyer says...". Get to the point.
-5. No preamble, no headers, no "Summary:" — just the bullets.
-6. Max 350 characters total."""
+АНАЛИЗ:
+• Devolução: [плюсы/минусы и приблиз. стоимость]
+• Troca: [плюсы/минусы]
+• Reembolso parcial: [когда выгодно]
+• Orientação: [когда подходит]
+
+ПРИНЦИПЫ ДЛЯ АНАЛИЗА:
+- Devolução = товар возвращается продавцу, выбывает из оборота. Стоимость — этикетка возврата.
+- Troca = клиент получает новый товар, старый возвращается. Стоимость — этикетка возврата + новая отправка обычно бесплатно.
+- Reembolso parcial = экономит этикетку и шиппинг, но нужно согласие покупателя. Хорошо при мелких претензиях.
+- Orientação = 0₽ если решает, иначе всё равно дойдёт до возврата. Пробовать только если претензия лечится инструкцией.
+
+ВАЖНО:
+- Извлеки из текста медиатора стоимость возврата (часто пишет "R$11.36" или похожее) и используй её.
+- НЕ цитируй медиатора дословно. На русском, по делу.
+- Максимум 700 символов всего."""
+
+SUMMARY_SYSTEM_PROMPT_EN = """You are a Mercado Livre seller's assistant. Output two sections.
+
+OUTPUT FORMAT (no preamble, no headers other than these):
+
+CASE:
+• [What's wrong with the product — 1 line]
+• [What the buyer already did/sent — 1 line]
+• [What buyer wants / what ML suggests — 1 line]
+
+ANALYSIS:
+• Devolução: [pros/cons + approx. cost]
+• Troca: [pros/cons]
+• Reembolso parcial: [when it pays off]
+• Orientação: [when to try]
+
+ANALYSIS PRINCIPLES:
+- Devolução = product comes back to seller (loses inventory). Cost = return label.
+- Troca = buyer gets new item, old one returns. Cost = return label + new shipment usually free.
+- Reembolso parcial = saves return label & shipping but needs buyer's agreement. Good for minor issues.
+- Orientação = 0 cost if it works, otherwise still ends in return.
+
+IMPORTANT:
+- Extract the return label cost from mediator text (often R$X.XX) and use it.
+- Don't quote the mediator verbatim. English, to the point.
+- Max 700 chars total."""
 
 # MarkdownV2 escape per Telegram spec
 _MD_ESCAPE = str.maketrans({c: f"\\{c}" for c in r"_*[]()~`>#+-=|{}.!"})
@@ -188,6 +214,56 @@ def _extract_buyer_complaint(claim: dict[str, Any]) -> Optional[str]:
         return None
     candidates.sort(key=lambda x: x[0])  # mediator first
     return candidates[0][1]
+
+
+def _extract_reputation_impact(claim: dict[str, Any]) -> Optional[bool]:
+    """Best-effort search for ML's "Afeta sua reputação" flag.
+
+    ML's UI shows it as a badge on each claim card. The data location
+    isn't documented — we walk several plausible paths and tags. Returns
+    True (affects), False (doesn't), or None (unknown).
+    """
+    # Direct boolean fields, in priority order
+    candidate_paths: list[tuple[str, ...]] = [
+        ("affects_reputation",),
+        ("reputation_impact",),
+        ("flags", "affects_reputation"),
+        ("mediation", "affects_reputation"),
+        ("mediation", "reputation_impact"),
+        ("mediation", "affects_seller_reputation"),
+        ("metadata", "reputation_impact"),
+        ("mediation", "metadata", "reputation_impact"),
+    ]
+    for path in candidate_paths:
+        v: Any = claim
+        for key in path:
+            if isinstance(v, dict):
+                v = v.get(key)
+            else:
+                v = None
+                break
+        if isinstance(v, bool):
+            return v
+
+    # Tags array — common ML pattern. Check NEGATIVE patterns FIRST since
+    # "nao_afeta_reputacao" contains "afeta_reputacao" as substring.
+    for tags_path in (("tags",), ("mediation", "tags"), ("flags",)):
+        v = claim
+        for key in tags_path:
+            if isinstance(v, dict):
+                v = v.get(key)
+            else:
+                v = None
+                break
+        if isinstance(v, list):
+            for t in v:
+                tl = str(t).lower()
+                if "nao_afeta" in tl or "não_afeta" in tl or "does_not_affect" in tl or "no_reputation" in tl or "not_affected" in tl:
+                    return False
+                if "afeta_reputacao" in tl or "afeta_reputação" in tl or "affects_reputation" in tl or "reputation_affected" in tl:
+                    return True
+
+    return None
 
 
 def _detect_recommended_action(claim: dict[str, Any]) -> Optional[str]:
@@ -406,6 +482,8 @@ async def _summarize_complaint(
     http: httpx.AsyncClient,
     complaint: str,
     target_lang: str = "ru",
+    product_price: Optional[float] = None,
+    product_currency: str = "BRL",
 ) -> Optional[str]:
     """Use OpenRouter (same model as ml_questions_dispatch) to produce a 2-4
     bullet summary of the buyer's claim message in the seller's language.
@@ -426,6 +504,15 @@ async def _summarize_complaint(
     else:
         system_prompt = SUMMARY_SYSTEM_PROMPT_RU
 
+    # Prepend product context so GPT can reason about cost-vs-benefit.
+    # Mediator message often quotes return-label cost (R$11.36 etc) — we
+    # don't need to inject that, the model picks it up from the text itself.
+    price_block = ""
+    if product_price is not None and product_price > 0:
+        price_block = f"ЦЕНА ТОВАРА: {product_price:.2f} {product_currency}\n\n"
+
+    user_content = price_block + complaint[:3000]
+
     try:
         r = await http.post(
             OPENROUTER_URL,
@@ -437,13 +524,13 @@ async def _summarize_complaint(
             },
             json={
                 "model": LLM_MODEL,
-                "max_tokens": 250,
+                "max_tokens": 500,
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": complaint[:3000]},
+                    {"role": "user", "content": user_content},
                 ],
             },
-            timeout=15.0,
+            timeout=20.0,
         )
         if r.status_code != 200:
             log.warning("OpenRouter summary %s: %s", r.status_code, r.text[:200])
@@ -513,6 +600,23 @@ def _build_claim_card(
     nickname = buyer_block.get("nickname") if isinstance(buyer_block, dict) else None
     if nickname:
         lines.append(f"👤 @{_esc(nickname)}")
+
+    # Reputation impact badge — best-effort across several ML payload shapes.
+    rep = _extract_reputation_impact(claim)
+    if rep is True:
+        if summary_lang == "ru":
+            lines.append("🔥 *Влияет на репутацию*")
+        elif summary_lang == "en":
+            lines.append("🔥 *Affects reputation*")
+        else:
+            lines.append("🔥 *Afeta sua reputação*")
+    elif rep is False:
+        if summary_lang == "ru":
+            lines.append("⚪ _Не влияет на репутацию_")
+        elif summary_lang == "en":
+            lines.append("⚪ _Doesn't affect reputation_")
+        else:
+            lines.append("⚪ _Não afeta a reputação_")
 
     if ret_summary:
         lines.append(f"↩️ *Devolução:* `{_esc_code(ret_summary)}`")
@@ -749,16 +853,35 @@ async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int, app_base_url: str
             # Generate (or reuse cached) bullet summary in the seller's
             # language. Skip for pt — sellers comfortable with pt-BR see the
             # original mediator/buyer text, no AI roundtrip needed.
+            #
+            # Cache key includes prompt version (v2 = with business analysis).
+            # Bumping the version invalidates old cached summaries so the new
+            # prompt re-runs once per claim.
             summary: Optional[str] = None
+            SUMMARY_PROMPT_VERSION = "v2-analysis"
             if summary_lang in ("ru", "en"):
                 cached = row["tg_summary"]
                 cached_lang = row["tg_summary_lang"]
-                if cached and cached_lang == summary_lang:
+                # Tag cached lang as e.g. "ru:v2-analysis" — matches only when
+                # both lang and prompt version line up.
+                expected_tag = f"{summary_lang}:{SUMMARY_PROMPT_VERSION}"
+                if cached and cached_lang == expected_tag:
                     summary = cached
                 else:
                     complaint = _extract_buyer_complaint(enriched)
                     if complaint:
-                        summary = await _summarize_complaint(http, complaint, summary_lang)
+                        # Pull product price from enriched order_item for
+                        # cost-vs-benefit analysis in the prompt.
+                        oi = enriched.get("order_item") or {}
+                        price = oi.get("unit_price") if isinstance(oi, dict) else None
+                        try:
+                            price_f = float(price) if price is not None else None
+                        except (TypeError, ValueError):
+                            price_f = None
+                        summary = await _summarize_complaint(
+                            http, complaint, summary_lang,
+                            product_price=price_f,
+                        )
                         if summary:
                             async with pool.acquire() as conn:
                                 await conn.execute(
@@ -768,7 +891,7 @@ async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int, app_base_url: str
                                            tg_summary_lang = $2
                                      WHERE user_id = $3 AND claim_id = $4
                                     """,
-                                    summary, summary_lang, user_id, cid,
+                                    summary, expected_tag, user_id, cid,
                                 )
 
             msg_id = await _send_claim(
