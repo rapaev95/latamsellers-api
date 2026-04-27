@@ -528,6 +528,67 @@ async def refresh_user_questions(
     return await ml_user_questions_svc.refresh_user_questions(pool, user.id)
 
 
+@router.get("/user-questions/response-stats")
+async def get_response_stats(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Time-to-respond metrics computed from local ml_user_questions cache.
+
+    No ML API call — purely SQL aggregation. ML's reputation system weights
+    response speed; sellers need to know their current SLA at a glance.
+    Returns:
+      medianHours / avgHours over the last 30 days of answered questions,
+      pending counts overdue 12h / 24h (drag down the rank).
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    await ml_user_questions_svc.ensure_schema(pool)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            WITH answered AS (
+                SELECT EXTRACT(EPOCH FROM (answer_date - date_created)) / 3600.0 AS hours
+                  FROM ml_user_questions
+                 WHERE user_id = $1
+                   AND status = 'ANSWERED'
+                   AND answer_date IS NOT NULL
+                   AND date_created IS NOT NULL
+                   AND date_created > NOW() - INTERVAL '30 days'
+            ),
+            pending AS (
+                SELECT
+                    COUNT(*) FILTER (WHERE NOW() - date_created > INTERVAL '12 hours') AS overdue_12h,
+                    COUNT(*) FILTER (WHERE NOW() - date_created > INTERVAL '24 hours') AS overdue_24h,
+                    COUNT(*) AS pending_total
+                  FROM ml_user_questions
+                 WHERE user_id = $1
+                   AND status = 'UNANSWERED'
+            )
+            SELECT
+                (SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY hours) FROM answered) AS median_hours,
+                (SELECT AVG(hours) FROM answered) AS avg_hours,
+                (SELECT COUNT(*) FROM answered) AS answered_30d,
+                p.overdue_12h, p.overdue_24h, p.pending_total
+            FROM pending p
+            """,
+            user.id,
+        )
+    if not row:
+        return {
+            "medianHours": None, "avgHours": None,
+            "answered30d": 0, "overdue12h": 0, "overdue24h": 0, "pendingTotal": 0,
+        }
+    return {
+        "medianHours": float(row["median_hours"]) if row["median_hours"] is not None else None,
+        "avgHours": float(row["avg_hours"]) if row["avg_hours"] is not None else None,
+        "answered30d": int(row["answered_30d"] or 0),
+        "overdue12h": int(row["overdue_12h"] or 0),
+        "overdue24h": int(row["overdue_24h"] or 0),
+        "pendingTotal": int(row["pending_total"] or 0),
+    }
+
+
 class _AnswerIn(__import__("pydantic").BaseModel):
     questionId: int
     text: str
