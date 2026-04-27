@@ -768,16 +768,28 @@ async def returns_probe(
         candidates.append(("seller_returns_search", f"{base}/post-purchase/v1/returns/search?seller={ml_user_id}&limit=5"))
 
     if order_id:
-        # Most informative: target the specific order shown in the seller's
-        # ML "Devoluções" view. If any of these 200, we have our hook.
+        # Most informative: target the specific number shown in the seller's
+        # ML "Devoluções" view. Prior probe revealed it's NOT an order_id
+        # (404 on /orders/{id}), so we now try several interpretations:
+        # claim_id, return_id, pack_id, etc.
         candidates.append(("order_full", f"{base}/orders/{order_id}"))
-        candidates.append(("order_returns", f"{base}/orders/{order_id}/returns"))
-        candidates.append(("post_purchase_order", f"{base}/post-purchase/v1/orders/{order_id}"))
-        candidates.append(("claims_by_order_resource", f"{base}/post-purchase/v1/claims/search?resource_id={order_id}"))
+        candidates.append(("packs_full", f"{base}/packs/{order_id}"))
+        candidates.append(("claim_direct", f"{base}/post-purchase/v1/claims/{order_id}"))
+        candidates.append(("return_direct", f"{base}/post-purchase/v1/returns/{order_id}"))
+        candidates.append(("v2_return_direct", f"{base}/post-purchase/v2/returns/{order_id}"))
+        candidates.append(("claims_by_pack", f"{base}/post-purchase/v1/claims/search?resource=pack&resource_id={order_id}"))
+        candidates.append(("claims_by_shipping", f"{base}/post-purchase/v1/claims/search?resource=shipping&resource_id={order_id}"))
         candidates.append(("claims_by_resource_pair", f"{base}/post-purchase/v1/claims/search?resource=order&resource_id={order_id}"))
-        candidates.append(("v1_returns_for_order", f"{base}/post-purchase/v1/returns?order_id={order_id}"))
-        candidates.append(("v1_returns_search_by_order", f"{base}/post-purchase/v1/returns/search?order_id={order_id}"))
-        candidates.append(("v2_returns_for_order", f"{base}/post-purchase/v2/orders/{order_id}/returns"))
+        # Player-role search — covers all claims where seller is involved,
+        # filtered by the order_id-as-resource. Returns ALL claim types if
+        # the resource_id matches anything ML knows about.
+        if ml_user_id:
+            candidates.append(("claims_by_player_seller", f"{base}/post-purchase/v1/claims/search?player_role=respondent&player_user_id={ml_user_id}&resource_id={order_id}"))
+        # If the number is a shipment_id, this may surface it
+        candidates.append(("shipments_full", f"{base}/shipments/{order_id}"))
+        # Order search by external id (long shot)
+        if ml_user_id:
+            candidates.append(("orders_search_by_q", f"{base}/orders/search?seller={ml_user_id}&q={order_id}"))
 
     results = []
     async with httpx.AsyncClient() as http:
@@ -827,12 +839,26 @@ async def messages_probe(
 
     headers = {"Authorization": f"Bearer {token}"}
     base = "https://api.mercadolibre.com"
+    # First-pass probe returned 404 on all 5 — same pattern as returns probe
+    # where the UI-visible "#venda" number isn't an order_id. Now we try
+    # interpreting it as pack_id (FULL orders wrap into packs), as well as
+    # the /option/{role} variants ML's docs mention.
     candidates = [
-        ("messages_packs_seller", f"{base}/messages/packs/{order_id}/sellers/{ml_user_id}"),
+        # Pack-scoped (most likely for FULL — id is probably pack_id)
+        ("messages_pack_seller_buyer", f"{base}/messages/packs/{order_id}/sellers/{ml_user_id}/option/seller_buyer"),
+        ("messages_pack_seller", f"{base}/messages/packs/{order_id}/sellers/{ml_user_id}"),
+        ("messages_pack_only", f"{base}/messages/packs/{order_id}"),
+        # Order-scoped legacy
         ("messages_orders_seller", f"{base}/messages/orders/{order_id}/sellers/{ml_user_id}"),
         ("messages_orders_legacy", f"{base}/messaging/orders/{order_id}/messages"),
         ("orders_messages", f"{base}/sites/MLB/orders/{order_id}/messages"),
+        # Cross-resource — list all messages for seller
+        ("seller_messages", f"{base}/messages/sellers/{ml_user_id}"),
+        ("seller_messages_unread", f"{base}/messages/sellers/{ml_user_id}?status=unread"),
+        # Post-purchase
         ("post_purchase_messages", f"{base}/post-purchase/v1/orders/{order_id}/messages"),
+        # Direct message resource (long shot)
+        ("message_direct", f"{base}/messages/{order_id}"),
     ]
 
     results = []
