@@ -53,6 +53,7 @@ def _metrics_from_raw(raw: Optional[dict], cls) -> "CampaignMetrics | AdMetrics"
 def _to_campaign(row: dict) -> AdCampaign:
     return AdCampaign(
         id=int(row["campaign_id"]),
+        product_id=row.get("product_id") or "PADS",
         name=row.get("name"),
         status=row.get("status"),
         strategy=row.get("strategy"),
@@ -63,6 +64,16 @@ def _to_campaign(row: dict) -> AdCampaign:
         advertiser_id=int(row["advertiser_id"]),
         date_created=_iso(row.get("date_created")),
         last_updated=_iso(row.get("last_updated")),
+        start_date=_iso(row.get("start_date")),
+        end_date=_iso(row.get("end_date")),
+        campaign_type=row.get("campaign_type"),
+        goal=row.get("goal"),
+        site_id=row.get("site_id"),
+        headline=row.get("headline"),
+        cpc=float(row["cpc"]) if row.get("cpc") is not None else None,
+        currency=row.get("currency"),
+        official_store_id=int(row["official_store_id"]) if row.get("official_store_id") is not None else None,
+        destination_id=int(row["destination_id"]) if row.get("destination_id") is not None else None,
         metrics=_metrics_from_raw(row.get("metrics"), CampaignMetrics),
         metrics_date_from=row["metrics_date_from"].isoformat() if row.get("metrics_date_from") else None,
         metrics_date_to=row["metrics_date_to"].isoformat() if row.get("metrics_date_to") else None,
@@ -108,28 +119,39 @@ def _handle_ml_error(err: ml_ads.MLAdsError) -> None:
 
 @router.get("/advertisers", response_model=AdvertisersOut)
 async def get_advertisers(
+    product_type: str = Query("PADS", pattern="^(PADS|DISPLAY|BADS|ALL)$"),
     refresh: bool = Query(False),
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ):
-    """Return advertisers cached for this user. When empty (or ?refresh=1),
-    hits ML `/advertising/advertisers?product_id=PADS` synchronously."""
+    """Return advertisers for this user filtered by product type.
+
+    `product_type=PADS|DISPLAY|BADS` filters to a single ML product type.
+    `product_type=ALL` returns all rows. On cold cache or `?refresh=1`,
+    hits ML `/advertising/advertisers?product_id=...` synchronously and
+    populates the per-type rows (DISPLAY/BADS skip drill-down sync —
+    they only have advertisers + campaigns list endpoints today)."""
     if pool is None:
         raise HTTPException(status_code=503, detail="no_db")
 
-    cached = await ads_storage.list_advertisers(pool, user.id)
+    filter_pid = None if product_type == "ALL" else product_type
+
+    cached = await ads_storage.list_advertisers(pool, user.id, product_id=filter_pid)
     if cached and not refresh:
         return AdvertisersOut(advertisers=[Advertiser(**r) for r in cached])
 
     # Live fallback — also covers first-time connection.
     try:
-        await ml_ads.sync_user_advertisers(pool, user.id)
+        if product_type == "ALL":
+            await ml_ads.sync_user_advertisers_all_types(pool, user.id)
+        else:
+            await ml_ads.sync_user_advertisers(pool, user.id, product_id=product_type)
     except ml_oauth_svc.MLRefreshError as err:
         raise HTTPException(status_code=428, detail=f"ml_oauth_required: {err}")
     except ml_ads.MLAdsError as err:
         _handle_ml_error(err)
 
-    fresh = await ads_storage.list_advertisers(pool, user.id)
+    fresh = await ads_storage.list_advertisers(pool, user.id, product_id=filter_pid)
     return AdvertisersOut(advertisers=[Advertiser(**r) for r in fresh])
 
 
@@ -139,31 +161,48 @@ async def get_advertisers(
 async def get_campaigns(
     advertiser_id: int = Query(..., ge=1),
     site_id: str = Query(..., min_length=3, max_length=4),
+    product_type: str = Query("PADS", pattern="^(PADS|DISPLAY|BADS)$"),
     refresh: bool = Query(False),
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ):
-    """List campaigns + rolled-up metrics for the advertiser. Triggers a
-    sync if the cache is stale or empty."""
+    """List campaigns + rolled-up metrics for the advertiser, scoped to one
+    ML product type. Triggers a sync if the cache is stale or empty.
+
+    PADS goes through the legacy /product_ads/campaigns/search path; DISPLAY
+    uses /display/campaigns; BADS uses /brand_ads/campaigns."""
     if pool is None:
         raise HTTPException(status_code=503, detail="no_db")
 
-    synced_at = await ads_storage.campaign_staleness(pool, user.id, advertiser_id)
+    synced_at = await ads_storage.campaign_staleness(
+        pool, user.id, advertiser_id, product_id=product_type,
+    )
     should_sync = refresh or synced_at is None or _stale(synced_at)
 
     if should_sync:
         try:
-            await ml_ads_sync.ensure_fresh_for_advertiser(
-                pool, user.id, advertiser_id, site_id,
-                max_age_seconds=0 if refresh else ml_ads_sync.STALE_THRESHOLD_SECONDS,
-            )
+            if product_type == "PADS":
+                # PADS still uses the dedicated ensure_fresh helper which
+                # also pulls ads — preserves existing behaviour.
+                await ml_ads_sync.ensure_fresh_for_advertiser(
+                    pool, user.id, advertiser_id, site_id,
+                    max_age_seconds=0 if refresh else ml_ads_sync.STALE_THRESHOLD_SECONDS,
+                )
+            else:
+                await ml_ads.sync_advertiser_campaigns_dispatch(
+                    pool, user.id, advertiser_id, site_id, product_type,
+                )
         except ml_oauth_svc.MLRefreshError as err:
             raise HTTPException(status_code=428, detail=f"ml_oauth_required: {err}")
         except ml_ads.MLAdsError as err:
             _handle_ml_error(err)
 
-    rows = await ads_storage.list_campaigns(pool, user.id, advertiser_id)
-    fresh_synced_at = await ads_storage.campaign_staleness(pool, user.id, advertiser_id)
+    rows = await ads_storage.list_campaigns(
+        pool, user.id, advertiser_id, product_id=product_type,
+    )
+    fresh_synced_at = await ads_storage.campaign_staleness(
+        pool, user.id, advertiser_id, product_id=product_type,
+    )
     return CampaignsOut(
         campaigns=[_to_campaign(r) for r in rows],
         total=len(rows),

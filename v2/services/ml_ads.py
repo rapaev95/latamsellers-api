@@ -254,6 +254,101 @@ async def fetch_all_ads(
     return results
 
 
+# ── DISPLAY product family ────────────────────────────────────────────────
+# DISPLAY uses /advertising/advertisers/{id}/display/* (no site_id in path).
+# Reference: developers.mercadolibre.* /api-display
+# Different shape than PADS — campaigns don't ship metrics in the list, you
+# need a separate /metrics call per campaign per date range (max 90d).
+
+async def fetch_display_campaigns(
+    access_token: str,
+    advertiser_id: int,
+    *,
+    sort_by: str = "id",
+    sort_order: str = "desc",
+) -> list[dict]:
+    data = await _get(
+        access_token,
+        f"/advertising/advertisers/{advertiser_id}/display/campaigns",
+        params={"sort_by": sort_by, "sort_order": sort_order},
+    )
+    return list(data.get("results") or [])
+
+
+async def fetch_display_campaign_metrics(
+    access_token: str,
+    advertiser_id: int,
+    campaign_id: int,
+    date_from: date,
+    date_to: date,
+) -> dict:
+    """Returns {metrics: [{date, prints, clicks, ...}], summary: {...}}."""
+    data = await _get(
+        access_token,
+        f"/advertising/advertisers/{advertiser_id}/display/campaigns/{campaign_id}/metrics",
+        params={
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+        },
+    )
+    return data or {}
+
+
+# ── BADS (Brand Ads) family ───────────────────────────────────────────────
+# BADS uses /advertising/advertisers/{id}/brand_ads/* (no site_id in path).
+# Reference: developers.mercadolibre.* /api-brand-ads
+# Campaigns ship items+keywords in the list. Metrics in separate calls.
+
+async def fetch_bads_campaigns(access_token: str, advertiser_id: int) -> list[dict]:
+    data = await _get(
+        access_token,
+        f"/advertising/advertisers/{advertiser_id}/brand_ads/campaigns",
+    )
+    # BADS uses "campaigns" key; PADS used "results". Accept both for safety.
+    return list(data.get("campaigns") or data.get("results") or [])
+
+
+async def fetch_bads_campaign_metrics(
+    access_token: str,
+    advertiser_id: int,
+    campaign_id: int,
+    date_from: date,
+    date_to: date,
+    *,
+    aggregation_type: str = "daily",
+) -> dict:
+    """Returns {paging, metrics: [{date, prints, clicks, ...}], summary}."""
+    data = await _get(
+        access_token,
+        f"/advertising/advertisers/{advertiser_id}/brand_ads/campaigns/{campaign_id}/metrics",
+        params={
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "aggregation_type": aggregation_type,
+        },
+    )
+    return data or {}
+
+
+async def fetch_bads_advertiser_metrics_aggregate(
+    access_token: str,
+    advertiser_id: int,
+    date_from: date,
+    date_to: date,
+) -> dict:
+    """Aggregate metrics across all of one advertiser's BADS campaigns."""
+    data = await _get(
+        access_token,
+        f"/advertising/advertisers/{advertiser_id}/brand_ads/campaigns/metrics",
+        params={
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "aggregation_type": "daily",
+        },
+    )
+    return data or {}
+
+
 # ── Orchestration (sync to DB) ─────────────────────────────────────────────
 
 @dataclass
@@ -266,18 +361,38 @@ class SyncStats:
 
 async def sync_user_advertisers(
     pool: asyncpg.Pool, user_id: int,
+    product_id: str = "PADS",
 ) -> list[dict]:
+    """Sync advertisers for one product type (PADS / DISPLAY / BADS).
+    Returns the raw advertisers list. Caller may iterate all 3 product types
+    via sync_user_advertisers_all_types()."""
     bearer, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user_id)
     try:
-        advertisers = await fetch_advertisers(bearer, product_id="PADS")
+        advertisers = await fetch_advertisers(bearer, product_id=product_id)
     except MLAdsError as err:
-        # 404 "No permissions found for user_id" → user hasn't enabled Publicidade
+        # 404 "No permissions found for user_id" → user hasn't enabled this
+        # product type (or no Publicidade access at all). Treat as empty.
         if err.status == 404:
-            log.info(f"[ml-ads] user={user_id} has no PADS permission")
+            log.info(f"[ml-ads] user={user_id} has no {product_id} permission")
             return []
         raise
-    await ads_storage.upsert_advertisers(pool, user_id, advertisers)
+    await ads_storage.upsert_advertisers(pool, user_id, advertisers, product_id=product_id)
     return advertisers
+
+
+async def sync_user_advertisers_all_types(
+    pool: asyncpg.Pool, user_id: int,
+) -> dict[str, list[dict]]:
+    """Sync advertisers across all 3 ML product types.
+    Returns {product_id: [advertiser, ...]} for caller diagnostics."""
+    out: dict[str, list[dict]] = {}
+    for ptype in ("PADS", "DISPLAY", "BADS"):
+        try:
+            out[ptype] = await sync_user_advertisers(pool, user_id, product_id=ptype)
+        except (ml_oauth_svc.MLRefreshError, MLAdsError) as err:
+            log.warning(f"[ml-ads] user={user_id} {ptype} sync failed: {err}")
+            out[ptype] = []
+    return out
 
 
 async def sync_advertiser_campaigns(
@@ -321,6 +436,151 @@ async def sync_advertiser_campaigns(
     return SyncStats(campaigns=len(campaigns), daily_rows=daily_rows_total)
 
 
+def _flatten_summary_for_ui(summary: dict) -> dict:
+    """DISPLAY and BADS metrics nest several core fields inside event_time/
+    touch_point. Our existing Pydantic CampaignMetrics expects them at the
+    root (so the same UI row-renderer works for all 3 types). Flatten the
+    'event_time' branch (purchases attributed to the action date — closer
+    to PADS semantics) up to root-level keys our schema knows about."""
+    if not isinstance(summary, dict):
+        return {}
+    out = dict(summary)
+    src = summary.get("event_time")
+    if isinstance(src, dict):
+        # Common: roas, units_quantity, direct_amount.
+        for key in ("roas", "units_quantity", "direct_amount"):
+            if key in src and key not in out:
+                out[key] = src[key]
+        # DISPLAY uses direct_amount as revenue. Map to total_amount used by UI.
+        if "direct_amount" in src and "total_amount" not in out:
+            out["total_amount"] = src["direct_amount"]
+    # DISPLAY uses consumed_budget; PADS uses cost. Normalize to cost.
+    if "consumed_budget" in out and "cost" not in out:
+        out["cost"] = out["consumed_budget"]
+    return out
+
+
+async def sync_display_advertiser_campaigns(
+    pool: asyncpg.Pool,
+    user_id: int,
+    advertiser_id: int,
+    *,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+) -> SyncStats:
+    """Pull DISPLAY campaigns + per-day metrics for one advertiser, upsert.
+    DISPLAY metrics endpoint requires per-campaign date_from/date_to calls."""
+    bearer, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user_id)
+    dt_to = date.today()
+    dt_from = dt_to - timedelta(days=lookback_days)
+
+    campaigns = await fetch_display_campaigns(bearer, advertiser_id)
+    # Fetch + attach summary metrics so the campaigns table has something
+    # to display without a separate UI round-trip.
+    enriched: list[dict] = []
+    daily_rows_total = 0
+    for c in campaigns:
+        cid = c.get("id") or c.get("campaign_id")
+        if cid is None:
+            enriched.append(c)
+            continue
+        try:
+            metrics_data = await fetch_display_campaign_metrics(
+                bearer, advertiser_id, int(cid), dt_from, dt_to,
+            )
+        except MLAdsError as err:
+            log.warning(f"[ml-ads:DISPLAY] metrics fetch failed campaign={cid}: {err}")
+            metrics_data = {}
+        # Store summary on the campaign row (re-using the existing `metrics` JSONB column).
+        c2 = dict(c)
+        c2["metrics"] = _flatten_summary_for_ui(metrics_data.get("summary") or {})
+        enriched.append(c2)
+        # Per-day metrics — same daily table as PADS so the UI can re-use chart code.
+        daily = list((metrics_data or {}).get("metrics") or [])
+        if daily:
+            await ads_storage.upsert_daily_metrics(
+                pool, user_id, advertiser_id, int(cid), daily,
+            )
+            daily_rows_total += len(daily)
+
+    await ads_storage.upsert_campaign_snapshot(
+        pool, user_id, advertiser_id, enriched, dt_from, dt_to,
+        product_id="DISPLAY",
+    )
+    return SyncStats(campaigns=len(campaigns), daily_rows=daily_rows_total)
+
+
+async def sync_bads_advertiser_campaigns(
+    pool: asyncpg.Pool,
+    user_id: int,
+    advertiser_id: int,
+    *,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+) -> SyncStats:
+    """Pull BADS campaigns + per-campaign metrics for one advertiser."""
+    bearer, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user_id)
+    dt_to = date.today()
+    dt_from = dt_to - timedelta(days=lookback_days)
+
+    campaigns = await fetch_bads_campaigns(bearer, advertiser_id)
+    enriched: list[dict] = []
+    daily_rows_total = 0
+    for c in campaigns:
+        cid = c.get("campaign_id") or c.get("id")
+        if cid is None:
+            enriched.append(c)
+            continue
+        try:
+            metrics_data = await fetch_bads_campaign_metrics(
+                bearer, advertiser_id, int(cid), dt_from, dt_to,
+            )
+        except MLAdsError as err:
+            log.warning(f"[ml-ads:BADS] metrics fetch failed campaign={cid}: {err}")
+            metrics_data = {}
+        c2 = dict(c)
+        c2["metrics"] = _flatten_summary_for_ui(metrics_data.get("summary") or {})
+        enriched.append(c2)
+        daily = list((metrics_data or {}).get("metrics") or [])
+        if daily:
+            await ads_storage.upsert_daily_metrics(
+                pool, user_id, advertiser_id, int(cid), daily,
+            )
+            daily_rows_total += len(daily)
+
+    await ads_storage.upsert_campaign_snapshot(
+        pool, user_id, advertiser_id, enriched, dt_from, dt_to,
+        product_id="BADS",
+    )
+    return SyncStats(campaigns=len(campaigns), daily_rows=daily_rows_total)
+
+
+async def sync_advertiser_campaigns_dispatch(
+    pool: asyncpg.Pool,
+    user_id: int,
+    advertiser_id: int,
+    site_id: str,
+    product_id: str,
+    *,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+) -> SyncStats:
+    """Single entrypoint for the router — picks the right sync path per product."""
+    if product_id == "PADS":
+        # PADS already syncs ads alongside campaigns via the existing sync_advertiser_campaigns,
+        # but the standalone _ads call lives in the original sync_user_full flow. For
+        # cold-cache router calls (GET /campaigns) we just refresh PADS campaigns.
+        return await sync_advertiser_campaigns(
+            pool, user_id, advertiser_id, site_id, lookback_days=lookback_days,
+        )
+    if product_id == "DISPLAY":
+        return await sync_display_advertiser_campaigns(
+            pool, user_id, advertiser_id, lookback_days=lookback_days,
+        )
+    if product_id == "BADS":
+        return await sync_bads_advertiser_campaigns(
+            pool, user_id, advertiser_id, lookback_days=lookback_days,
+        )
+    raise ValueError(f"unknown_product_id: {product_id}")
+
+
 async def sync_advertiser_ads(
     pool: asyncpg.Pool,
     user_id: int,
@@ -344,19 +604,22 @@ async def sync_user_full(
     *,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
 ) -> SyncStats:
-    """Top-level sync entry — advertisers → campaigns+daily → ads."""
+    """Top-level sync entry. Discovers advertisers across all 3 product types
+    (PADS / DISPLAY / BADS) so the UI's product-type toggle has data.
+    Drill-down (campaigns/daily/ads) only runs for PADS — DISPLAY/BADS use
+    different URL patterns and are deferred to a per-type sync path."""
     stats = SyncStats()
     try:
-        advertisers = await sync_user_advertisers(pool, user_id)
+        advertisers_by_type = await sync_user_advertisers_all_types(pool, user_id)
     except ml_oauth_svc.MLRefreshError as err:
         log.info(f"[ml-ads] user={user_id} no valid ML token: {err}")
         return stats
-    except MLAdsError as err:
-        log.warning(f"[ml-ads] user={user_id} advertisers fetch failed: {err}")
-        return stats
-    stats.advertisers = len(advertisers)
 
-    for adv in advertisers:
+    pads_advertisers = advertisers_by_type.get("PADS", [])
+    stats.advertisers = sum(len(v) for v in advertisers_by_type.values())
+
+    # PADS-only drill-down — campaigns + ads from product_ads/* paths.
+    for adv in pads_advertisers:
         advertiser_id = int(adv["advertiser_id"])
         site_id = adv.get("site_id") or "MLB"
         try:

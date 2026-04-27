@@ -75,16 +75,31 @@ class AdMetrics(BaseModel):
 
 class AdCampaign(BaseModel):
     id: int
+    product_id: str = "PADS"          # PADS | DISPLAY | BADS
     name: Optional[str] = None
     status: Optional[str] = None
-    strategy: Optional[str] = None  # PROFITABILITY | INCREASE | VISIBILITY
+    strategy: Optional[str] = None    # PADS only — PROFITABILITY/INCREASE/VISIBILITY
     budget: Optional[float] = None
-    automatic_budget: Optional[bool] = None
-    roas_target: Optional[float] = None
+    automatic_budget: Optional[bool] = None  # PADS only
+    roas_target: Optional[float] = None      # PADS only
     channel: Optional[str] = None
     advertiser_id: int
     date_created: Optional[str] = None
     last_updated: Optional[str] = None
+    # Generic time window — DISPLAY (start_date/end_date) and BADS use these
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    # DISPLAY: type=GUARANTEED/PROGRAMMATIC, goal=awareness/consideration/...
+    # BADS: campaign_type=automatic|custom
+    campaign_type: Optional[str] = None
+    goal: Optional[str] = None
+    site_id: Optional[str] = None
+    # BADS-specific
+    headline: Optional[str] = None
+    cpc: Optional[float] = None
+    currency: Optional[str] = None
+    official_store_id: Optional[int] = None
+    destination_id: Optional[int] = None
     metrics: CampaignMetrics = CampaignMetrics()
     metrics_date_from: Optional[str] = None
     metrics_date_to: Optional[str] = None
