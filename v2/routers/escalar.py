@@ -2396,3 +2396,50 @@ async def get_anomalies(
         return {"error": "no_db", "anomalies": []}
     await listing_journey_svc.ensure_schema(pool)
     return {"anomalies": await listing_journey_svc.detect_anomalies(pool, user.id)}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Video concat — склейка нескольких Runway-клипов в одно длинное видео
+# для FB Reels (Runway даёт максимум 10с за раз; для 15-30с нужно 2-3
+# клипа склеить через ffmpeg на сервере).
+# ──────────────────────────────────────────────────────────────────────
+
+from pydantic import BaseModel as _CV_BM  # avoid clobbering top-level alias if any
+from fastapi import Response as _CV_Response
+
+
+class _ConcatVideosIn(_CV_BM):
+    video_urls: list[str]
+
+
+@router.post("/videos/concat")
+async def concat_videos_endpoint(
+    body: _ConcatVideosIn,
+    user: CurrentUser = Depends(current_user),
+):
+    """Скачать N видео по URL, склеить через ffmpeg, отдать MP4.
+
+    Body: {"video_urls": ["https://...mp4", "https://...mp4"]}
+    Returns: video/mp4 binary stream (Content-Disposition attachment).
+
+    Лимиты: max 5 URL, каждый <= 200MB. ffmpeg должен быть в системе
+    (ставится в Dockerfile). При несовпадении формата — fallback на
+    перекодирование через libx264 (медленнее но надёжнее).
+    """
+    from v2.services.video_concat import concat_videos, VideoConcatError
+
+    if not body.video_urls:
+        raise HTTPException(status_code=400, detail="video_urls required")
+    try:
+        mp4_bytes = await concat_videos(body.video_urls)
+    except VideoConcatError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+    except Exception as err:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"concat_exception: {err}") from err
+
+    filename = f"concat_user{user.id}_{len(body.video_urls)}clips.mp4"
+    return _CV_Response(
+        content=mp4_bytes,
+        media_type="video/mp4",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
