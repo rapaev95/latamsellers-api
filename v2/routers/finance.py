@@ -699,6 +699,108 @@ async def debug_pnl_gap(
     }
 
 
+@router.post("/pnl-gap-fix")
+async def fix_pnl_gap(
+    project: str = Query(..., description="Project ID кому привязать MLB, e.g. 'ARTHUR'"),
+    month: str = Query(..., description="Месяц YYYY-MM, e.g. '2026-03'"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """One-click фикс гэпа: берёт все NAO_CLASSIFICADO MLB для project+month
+    и добавляет их в mlb_fallback указанного проекта. Дальше vendas-rows с
+    этими MLB будут попадать в нужный проект.
+
+    Возвращает: количество добавленных MLB + те что уже были в fallback.
+    """
+    _bind_user(user)
+    from v2.legacy.reports import load_vendas_ml_report, parse_brl, invalidate_vendas_cache
+    from v2.legacy.config import (
+        load_projects, update_project, _invalidate_projects_cache,
+    )
+    import pandas as pd
+    import re
+
+    invalidate_vendas_cache(user.id)
+    vdf = load_vendas_ml_report()
+    if vdf is None:
+        return {"error": "vendas_ml не загружен"}
+
+    pt_months = {
+        "janeiro": "01", "fevereiro": "02", "março": "03", "marco": "03",
+        "abril": "04", "maio": "05", "junho": "06", "julho": "07",
+        "agosto": "08", "setembro": "09", "outubro": "10",
+        "novembro": "11", "dezembro": "12",
+    }
+
+    def _row_month(date_str: str) -> str:
+        s = (date_str or "").strip().lower()
+        if not s:
+            return ""
+        for pt, num in pt_months.items():
+            if pt in s:
+                yrs = re.findall(r"\b(20\d{2})\b", s)
+                if yrs:
+                    return f"{yrs[0]}-{num}"
+        return ""
+
+    if "Data da venda" not in vdf.columns or "__project" not in vdf.columns:
+        return {"error": "vendas DF без обязательных колонок"}
+
+    # Собираем все уникальные NAO_CLASSIFICADO MLB за месяц
+    naoclass_mlbs: set[str] = set()
+    for _, row in vdf.iterrows():
+        rm = _row_month(str(row.get("Data da venda", "")))
+        if rm != month:
+            continue
+        proj = str(row.get("__project", "") or "").strip()
+        if proj not in ("NAO_CLASSIFICADO", "", "nan"):
+            continue
+        mlb = str(row.get("# de anúncio", "") or "").strip()
+        if mlb and mlb.lower() != "nan":
+            naoclass_mlbs.add(mlb)
+
+    if not naoclass_mlbs:
+        return {
+            "added": 0, "already_present": 0, "added_mlbs": [],
+            "message": "Нет NAO_CLASSIFICADO MLB за этот период",
+        }
+
+    # Текущие mlb_fallback проекта
+    projects = load_projects()
+    pid = project.upper()
+    if pid not in projects:
+        return {"error": f"проект {pid} не найден"}
+    current = list(projects[pid].get("mlb_fallback") or [])
+    current_set = set(current)
+
+    new_mlbs = [m for m in naoclass_mlbs if m not in current_set]
+    already = [m for m in naoclass_mlbs if m in current_set]
+    merged = current + new_mlbs
+
+    ok = update_project(pid, {"mlb_fallback": merged})
+    if not ok:
+        return {"error": "update_project failed"}
+
+    _invalidate_projects_cache()
+    invalidate_vendas_cache(user.id)
+    # catalog-project-index тоже сбросим — get_project_by_sku его читает
+    try:
+        from v2.legacy.config import invalidate_catalog_project_index
+        invalidate_catalog_project_index()
+    except Exception:
+        pass
+
+    return {
+        "added": len(new_mlbs),
+        "already_present": len(already),
+        "added_mlbs": sorted(new_mlbs),
+        "already_present_mlbs": sorted(already),
+        "total_mlb_fallback_now": len(merged),
+        "project": pid,
+        "month": month,
+    }
+
+
 @router.get("/sku-mapping-debug")
 async def debug_sku_mapping(
     sku: str = Query(..., description="SKU для диагностики, e.g. 'A21191-1'"),
