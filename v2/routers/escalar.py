@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional, Union
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 
 from v2.deps import CurrentUser, current_user, get_pool
 from v2.legacy import db_storage as legacy_db
@@ -11,6 +11,7 @@ from v2.parsers import db_loader
 from v2.schemas.escalar import EscalarProductsOut, SnoozeIn, SnoozeOut
 from v2.services import (
     abc,
+    category_benchmarks as category_benchmarks_svc,
     ml_account_health as ml_account_health_svc,
     ml_backfill as ml_backfill_svc,
     ml_item_context as ml_item_context_svc,
@@ -602,7 +603,6 @@ async def answer_question(
 ):
     """Post answer to ML, then update the cached row so UI reflects the reply
     immediately — no need to wait for the next refresh cycle."""
-    from fastapi import HTTPException
     import logging
     log = logging.getLogger("escalar.answer")
     if pool is None:
@@ -1324,4 +1324,114 @@ async def full_operations_probe(
         },
         "body": body,
         "hint": "200 → API works, build full-operations cache. 403/404 → endpoint not for this account, document and skip.",
+    }
+
+
+# ─── Category benchmarks (XLSX uploads) ──────────────────────────────────────
+# ML provides three relevant manual XLSX exports — see v2/services/category_benchmarks.py.
+# We accept a single upload endpoint that auto-detects the file type by sheet
+# structure and routes to the appropriate parser.
+
+@router.post("/benchmarks/upload")
+async def upload_benchmark_file(
+    file: UploadFile = File(..., description="ML XLSX export (composição / mais_vendidos / desempenho)"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Accept ML's XLSX exports for category benchmarks. Auto-detects type from
+    filename + sheet structure, parses + stores, recomputes benchmarks for the user.
+    Returns counts of rows saved and the detected type so the UI can confirm."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    filename = file.filename or ""
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="empty_file")
+    if len(file_bytes) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail={"error": "file_too_large", "max_mb": 25})
+
+    await category_benchmarks_svc.ensure_schema(pool)
+
+    # Probe sheet names without full parse to route
+    try:
+        wb = __import__("openpyxl").load_workbook(__import__("io").BytesIO(file_bytes), read_only=True, data_only=True)
+        sheets = wb.sheetnames
+    except Exception as err:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail={"error": "invalid_xlsx", "detail": str(err)})
+
+    file_type = category_benchmarks_svc.detect_xlsx_type(filename, sheets)
+
+    saved = 0
+    benchmarks_updated = 0
+    if file_type == category_benchmarks_svc.XlsxType.COMPOSICAO:
+        rows = category_benchmarks_svc.parse_composicao(file_bytes, filename)
+        saved = await category_benchmarks_svc.store_composicao(pool, user.id, rows)
+    elif file_type == category_benchmarks_svc.XlsxType.MAIS_VENDIDOS:
+        rows = category_benchmarks_svc.parse_mais_vendidos(file_bytes, filename)
+        saved = await category_benchmarks_svc.store_top_listings(pool, user.id, rows)
+        benchmarks_updated = await category_benchmarks_svc.compute_benchmarks(pool, user.id)
+    elif file_type == category_benchmarks_svc.XlsxType.DESEMPENHO:
+        rows = category_benchmarks_svc.parse_desempenho(file_bytes, filename)
+        saved = await category_benchmarks_svc.store_desempenho(pool, user.id, rows)
+    else:
+        return {
+            "ok": False,
+            "error": "unrecognized_xlsx",
+            "filename": filename,
+            "sheets": sheets,
+            "hint": "Filename should contain 'benchmark_categor', 'mais_vendidos' or 'desempenho'.",
+        }
+
+    return {
+        "ok": True,
+        "fileType": file_type,
+        "filename": filename,
+        "rowsSaved": saved,
+        "benchmarksComputed": benchmarks_updated,
+    }
+
+
+@router.get("/benchmarks")
+async def get_benchmarks(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Per-subcategory aggregates computed from category_top_listings."""
+    if pool is None:
+        return {"error": "no_db", "benchmarks": []}
+    await category_benchmarks_svc.ensure_schema(pool)
+    return {"benchmarks": await category_benchmarks_svc.get_benchmarks(pool, user.id)}
+
+
+@router.get("/benchmarks/top-listings")
+async def get_top_listings(
+    subcategory: str = Query(..., min_length=1),
+    limit: int = Query(100, ge=1, le=200),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Raw top-100 (or fewer) listings in the given subcategory — used for
+    competitive review and manual pattern-matching."""
+    if pool is None:
+        return {"error": "no_db", "items": []}
+    await category_benchmarks_svc.ensure_schema(pool)
+    return {
+        "subcategory": subcategory,
+        "items": await category_benchmarks_svc.get_top_listings(pool, user.id, subcategory, limit),
+    }
+
+
+@router.get("/benchmarks/listing-performance")
+async def get_listing_performance(
+    item_id: Optional[str] = Query(None),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Per-item performance snapshot from desempenho_publicacoes XLSX —
+    surfaces reviews + Experiência de compra that ML API doesn't expose."""
+    if pool is None:
+        return {"error": "no_db", "items": []}
+    await category_benchmarks_svc.ensure_schema(pool)
+    return {
+        "items": await category_benchmarks_svc.get_listing_performance(pool, user.id, item_id),
     }
