@@ -177,14 +177,21 @@ async def _upsert_offer(
     if offer_id is not None:
         offer_id = str(offer_id)
     original_price = _parse_num(offer.get("original_price"))
-    # ML returns the discounted price under different keys per offer type:
-    #   DEAL/SELLER_CAMPAIGN  → deal_price
-    #   LIGHTNING/SMART/PRICE_MATCHING/UNHEALTHY_STOCK → price (current promo
-    #     price) or suggested_discounted_price (recommended)
+    # ML returns several price candidates depending on offer type:
+    #   DEAL (fixed)                   → deal_price
+    #   LIGHTNING / FLEXIBLE_PERCENTAGE → range [min_discounted_price,
+    #     max_discounted_price] + suggested_discounted_price + price
+    #     (where `price` may be the floor / promo target — UNSAFE to use
+    #     blindly: for one item it was R$ 94 vs original R$ 340, a -72%
+    #     auto-accept the seller never asked for).
+    # Stored deal_price is what we send to /seller-promotions/items on
+    # "Aceitar". Safe priority: explicit deal_price → max_discounted_price
+    # (entrada / minimum required discount) → suggested → price.
     deal_price = _parse_num(
         offer.get("deal_price")
-        or offer.get("price")
+        or offer.get("max_discounted_price")
         or offer.get("suggested_discounted_price")
+        or offer.get("price")
     )
     discount_pct = _parse_num(offer.get("discount_percentage"))
     # Some offer types only carry meli_percentage + seller_percentage;
@@ -582,10 +589,12 @@ async def dispatch_pending_candidates(
             if cached is not None:
                 enriched["_margin_3m"] = cached
                 if cached.get("ok"):
+                    # ML's suggested deal price for the offer (mid-point in
+                    # FLEXIBLE ranges; equals deal_price for fixed types).
                     suggested = (
-                        enriched.get("deal_price")
+                        enriched.get("suggested_discounted_price")
+                        or enriched.get("deal_price")
                         or enriched.get("price")
-                        or enriched.get("suggested_discounted_price")
                     )
                     if suggested:
                         enriched["_margin_at_suggested"] = margin_svc.apply_hypothetical_price(
