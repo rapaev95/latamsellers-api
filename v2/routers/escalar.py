@@ -725,6 +725,111 @@ async def resend_user_claims_tg(
     return {"reset": reset_count, **result}
 
 
+# ── Returns probe (TEST step for Devoluções) ────────────────────────────
+# ML's Seller Hub "Devoluções → Próximas a serem atendidas" surface returns
+# that don't always show up via /post-purchase/v1/claims/search (those are
+# claims; standalone returns are a separate post-purchase resource). This
+# probe hits the most likely candidate endpoints and reports each one's
+# status + body sample so we can pick the right one for the cache.
+
+@router.get("/returns-probe")
+async def returns_probe(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Probe candidate ML endpoints for "Devoluções (Próximas a serem
+    atendidas)". Returns raw status codes + 600-char body previews so we
+    don't waste a build cycle on the wrong path."""
+    if pool is None:
+        return {"error": "no_db"}
+    try:
+        token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except Exception as err:  # noqa: BLE001
+        return {"error": "oauth_failed", "detail": str(err)}
+
+    headers = {"Authorization": f"Bearer {token}"}
+    base = "https://api.mercadolibre.com"
+    # Candidate endpoints — most-likely first
+    candidates = [
+        ("v1_returns_search", f"{base}/post-purchase/v1/returns/search?role=seller&limit=5"),
+        ("v1_returns_search_simple", f"{base}/post-purchase/v1/returns/search?limit=5"),
+        ("v2_returns_search", f"{base}/post-purchase/v2/returns/search?limit=5"),
+        ("v1_returns_seller", f"{base}/post-purchase/v1/returns?role=seller&limit=5"),
+        ("v1_devolutions", f"{base}/post-purchase/v1/devolutions/search?limit=5"),
+    ]
+
+    results = []
+    async with httpx.AsyncClient() as http:
+        for label, url in candidates:
+            try:
+                r = await http.get(url, headers=headers, timeout=15.0)
+                results.append({
+                    "label": label,
+                    "url": url,
+                    "status": r.status_code,
+                    "body_preview": r.text[:600],
+                })
+            except Exception as err:  # noqa: BLE001
+                results.append({"label": label, "url": url, "error": str(err)})
+    return {"results": results}
+
+
+# ── Messages probe (TEST step for Mensagens) ────────────────────────────
+# Order chat between buyer↔seller surfaces under ML's "Mensagens" tab.
+# Probable endpoint pattern: /messages/packs/{pack_id}/sellers/{seller_id}.
+# To probe meaningfully we need an order_id the seller knows is the
+# unread one; user passes it in the query string.
+
+@router.get("/messages-probe")
+async def messages_probe(
+    order_id: str = Query(..., description="ML order id to probe messages for"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Probe candidate ML endpoints for the order-message chat. Pass an
+    order_id the seller has unread messages on (visible in ML's Mensagens
+    tab) — different endpoints scope by order vs. pack vs. seller.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    try:
+        token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except Exception as err:  # noqa: BLE001
+        return {"error": "oauth_failed", "detail": str(err)}
+
+    # Pull the seller's ML user_id (need it for /messages/packs/.../sellers/{id})
+    async with pool.acquire() as conn:
+        ml_user_id = await conn.fetchval(
+            "SELECT ml_user_id FROM ml_user_tokens WHERE user_id = $1",
+            user.id,
+        )
+
+    headers = {"Authorization": f"Bearer {token}"}
+    base = "https://api.mercadolibre.com"
+    candidates = [
+        ("messages_packs_seller", f"{base}/messages/packs/{order_id}/sellers/{ml_user_id}"),
+        ("messages_orders_seller", f"{base}/messages/orders/{order_id}/sellers/{ml_user_id}"),
+        ("messages_orders_legacy", f"{base}/messaging/orders/{order_id}/messages"),
+        ("orders_messages", f"{base}/sites/MLB/orders/{order_id}/messages"),
+        ("post_purchase_messages", f"{base}/post-purchase/v1/orders/{order_id}/messages"),
+    ]
+
+    results = []
+    async with httpx.AsyncClient() as http:
+        for label, url in candidates:
+            try:
+                r = await http.get(url, headers=headers, timeout=15.0)
+                results.append({
+                    "label": label,
+                    "url": url,
+                    "status": r.status_code,
+                    "body_preview": r.text[:600],
+                })
+            except Exception as err:  # noqa: BLE001
+                results.append({"label": label, "url": url, "error": str(err)})
+    return {"results": results, "ml_user_id": ml_user_id}
+
+
 # ── Clips probe (TEST step) ──────────────────────────────────────────────────
 # ML deprecated youtube `video_id` on items as of 2024-09-09 — only Clips
 # uploads work now. The endpoint uses cbt_item_id (Cross-Border Trading), so
