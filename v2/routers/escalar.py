@@ -1136,6 +1136,23 @@ async def notifications_diagnostic(
     out["recentPending"] = [dict(r) for r in sample_pending]
     out["recentSent"] = [dict(r) for r in sample_sent]
 
+    # Aggregate topic distribution across the user's full notice history.
+    # Helps diagnose which event types ML actually pushes to our webhook —
+    # e.g. presence of `messages` topic confirms we can build a TG dispatch
+    # for buyer-seller chat without scraping ML's restricted /messages API.
+    async with pool.acquire() as conn:
+        topic_rows = await conn.fetch(
+            """
+            SELECT COALESCE(topic, '(null)') AS topic, COUNT(*) AS n
+              FROM ml_notices
+             WHERE user_id = $1
+             GROUP BY topic
+             ORDER BY n DESC
+            """,
+            user.id,
+        )
+    out["topicCounts"] = {r["topic"]: int(r["n"]) for r in topic_rows}
+
     # 4. ENV config (masked)
     bot_token = _os.environ.get("TELEGRAM_BOT_TOKEN") or ""
     out["env"] = {
