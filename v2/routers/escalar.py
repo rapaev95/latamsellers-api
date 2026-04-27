@@ -505,13 +505,16 @@ async def refresh_user_items(
 @router.get("/user-questions")
 async def get_user_questions(
     status: str = Query("ALL"),
+    item_status: Optional[str] = Query(None, description="active | archived | (omit for all)"),
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ):
     if pool is None:
         return {"error": "no_db", "questions": [], "total": 0}
     await ml_user_questions_svc.ensure_schema(pool)
-    return await ml_user_questions_svc.get_cached(pool, user.id, status=status)
+    return await ml_user_questions_svc.get_cached(
+        pool, user.id, status=status, item_status=item_status,
+    )
 
 
 @router.post("/user-questions/refresh")

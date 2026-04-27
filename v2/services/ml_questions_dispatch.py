@@ -529,12 +529,15 @@ async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int) -> dict[str, int]
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT question_id, item_id, text, raw, from_nickname
-              FROM ml_user_questions
-             WHERE user_id = $1
-               AND status = 'UNANSWERED'
-               AND tg_dispatched_at IS NULL
-             ORDER BY date_created DESC
+            SELECT q.question_id, q.item_id, q.text, q.raw, q.from_nickname
+              FROM ml_user_questions q
+              LEFT JOIN ml_user_items i
+                ON i.user_id = q.user_id AND i.item_id = q.item_id
+             WHERE q.user_id = $1
+               AND q.status = 'UNANSWERED'
+               AND q.tg_dispatched_at IS NULL
+               AND COALESCE(i.status, 'active') = 'active'
+             ORDER BY q.date_created DESC
              LIMIT $2
             """,
             user_id, TG_BATCH_CAP,
@@ -643,21 +646,24 @@ async def _send_reminders_for_user(
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT question_id, item_id, text, raw, from_nickname,
-                   tg_message_id, tg_suggestion, tg_dispatched_at,
-                   tg_reminder_count
-              FROM ml_user_questions
-             WHERE user_id = $1
-               AND status = 'UNANSWERED'
-               AND tg_dispatched_at IS NOT NULL
-               AND tg_reminder_count < $2
+            SELECT q.question_id, q.item_id, q.text, q.raw, q.from_nickname,
+                   q.tg_message_id, q.tg_suggestion, q.tg_dispatched_at,
+                   q.tg_reminder_count
+              FROM ml_user_questions q
+              LEFT JOIN ml_user_items i
+                ON i.user_id = q.user_id AND i.item_id = q.item_id
+             WHERE q.user_id = $1
+               AND q.status = 'UNANSWERED'
+               AND q.tg_dispatched_at IS NOT NULL
+               AND q.tg_reminder_count < $2
+               AND COALESCE(i.status, 'active') = 'active'
                AND (
-                 (tg_last_reminder_at IS NULL
-                   AND tg_dispatched_at + ($3 * INTERVAL '1 hour') < NOW())
-                 OR (tg_last_reminder_at IS NOT NULL
-                   AND tg_last_reminder_at + ($4 * INTERVAL '1 hour') < NOW())
+                 (q.tg_last_reminder_at IS NULL
+                   AND q.tg_dispatched_at + ($3 * INTERVAL '1 hour') < NOW())
+                 OR (q.tg_last_reminder_at IS NOT NULL
+                   AND q.tg_last_reminder_at + ($4 * INTERVAL '1 hour') < NOW())
                )
-             ORDER BY tg_dispatched_at ASC
+             ORDER BY q.tg_dispatched_at ASC
              LIMIT $5
             """,
             user_id, REMINDER_MAX_COUNT,

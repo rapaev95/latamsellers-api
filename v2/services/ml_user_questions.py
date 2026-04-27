@@ -198,28 +198,41 @@ async def get_cached(
     pool: asyncpg.Pool,
     user_id: int,
     status: str = "ALL",
+    item_status: str | None = None,
 ) -> dict[str, Any]:
-    where = "WHERE user_id = $1"
+    """`item_status` filter: None = all items; "active" = answerable now;
+    "archived" = paused/closed/under_review (ML rejects answers there)."""
+    where = "WHERE q.user_id = $1"
     params: list[Any] = [user_id]
     if status and status.upper() != "ALL":
-        where += " AND status = $2"
+        where += f" AND q.status = ${len(params) + 1}"
         params.append(status.upper())
+    if item_status == "active":
+        where += " AND COALESCE(i.status, 'active') = 'active'"
+    elif item_status == "archived":
+        where += " AND i.status IS NOT NULL AND i.status <> 'active'"
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
-            SELECT question_id, item_id, text, status,
-                   to_char(date_created AT TIME ZONE 'UTC',
+            SELECT q.question_id, q.item_id, q.text, q.status,
+                   to_char(q.date_created AT TIME ZONE 'UTC',
                            'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS date_created,
-                   answer_text,
-                   to_char(answer_date AT TIME ZONE 'UTC',
+                   q.answer_text,
+                   to_char(q.answer_date AT TIME ZONE 'UTC',
                            'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS answer_date,
-                   from_nickname, raw,
-                   to_char(fetched_at AT TIME ZONE 'UTC',
-                           'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS fetched_at
-              FROM ml_user_questions
+                   q.from_nickname, q.raw,
+                   to_char(q.fetched_at AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS fetched_at,
+                   i.status AS item_status,
+                   i.title  AS item_title,
+                   i.permalink AS item_permalink,
+                   i.thumbnail AS item_thumbnail
+              FROM ml_user_questions q
+              LEFT JOIN ml_user_items i
+                ON i.user_id = q.user_id AND i.item_id = q.item_id
               {where}
-             ORDER BY date_created DESC NULLS LAST
+             ORDER BY q.date_created DESC NULLS LAST
             """,
             *params,
         )
@@ -232,6 +245,10 @@ async def get_cached(
         questions.append({
             "id": int(r["question_id"]),
             "item_id": r["item_id"],
+            "item_title": r["item_title"],
+            "item_permalink": r["item_permalink"],
+            "item_thumbnail": r["item_thumbnail"],
+            "itemStatus": r["item_status"] or "active",
             "text": r["text"],
             "status": r["status"],
             "date_created": r["date_created"],
