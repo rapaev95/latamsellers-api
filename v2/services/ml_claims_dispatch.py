@@ -190,6 +190,46 @@ def _extract_buyer_complaint(claim: dict[str, Any]) -> Optional[str]:
     return candidates[0][1]
 
 
+def _detect_recommended_action(claim: dict[str, Any]) -> Optional[str]:
+    """Parse the mediator message for ML's recommended option.
+
+    ML's mediator decorates one numbered option with "(Melhor opção) ⭐"
+    or just "⭐". Returns the matching callback prefix:
+      'cl_rf' → reembolso (full refund)
+      'cl_rt' → aceitar devolução (return product)
+      'cl_ex' → troca (exchange)
+      'cl_pa' → reembolso parcial (partial refund)
+    Or None if the mediator hasn't recommended (or text format differs).
+
+    Important: check `reembolso parcial` BEFORE `reembolso` — the latter
+    matches the former as a substring.
+    """
+    messages = claim.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if m.get("sender_role") != "mediator":
+            continue
+        text = (m.get("message") or "").lower()
+        if not text:
+            continue
+        if "melhor op" not in text and "⭐" not in text and "recomendad" not in text:
+            continue
+        # Order matters — longer keys first to avoid partial-match collisions.
+        patterns = [
+            ("cl_pa", r"reembolso\s+parcial[^.\n*]*?(?:melhor\s+op[çc][ãa]o|⭐|recomendad)"),
+            ("cl_rt", r"devolu[çc][ãa]o[^.\n*]*?(?:melhor\s+op[çc][ãa]o|⭐|recomendad)"),
+            ("cl_ex", r"troca[^.\n*]*?(?:melhor\s+op[çc][ãa]o|⭐|recomendad)"),
+            ("cl_rf", r"reembolso(?!\s+parcial)[^.\n*]*?(?:melhor\s+op[çc][ãa]o|⭐|recomendad)"),
+        ]
+        for action, pattern in patterns:
+            if re.search(pattern, text, flags=re.IGNORECASE):
+                return action
+    return None
+
+
 def _extract_photo_urls(claim: dict[str, Any]) -> list[dict[str, str]]:
     """Pull buyer-uploaded photo URLs from claim messages + returns.
 
@@ -380,6 +420,7 @@ def _build_claim_card(
     claim: dict[str, Any],
     summary: Optional[str] = None,
     summary_lang: str = "ru",
+    recommended_action: Optional[str] = None,
 ) -> str:
     """MarkdownV2-formatted TG card for one actionable claim."""
     cid = claim.get("id") or "?"
@@ -451,6 +492,26 @@ def _build_claim_card(
             lines.append("💬 *Motivo do comprador:*")
             lines.append(_esc(clip))
 
+    # Surface ML mediator's recommendation as a one-line hint above the CTA
+    # block so the seller spots it before scanning the buttons.
+    if recommended_action:
+        rec_label_map = {
+            "cl_rf": "Reembolso",
+            "cl_rt": "Aceitar devolução",
+            "cl_ex": "Troca de produto",
+            "cl_pa": "Reembolso parcial",
+        }
+        rec_label = rec_label_map.get(recommended_action)
+        if rec_label:
+            if summary_lang == "ru":
+                rec_hint = f"🤖 *ML рекомендует:* {_esc(rec_label)} ⭐"
+            elif summary_lang == "en":
+                rec_hint = f"🤖 *ML recommends:* {_esc(rec_label)} ⭐"
+            else:
+                rec_hint = f"🤖 *Sugestão do ML:* {_esc(rec_label)} ⭐"
+            lines.append("")
+            lines.append(rec_hint)
+
     lines.append("")
     if needs_review:
         lines.append("_Devolução em mãos\\. Decida\\: aceitar reembolso ou contestar\\._")
@@ -459,7 +520,11 @@ def _build_claim_card(
     return "\n".join(lines)
 
 
-def _build_keyboard(claim_id: int, app_base_url: str) -> dict[str, Any]:
+def _build_keyboard(
+    claim_id: int,
+    app_base_url: str,
+    recommended_action: Optional[str] = None,
+) -> dict[str, Any]:
     """Inline keyboard with one-click resolution actions.
 
     callback_data prefixes (handled by the Next.js telegram-webhook route):
@@ -468,21 +533,24 @@ def _build_keyboard(claim_id: int, app_base_url: str) -> dict[str, Any]:
       cl_ex:{id}  → change_product (exchange / accept return for replacement)
       cl_pa:{id}  → partial-refund — opens the app (needs amount input)
 
-    Both "Atender no app" and "Ver no ML" stay as URL fallbacks for the
-    cases the seller wants to handle in a richer UI (orientation, evidences,
-    custom percentage).
+    `recommended_action` (from ML mediator's "Melhor opção ⭐") prefixes
+    the corresponding label with ⭐ so the seller sees ML's recommendation
+    at a glance.
     """
+    def _label(base: str, action_key: str) -> str:
+        return f"⭐ {base}" if recommended_action == action_key else base
+
     app_link = f"{app_base_url.rstrip('/')}/escalar/claims"
     ml_link = f"https://myaccount.mercadolivre.com.br/post-purchase/cases/{claim_id}"
     return {
         "inline_keyboard": [
             [
-                {"text": "💵 Reembolsar", "callback_data": f"cl_rf:{claim_id}"},
-                {"text": "↩️ Aceitar devolução", "callback_data": f"cl_rt:{claim_id}"},
+                {"text": _label("💵 Reembolsar", "cl_rf"), "callback_data": f"cl_rf:{claim_id}"},
+                {"text": _label("↩️ Aceitar devolução", "cl_rt"), "callback_data": f"cl_rt:{claim_id}"},
             ],
             [
-                {"text": "🔄 Trocar", "callback_data": f"cl_ex:{claim_id}"},
-                {"text": "💸 Reembolso parcial", "callback_data": f"cl_pa:{claim_id}"},
+                {"text": _label("🔄 Trocar", "cl_ex"), "callback_data": f"cl_ex:{claim_id}"},
+                {"text": _label("💸 Reembolso parcial", "cl_pa"), "callback_data": f"cl_pa:{claim_id}"},
             ],
             [
                 {"text": "⚡ Atender no app", "url": app_link},
@@ -521,10 +589,14 @@ async def _send_claim(
     except (TypeError, ValueError):
         return None
 
-    text = _build_claim_card(claim, summary=summary, summary_lang=summary_lang)
+    recommended_action = _detect_recommended_action(claim)
+    text = _build_claim_card(
+        claim, summary=summary, summary_lang=summary_lang,
+        recommended_action=recommended_action,
+    )
     if len(text) > 4000:
         text = text[:3990] + "…"
-    keyboard = _build_keyboard(cid, app_base_url)
+    keyboard = _build_keyboard(cid, app_base_url, recommended_action=recommended_action)
 
     try:
         # First attempt: MarkdownV2
