@@ -94,6 +94,7 @@ def aggregate(
     stock_full_map: dict[str, StockFullSku] | None = None,
     vendas_filenames: list[str] | None = None,
     publicidade_rows: Iterable[PublicidadeRow] | None = None,
+    current_prices_map: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Build full ABC summary. Returns dict with `products` and `meta`.
 
@@ -177,13 +178,18 @@ def aggregate(
         _pnl_period = (date.today() - timedelta(days=int(days)), date.today())
     else:
         _pnl_period = (date(2000, 1, 1), date.today())
-    _project_alloc_cache: dict[str, tuple[float, float]] = {}
+    _project_alloc_cache: dict[str, tuple[float, float, float]] = {}
 
-    def _project_fixed_per_unit(project_name: str) -> tuple[float, float]:
-        """Returns (aluguel_per_unit, fulfillment_per_unit) for the project."""
+    def _project_fixed_per_unit(project_name: str) -> tuple[float, float, float]:
+        """Returns (aluguel_per_unit, fulfillment_per_unit, das_rate) for project.
+
+        das_rate is the effective Simples Nacional rate (Anexo I/II/III with
+        RBT12 bracket applied), as a decimal (e.g. 0.047 for 4.7%). Used to
+        compute per-sale DAS at the current selling price for unit econ.
+        """
         key = (project_name or "").strip()
         if not key:
-            return (0.0, 0.0)
+            return (0.0, 0.0, 0.045)
         cached = _project_alloc_cache.get(key)
         if cached is not None:
             return cached
@@ -191,7 +197,7 @@ def aggregate(
             from v2.legacy.finance import compute_pnl
             pnl = compute_pnl(key, _pnl_period)
         except Exception:
-            _project_alloc_cache[key] = (0.0, 0.0)
+            _project_alloc_cache[key] = (0.0, 0.0, 0.045)
             return _project_alloc_cache[key]
         aluguel_total = 0.0
         fulfillment_total = 0.0
@@ -203,7 +209,16 @@ def aggregate(
             elif "fulfillment" in label_lower or "доставка" in label_lower:
                 fulfillment_total += amount
         units_total = max(int(getattr(pnl, "vendas_count", 0) or 0), 1)
-        result = (aluguel_total / units_total, fulfillment_total / units_total)
+        tax_info = getattr(pnl, "tax_info", None) or {}
+        try:
+            das_rate = float(tax_info.get("effective_pct", 4.5)) / 100.0
+        except (TypeError, ValueError):
+            das_rate = 0.045
+        result = (
+            aluguel_total / units_total,
+            fulfillment_total / units_total,
+            das_rate,
+        )
         _project_alloc_cache[key] = result
         return result
 
@@ -317,14 +332,49 @@ def aggregate(
         # entered inline in the products dashboard.
         extra_fixed = _extra_fixed_cost_for(a.sku)
         # Project-level fixed costs allocated per unit (Aluguel + Fulfillment
-        # from PnL). Same per-unit value across all SKUs in the same project.
+        # from PnL) + DAS rate. Same per-unit value across SKUs in the same
+        # project. Cache hit on repeat calls.
         project_for_pnl = (resolver.resolve(a.sku, a.mlb) if resolver else "") or ""
-        aluguel_pu, fulfillment_pu = _project_fixed_per_unit(project_for_pnl)
+        aluguel_pu, fulfillment_pu, das_rate = _project_fixed_per_unit(project_for_pnl)
         margin = (
             avg_price - comm_pu - ship_pu - refund_pu - ad_pu - storage_pu
             - unit_cost - extra_fixed - aluguel_pu - fulfillment_pu
         )
         margin_pct = (margin / avg_price * 100) if avg_price > 0 else 0.0
+
+        # ── Unit economics: contribution margin at CURRENT listing price ──────
+        # Source of truth = ml_user_items.price (live), passed in via
+        # current_prices_map. Falls back to historical avg_price when missing.
+        # Variable costs only — Aluguel + ad_pu (overhead allocation) are
+        # explicitly excluded so the seller can decide on a single sale
+        # without fixed-cost-per-unit volatility.
+        current_price = avg_price
+        if current_prices_map:
+            cp = current_prices_map.get(a.mlb)
+            if cp is not None:
+                try:
+                    cp_f = float(cp)
+                    if cp_f > 0:
+                        current_price = cp_f
+                except (TypeError, ValueError):
+                    pass
+        commission_rate = (comm_pu / avg_price) if avg_price > 0 else 0.167
+        ml_fee_now = current_price * commission_rate
+        das_now = current_price * das_rate
+        # Variable per-sale / per-unit costs only. Aluguel and ad_pu
+        # (advertising allocation) are FIXED — excluded from CM.
+        variable_cost = (
+            unit_cost
+            + ml_fee_now
+            + ship_pu          # envios subsídio (per shipment, fixed amount)
+            + storage_pu       # armazenagem per unit per day
+            + refund_pu        # return shipping per refund
+            + fulfillment_pu   # fulfillment cost per shipment
+            + das_now          # DAS scales with current price
+            + extra_fixed      # manual extra cost per unit
+        )
+        contribution = current_price - variable_cost
+        contribution_pct = (contribution / current_price * 100) if current_price > 0 else 0.0
         # ROI = profit_per_unit / cost_per_unit. Cost = COGS + ad spend (what
         # the seller actually puts at risk). Returns 0 if no cost basis yet.
         cost_basis = unit_cost + ad_pu
@@ -370,6 +420,13 @@ def aggregate(
             "extraFixedCost": extra_fixed,
             "aluguelPerUnit": aluguel_pu,
             "fulfillmentPerUnit": fulfillment_pu,
+            # Live listing price + CM at current price (not historical avg).
+            # Used by /escalar/promotions Unit Econ panel for promo decisions.
+            "currentPrice": current_price,
+            "commissionRate": round(commission_rate, 4),
+            "dasRate": round(das_rate, 4),
+            "contributionMargin": round(contribution, 2),
+            "contributionMarginPct": round(contribution_pct, 2),
             "margin": margin,
             "marginPct": margin_pct,
             "roi": roi,

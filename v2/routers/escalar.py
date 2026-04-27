@@ -92,6 +92,27 @@ async def get_products(
         publicidade_rows = await db_loader.load_user_publicidade(pool, user.id)
         _step(f"after load_user_publicidade ({len(publicidade_rows)} rows)")
 
+    # Pull live listing prices from ml_user_items so abc can compute unit econ
+    # at the current selling price (not the historical period average — avg
+    # mixes in past discounts and is misleading for "should I take this promo").
+    current_prices_map: dict[str, float] = {}
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                price_rows = await conn.fetch(
+                    "SELECT item_id, price FROM ml_user_items WHERE user_id = $1",
+                    user.id,
+                )
+            for r in price_rows:
+                if r["price"] is not None:
+                    try:
+                        current_prices_map[r["item_id"]] = float(r["price"])
+                    except (TypeError, ValueError):
+                        pass
+            _step(f"after current_prices load ({len(current_prices_map)} items)")
+        except Exception as err:  # noqa: BLE001
+            _log.warning("current_prices load failed: %s", err)
+
     summary = abc.aggregate(
         days=days_v,
         project=project or "",
@@ -102,6 +123,7 @@ async def get_products(
         stock_full_map=stock_full_map,
         vendas_filenames=vendas_filenames,
         publicidade_rows=publicidade_rows,
+        current_prices_map=current_prices_map,
     )
     _step(f"after abc.aggregate (products={len(summary['products'])})")
 

@@ -22,6 +22,15 @@ class ABCProduct(BaseModel):
     extraFixedCost: float = 0.0
     aluguelPerUnit: float = 0.0
     fulfillmentPerUnit: float = 0.0
+    # Live listing price + Contribution Margin computed at current price.
+    # currentPrice falls back to avgPrice when ml_user_items has no row yet.
+    # CM = currentPrice − all VARIABLE costs only (no Aluguel, no ad allocation),
+    # the right metric for "should I accept this promo" decisions.
+    currentPrice: Optional[float] = None
+    commissionRate: Optional[float] = None
+    dasRate: Optional[float] = None
+    contributionMargin: Optional[float] = None
+    contributionMarginPct: Optional[float] = None
     margin: float
     marginPct: float
     roi: float
