@@ -119,27 +119,32 @@ def apply_hypothetical_price(
         new_margin = None
 
     # ── Unit economics recompute (only variable costs scale with price) ──
+    # Use stored RATES directly so the formula is independent of "scale" —
+    # ml_fee_rate × hypothetical_price gives the right per-sale fee at any
+    # price point (matching ML's actual % billing).
     unit_in = cached.get("unit") or {}
     new_unit: dict[str, Any] | None = None
     if unit_in:
-        new_avg_price = float(hypothetical_price)
-        new_ml_fee_pu = float(unit_in.get("ml_fee_per_unit") or 0) * scale
+        new_price = float(hypothetical_price)
+        ml_fee_rate = float(unit_in.get("ml_fee_rate") or 0.167)
+        new_ml_fee_pu = new_price * ml_fee_rate
         ful_pu = float(unit_in.get("fulfillment_per_sale") or 0)
         cogs_pu = unit_in.get("cogs_per_unit")
         armaz_pu = float(unit_in.get("armaz_per_unit") or 0)
         das_rate = float(unit_in.get("das_rate") or 0.045)
-        new_das_pu = new_avg_price * das_rate
+        new_das_pu = new_price * das_rate
         if cogs_pu is not None:
             new_var_cost = new_ml_fee_pu + ful_pu + float(cogs_pu) + new_das_pu + armaz_pu
-            new_unit_profit = new_avg_price - new_var_cost
-            new_unit_margin = round(new_unit_profit / new_avg_price * 100, 1) if new_avg_price else None
+            new_unit_profit = new_price - new_var_cost
+            new_unit_margin = round(new_unit_profit / new_price * 100, 1) if new_price else None
         else:
             new_var_cost = None
             new_unit_profit = None
             new_unit_margin = None
         new_unit = dict(unit_in)
         new_unit.update({
-            "avg_price": round(new_avg_price, 2),
+            "current_price": round(new_price, 2),
+            "avg_price": round(new_price, 2),  # legacy alias
             "ml_fee_per_unit": round(new_ml_fee_pu, 2),
             "das_per_unit": round(new_das_pu, 2),
             "variable_cost": round(new_var_cost, 2) if new_var_cost is not None else None,
@@ -207,14 +212,18 @@ def _batch_refresh_sync(user_id: int, period_months: int) -> dict:
         return {"ok": False, "error": "no_db_url"}
 
     item_ids: list[str] = []
+    current_prices: dict[str, float] = {}
     try:
         conn = psycopg2.connect(dsn)
         cur = conn.cursor()
         cur.execute(
-            "SELECT item_id FROM ml_user_items WHERE user_id = %s",
+            "SELECT item_id, price FROM ml_user_items WHERE user_id = %s",
             (user_id,),
         )
-        item_ids = [r[0] for r in cur.fetchall()]
+        for row in cur.fetchall():
+            item_ids.append(row[0])
+            if row[1] is not None:
+                current_prices[row[0]] = float(row[1])
         cur.close()
         conn.close()
     except Exception as err:  # noqa: BLE001
@@ -261,6 +270,7 @@ def _batch_refresh_sync(user_id: int, period_months: int) -> dict:
 
             payload = _build_item_payload(
                 pnl, item_df, project, sku, unit_cost, period_months,
+                current_price=current_prices.get(item_id),
             )
             payloads.append((item_id.upper(), json.dumps(payload)))
         except Exception as err:  # noqa: BLE001
@@ -308,9 +318,15 @@ def _build_item_payload(
     sku: Optional[str],
     unit_cost: Optional[float],
     period_months: int,
+    current_price: Optional[float] = None,
 ) -> dict:
     """Project pnl + filtered item rows → payload dict shaped like the
-    historical get_item_margin response so the renderer doesn't need to change."""
+    historical get_item_margin response so the renderer doesn't need to change.
+
+    `current_price` is the live ml_user_items.price — used as the basis for
+    unit economics so margin reflects today's listing price, not the
+    historical average over the period (which can be lower if the item ran
+    a discount mid-period)."""
     revenue, ml_fees, units = _sum_item_basics(item_df)
 
     # PnLReport exposes vendas_count (delivered+returned in period). The
@@ -367,8 +383,17 @@ def _build_item_payload(
     #   - DAS (% of revenue, scales with discount)
     #   - Armazenagem (per unit, daily — small)
     # Aluguel / Publicidade-as-fixed are excluded.
-    avg_price = revenue / units if units > 0 else 0.0
-    ml_fee_per_unit = ml_fees / units if units > 0 else 0.0
+    historical_avg_price = revenue / units if units > 0 else 0.0
+    # Prefer the live listing price as the basis. Fall back to historical
+    # average when ml_user_items has no row (rare — e.g. paused listing
+    # before our cache caught up).
+    price_basis = float(current_price) if current_price else historical_avg_price
+
+    # ml_fee/unit is derived as a RATE (% of revenue) so it scales with the
+    # current price — matching how ML actually charges per sale.
+    ml_fee_rate = ml_fees / revenue if revenue > 0 else 0.167
+    ml_fee_per_unit = price_basis * ml_fee_rate
+
     fulfillment_per_sale = fulfillment / total_units if total_units > 0 else 0.0
     armaz_per_unit = armazenagem / total_units if total_units > 0 else 0.0
     # DAS rate must come from tax_info.effective_pct (already considers RBT12
@@ -382,7 +407,7 @@ def _build_item_payload(
     else:
         revenue_gross = float(getattr(pnl, "revenue_gross", 0) or 0)
         das_rate = (das / revenue_gross) if revenue_gross > 0 else 0.045
-    das_per_unit = avg_price * das_rate
+    das_per_unit = price_basis * das_rate
     cogs_per_unit = float(unit_cost) if unit_cost is not None else None
 
     if cogs_per_unit is not None:
@@ -390,8 +415,8 @@ def _build_item_payload(
             ml_fee_per_unit + fulfillment_per_sale + cogs_per_unit
             + das_per_unit + armaz_per_unit
         )
-        unit_profit = avg_price - unit_variable_cost
-        unit_margin_pct = round(unit_profit / avg_price * 100, 1) if avg_price else None
+        unit_profit = price_basis - unit_variable_cost
+        unit_margin_pct = round(unit_profit / price_basis * 100, 1) if price_basis else None
     else:
         unit_variable_cost = None
         unit_profit = None
@@ -417,9 +442,16 @@ def _build_item_payload(
         "unit_cost_brl": unit_cost,
         "missing_cost": unit_cost is None,
         # Unit-economics block — variable per-sale / per-unit costs only.
+        # `current_price` is what we're computing margin AT (live listing
+        # price). `historical_avg_price` is the period's actual average —
+        # kept for transparency but not used in the margin calculation.
         "unit": {
-            "avg_price": round(avg_price, 2),
+            "current_price": round(price_basis, 2),
+            "historical_avg_price": round(historical_avg_price, 2),
+            # Legacy alias (some readers may still look for `avg_price`).
+            "avg_price": round(price_basis, 2),
             "ml_fee_per_unit": round(ml_fee_per_unit, 2),
+            "ml_fee_rate": round(ml_fee_rate, 4),
             "fulfillment_per_sale": round(fulfillment_per_sale, 2),
             "cogs_per_unit": round(cogs_per_unit, 2) if cogs_per_unit is not None else None,
             "das_per_unit": round(das_per_unit, 2),
