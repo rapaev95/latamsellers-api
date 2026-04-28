@@ -204,6 +204,10 @@ async def get_campaigns(
 
     label = _safe_call_label("get_campaigns", advertiser_id, user.id)
     try:
+        # Idempotent — guards against the historic bug where startup
+        # didn't include ads_storage.ensure_schema, leaving prod tables
+        # missing the product_id column.
+        await ads_storage.ensure_schema(pool)
         synced_at = await ads_storage.campaign_staleness(
             pool, user.id, advertiser_id, product_id=product_type,
         )
@@ -290,6 +294,7 @@ async def get_ads(
 
     label = _safe_call_label("get_ads", advertiser_id, user.id)
     try:
+        await ads_storage.ensure_schema(pool)
         synced_at = await ads_storage.campaign_staleness(pool, user.id, advertiser_id)
         should_sync = refresh or synced_at is None or _stale(synced_at)
         if should_sync:

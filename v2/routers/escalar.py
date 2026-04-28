@@ -567,45 +567,45 @@ async def quality_probe(
 @router.post("/products/refresh-quality")
 async def refresh_products_quality(
     limit: int = Query(500, ge=1, le=1000),
+    include_paused: bool = Query(True),
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ):
     """Rebuild the ml_item_quality cache for this user's items.
 
-    Triggered by the Next.js UI when the cache is missing or stale (>24h).
-    Walks the user's product list (same ABC aggregator as /products), extracts
-    unique itemIds and calls /item/{id}/performance for each (throttled).
+    Source of item_ids: `ml_user_items` (the live ML catalog mirror),
+    NOT abc.aggregate which only knows items present in uploaded vendas
+    CSVs. Without this fix, items without recent CSV-tracked sales fall
+    through quality coverage, leaving qualityCoverage stuck around 50%.
+
+    `include_paused=True` (default) covers paused listings too —
+    moderation reasons can be attached to paused items and the seller
+    needs to see them.
     """
-    # Build the same product list as /products to know which itemIds to refresh.
-    snoozed = set(await user_storage.get(pool, user.id, SNOOZE_KEY) or [])
-    resolver = await projects.load_resolver(pool, user.id)
+    if pool is None:
+        return {"error": "no_db"}
 
-    vendas_rows = None
-    storage_map = None
-    stock_full_map = None
-    vendas_filenames = None
-    if get_settings().storage_mode == "db" and pool is not None:
-        vendas_rows = await db_loader.load_user_vendas(pool, user.id)
-        storage_map = await db_loader.load_user_armazenagem(pool, user.id)
-        stock_full_map = await db_loader.load_user_stock_full(pool, user.id)
-        vendas_filenames = await db_loader.list_user_vendas_filenames(pool, user.id)
+    statuses = ["active"]
+    if include_paused:
+        statuses.extend(["paused", "under_review"])
 
-    summary = abc.aggregate(
-        days="all",
-        project="",
-        snoozed_skus=snoozed,
-        resolver=resolver,
-        vendas_rows=vendas_rows,
-        storage_map=storage_map,
-        stock_full_map=stock_full_map,
-        vendas_filenames=vendas_filenames,
-    )
-    item_ids = [p.get("itemId") for p in summary["products"] if p.get("itemId")]
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT item_id FROM ml_user_items
+             WHERE user_id = $1 AND status = ANY($2::text[])
+             ORDER BY fetched_at DESC NULLS LAST
+            """,
+            user.id, statuses,
+        )
+    item_ids = [r["item_id"] for r in rows if r["item_id"]]
 
     await ml_quality_svc.ensure_schema(pool)
     result = await ml_quality_svc.refresh_user_quality(pool, user.id, item_ids, limit=limit)
     return {
         "totalItems": len(item_ids),
+        "source": "ml_user_items",
+        "statuses": statuses,
         "fetched": result["fetched"],
         "saved": result["saved"],
         "failed": result["failed"],
@@ -618,44 +618,42 @@ async def refresh_products_quality(
 @router.post("/products/refresh-visits")
 async def refresh_products_visits(
     limit: int = Query(500, ge=1, le=1000),
+    include_paused: bool = Query(True),
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ):
     """Rebuild the ml_item_visits cache for this user's items.
 
-    Mirrors refresh-quality: walks the same product list, calls ML
-    `/items/{id}/visits/time_window?last=30&unit=day` per item (throttled)
-    and upserts into ml_item_visits.
+    Source: `ml_user_items` (live ML catalog mirror), same as
+    refresh-quality. Items not present in CSV vendas now also get
+    visits cached, fixing the visitsCoverage gap. include_paused
+    covers paused listings too — useful for «когда было больше визитов
+    до паузы» retrospectives.
     """
-    snoozed = set(await user_storage.get(pool, user.id, SNOOZE_KEY) or [])
-    resolver = await projects.load_resolver(pool, user.id)
+    if pool is None:
+        return {"error": "no_db"}
 
-    vendas_rows = None
-    storage_map = None
-    stock_full_map = None
-    vendas_filenames = None
-    if get_settings().storage_mode == "db" and pool is not None:
-        vendas_rows = await db_loader.load_user_vendas(pool, user.id)
-        storage_map = await db_loader.load_user_armazenagem(pool, user.id)
-        stock_full_map = await db_loader.load_user_stock_full(pool, user.id)
-        vendas_filenames = await db_loader.list_user_vendas_filenames(pool, user.id)
+    statuses = ["active"]
+    if include_paused:
+        statuses.extend(["paused", "under_review"])
 
-    summary = abc.aggregate(
-        days="all",
-        project="",
-        snoozed_skus=snoozed,
-        resolver=resolver,
-        vendas_rows=vendas_rows,
-        storage_map=storage_map,
-        stock_full_map=stock_full_map,
-        vendas_filenames=vendas_filenames,
-    )
-    item_ids = [p.get("itemId") for p in summary["products"] if p.get("itemId")]
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT item_id FROM ml_user_items
+             WHERE user_id = $1 AND status = ANY($2::text[])
+             ORDER BY fetched_at DESC NULLS LAST
+            """,
+            user.id, statuses,
+        )
+    item_ids = [r["item_id"] for r in rows if r["item_id"]]
 
     await ml_visits_svc.ensure_schema(pool)
     result = await ml_visits_svc.refresh_user_visits(pool, user.id, item_ids, limit=limit)
     return {
         "totalItems": len(item_ids),
+        "source": "ml_user_items",
+        "statuses": statuses,
         "fetched": result["fetched"],
         "saved": result["saved"],
         "failed": result["failed"],
@@ -2979,7 +2977,14 @@ async def full_operations_probe(
     pool=Depends(get_pool),
 ):
     """RAW probe for /stock/fulfillment/operations/search — verify scope and
-    response shape before designing the cache table."""
+    response shape before designing the cache table.
+
+    The ML endpoint expects seller_id + (optional) date range. Initial
+    probe missed seller_id and got 400. This probe tries a small grid of
+    parameter combinations and returns the status of each so we can spot
+    which shape ML actually wants for THIS user without running through
+    the docs every time.
+    """
     if pool is None:
         return {"error": "no_db"}
     try:
@@ -2987,34 +2992,62 @@ async def full_operations_probe(
     except ml_oauth_svc.MLRefreshError as err:
         return {"error": "ml_oauth_required", "detail": str(err)}
 
-    url = (
-        f"https://api.mercadolibre.com/stock/fulfillment/operations/search"
-        f"?operation_type={operation_type}&limit=20&offset=0"
-    )
-    try:
-        async with httpx.AsyncClient() as http:
-            r = await http.get(
-                url,
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=15.0,
-            )
-    except Exception as err:  # noqa: BLE001
-        return {"error": "network", "detail": str(err), "url": url}
+    tokens = await ml_oauth_svc.load_user_tokens(pool, user.id) or {}
+    seller_id = tokens.get("ml_user_id")
 
-    content_type = r.headers.get("content-type", "")
-    try:
-        body = r.json() if "json" in content_type else r.text[:2000]
-    except Exception:  # noqa: BLE001
-        body = r.text[:2000]
+    base = "https://api.mercadolibre.com/stock/fulfillment/operations/search"
+    # Date range default: last 60 days, ML wants ISO with TZ
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    now = _dt.now(_tz.utc)
+    date_to = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    date_from = (now - _td(days=60)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    candidates: list[tuple[str, str]] = [
+        ("v1_no_seller", f"{base}?operation_type={operation_type}&limit=20&offset=0"),
+    ]
+    if seller_id:
+        candidates += [
+            ("v2_seller_id", f"{base}?operation_type={operation_type}&seller_id={seller_id}&limit=20&offset=0"),
+            ("v3_seller_id_dates", f"{base}?operation_type={operation_type}&seller_id={seller_id}&date_from={date_from}&date_to={date_to}&limit=20"),
+            # Some ML endpoints prefer `seller=` param name
+            ("v4_seller", f"{base}?operation_type={operation_type}&seller={seller_id}&limit=20"),
+        ]
+
+    results: list[dict[str, Any]] = []
+    async with httpx.AsyncClient() as http:
+        for label, url in candidates:
+            try:
+                r = await http.get(
+                    url,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    timeout=15.0,
+                )
+                ct = r.headers.get("content-type", "")
+                try:
+                    body = r.json() if "json" in ct else r.text[:1500]
+                except Exception:  # noqa: BLE001
+                    body = r.text[:1500]
+                results.append({
+                    "label": label,
+                    "url": url,
+                    "status": r.status_code,
+                    "content_type": ct,
+                    "body_preview": (json.dumps(body, default=str)[:500] if isinstance(body, (dict, list)) else str(body)[:500]),
+                })
+            except Exception as err:  # noqa: BLE001
+                results.append({"label": label, "url": url, "error": str(err)})
+
+    successful = next((r for r in results if r.get("status") == 200), None)
     return {
-        "url": url,
-        "status": r.status_code,
-        "headers": {
-            "content-type": content_type,
-            "x-request-id": r.headers.get("x-request-id"),
-        },
-        "body": body,
-        "hint": "200 → API works, build full-operations cache. 403/404 → endpoint not for this account, document and skip.",
+        "operation_type": operation_type,
+        "seller_id": seller_id,
+        "results": results,
+        "winning_shape": successful["label"] if successful else None,
+        "hint": (
+            "Use the `winning_shape` parameter set when building the "
+            "ml_full_operations cache. If all probes 400/403 → ML hasn't "
+            "enabled the API for this account; document and skip."
+        ),
     }
 
 

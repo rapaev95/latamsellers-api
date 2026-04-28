@@ -552,6 +552,20 @@ async def _v2_startup() -> None:
             await ml_messages_dispatch_svc.ensure_schema(pool)
         except Exception as err:  # noqa: BLE001
             _ml_log.exception("ML messages dispatch schema bootstrap failed: %s", err)
+        try:
+            # Was missing — production tables ml_ad_campaigns / ml_ad_ads
+            # were created by an older revision and never picked up the
+            # `product_id` column from later migrations. Result was a
+            # 500 UndefinedColumnError every time someone hit /ads/campaigns.
+            from v2.storage import ads_storage as _ads_storage
+            await _ads_storage.ensure_schema(pool)
+        except Exception as err:  # noqa: BLE001
+            _ml_log.exception("ads_storage schema bootstrap failed: %s", err)
+        try:
+            from v2.services import ml_orders as _ml_orders_svc
+            await _ml_orders_svc.ensure_schema(pool)
+        except Exception as err:  # noqa: BLE001
+            _ml_log.exception("ml_orders schema bootstrap failed: %s", err)
 
     # Spin up the headless Chromium used by /escalar/positions scraper.
     # Failure here is logged but non-fatal — the scraper self-heals on first use.
