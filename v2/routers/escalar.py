@@ -22,6 +22,7 @@ from v2.services import (
     ml_quality as ml_quality_svc,
     ml_scraper_chat as ml_scraper_chat_svc,
     daily_summary_dispatch as daily_summary_dispatch_svc,
+    photo_ab_dispatch as photo_ab_dispatch_svc,
     listing_journey as listing_journey_svc,
     ml_user_claims as ml_user_claims_svc,
     ml_user_items as ml_user_items_svc,
@@ -1213,6 +1214,93 @@ async def send_claim_message(
             }
         except Exception as err:  # noqa: BLE001
             return {"error": "exception", "detail": str(err)}
+
+
+@router.post("/photo-experiments")
+async def photo_experiment_start(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+    body: dict[str, Any] = Body(...),
+):
+    """Start a photo A/B test for an item.
+
+    Body:
+      item_id: str (required)
+      duration_days: int (3, 7, or 14; default 7)
+      new_picture_id: str (optional — ML picture id of the new main photo)
+      old_picture_id: str (optional)
+      ai_asset_id: int (optional — FK to escalar_generated_assets)
+      notes: str (optional)
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    item_id = (body or {}).get("item_id")
+    if not item_id or not isinstance(item_id, str):
+        return {"error": "item_id_required"}
+    duration_days = int((body or {}).get("duration_days", 7))
+    if duration_days not in (3, 7, 14):
+        return {"error": "duration_days_must_be_3_7_or_14"}
+    return await photo_ab_dispatch_svc.start_experiment(
+        pool, user.id, item_id, duration_days,
+        new_picture_id=(body or {}).get("new_picture_id"),
+        old_picture_id=(body or {}).get("old_picture_id"),
+        ai_asset_id=(body or {}).get("ai_asset_id"),
+        notes=(body or {}).get("notes"),
+    )
+
+
+@router.get("/photo-experiments")
+async def photo_experiment_list(
+    status: Optional[str] = Query(None, description="testing | completed | cancelled"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    if pool is None:
+        return {"experiments": []}
+    await photo_ab_dispatch_svc.ensure_schema(pool)
+    rows = await photo_ab_dispatch_svc.list_experiments(pool, user.id, status=status)
+    return {"experiments": rows, "total": len(rows)}
+
+
+@router.post("/photo-experiments/{experiment_id}/cancel")
+async def photo_experiment_cancel(
+    experiment_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    if pool is None:
+        return {"error": "no_db"}
+    return await photo_ab_dispatch_svc.cancel_experiment(pool, user.id, experiment_id)
+
+
+@router.post("/photo-experiments/{experiment_id}/close-now")
+async def photo_experiment_close_now(
+    experiment_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Force-close one experiment immediately (for testing the result-card
+    flow without waiting for ends_at). Same code path as the cron uses.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    await photo_ab_dispatch_svc.ensure_schema(pool)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, user_id, item_id, ai_asset_id, old_picture_id,
+                   new_picture_id, duration_days, started_at, ends_at,
+                   baseline_visits, baseline_orders
+              FROM escalar_photo_experiments
+             WHERE id = $1 AND user_id = $2 AND status = 'testing'
+            """,
+            experiment_id, user.id,
+        )
+    if not row:
+        return {"error": "not_found_or_not_testing"}
+    async with httpx.AsyncClient() as http:
+        ok = await photo_ab_dispatch_svc._close_one_experiment(pool, http, dict(row))
+    return {"ok": ok, "experiment_id": experiment_id}
 
 
 @router.post("/daily-summary/preview")

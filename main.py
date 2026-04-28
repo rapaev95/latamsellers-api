@@ -62,6 +62,7 @@ from v2.db import close_pool, create_pool, get_pool  # noqa: E402
 from v2.services import ml_backfill as ml_backfill_svc  # noqa: E402
 from v2.services import ml_claims_dispatch as ml_claims_dispatch_svc  # noqa: E402
 from v2.services import daily_summary_dispatch as daily_summary_dispatch_svc  # noqa: E402
+from v2.services import photo_ab_dispatch as photo_ab_dispatch_svc  # noqa: E402
 from v2.services import ml_item_context as ml_item_context_svc  # noqa: E402
 from v2.services import ml_messages_dispatch as ml_messages_dispatch_svc  # noqa: E402
 from v2.services import ml_notices as ml_notices_svc  # noqa: E402
@@ -138,6 +139,31 @@ async def _dispatch_claims_to_tg_job() -> None:
         )
     except Exception as err:  # noqa: BLE001
         _ml_log.exception("Claims dispatch job failed: %s", err)
+
+
+async def _dispatch_photo_ab_results_job() -> None:
+    """Close photo A/B experiments whose ends_at has passed.
+
+    Hourly cron — selects experiments with status='testing' AND
+    ends_at <= NOW(), computes treatment metrics over [started_at, ends_at]
+    using the same data sources as daily-summary, sends a TG result
+    card, marks status='completed'. ML's data ingestion has its own lag
+    so hourly granularity is fine — ends_at being a few minutes past
+    the cron tick doesn't change the verdict.
+    """
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("Photo A/B tick skipped: no DB pool")
+            return
+        result = await photo_ab_dispatch_svc.dispatch_pending_results(pool)
+        if result.get("experiments", 0) > 0:
+            _ml_log.info(
+                "Photo A/B tick: experiments=%s sent=%s",
+                result.get("experiments"), result.get("sent"),
+            )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("Photo A/B job failed: %s", err)
 
 
 async def _dispatch_daily_sales_summary_job() -> None:
@@ -623,6 +649,18 @@ async def _v2_startup() -> None:
         _dispatch_daily_sales_summary_job,
         CronTrigger(hour=_summary_hour, minute=_summary_minute, timezone="UTC"),
         id="daily_sales_summary_tg",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Photo A/B test result dispatch — every hour, picks up experiments
+    # whose ends_at has elapsed and ships the treatment-vs-baseline diff.
+    _photo_ab_interval = int(os.environ.get("PHOTO_AB_INTERVAL_MIN", "60"))
+    _ml_scheduler.add_job(
+        _dispatch_photo_ab_results_job,
+        "interval",
+        minutes=_photo_ab_interval,
+        id="photo_ab_results_tg",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
