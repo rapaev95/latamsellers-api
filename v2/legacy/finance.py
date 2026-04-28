@@ -369,13 +369,15 @@ def compute_retirada_cost(project: str, period: tuple[date, date]) -> dict:
         avg = None
     sku_idx = build_catalog_index()
     sku_mlb_idx = build_catalog_mlb_index()
-    # by_sku в raw уже содержит mlb для каждого SKU — собираем sku→mlb map.
+    # MLB-fallback в Dados Fiscais индексируется по `Código do Anúncio`
+    # (это `MLB-XXXXX` — поле `anuncio` в retirada-отчёте, НЕ `mlb` =
+    # Código ML типа KJAD81021). Собираем sku → anuncio map для lookup.
     sku_mlb_map: dict[str, str] = {}
     for forma_data in by_forma.values():
         for sku, sb in (forma_data.get("by_sku") or {}).items():
-            mlb = sb.get("mlb") or ""
-            if mlb and not sku_mlb_map.get(sku):
-                sku_mlb_map[sku] = mlb
+            anuncio = sb.get("anuncio") or sb.get("mlb") or ""
+            if anuncio and not sku_mlb_map.get(sku):
+                sku_mlb_map[sku] = anuncio
 
     for forma, bucket in by_forma.items():
         tarifa = float(bucket.get("tarifa", 0.0) or 0.0)

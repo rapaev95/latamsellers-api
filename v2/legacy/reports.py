@@ -3944,13 +3944,20 @@ def get_retirada_by_period(project: str, period_from, period_to) -> dict:
         bucket["units"] += int(r["units"])
         sku = r["sku"] or "N/A"
         sku_b = bucket["by_sku"].setdefault(sku, {
-            "units": 0, "tarifa": 0.0, "mlb": r["mlb"], "titulo": r["titulo"],
+            "units": 0, "tarifa": 0.0,
+            # mlb = Código ML (KJAD81021 etc) — для UI-ссылки на товар.
+            # anuncio = Nº do anúncio (MLB-XXXXXX) — это ключ для lookup в
+            # catalog_mlb_index (Dados Fiscais индексирует по «Código do Anúncio»).
+            "mlb": r["mlb"], "anuncio": r["anuncio"],
+            "titulo": r["titulo"],
             "custo_ids": [],
         })
         sku_b["units"] += int(r["units"])
         sku_b["tarifa"] += float(r["valor"])
         if not sku_b["mlb"] and r["mlb"]:
             sku_b["mlb"] = r["mlb"]
+        if not sku_b.get("anuncio") and r["anuncio"]:
+            sku_b["anuncio"] = r["anuncio"]
         if not sku_b["titulo"] and r["titulo"]:
             sku_b["titulo"] = r["titulo"]
         if custo_id:
