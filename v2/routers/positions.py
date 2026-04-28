@@ -28,6 +28,107 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
     return dt.isoformat() if dt else None
 
 
+@router.get("/_probe")
+async def positions_probe(
+    keyword: str = Query(..., min_length=1),
+    site_id: str = Query("MLB"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Diagnostic: hit ML JSON search API directly with the user's bearer
+    + show storage_state status. Used to figure out why /check returns
+    ml_no_results — is it the JSON API blocked, scraper blocked, or
+    actually empty results from ML?
+    """
+    if pool is None:
+        return {"error": "no_db"}
+
+    import httpx
+    from urllib.parse import quote_plus
+    from v2.services import ml_oauth as _oauth_svc, ml_scraper as _scraper
+
+    # 1. ML token state
+    try:
+        token, exp, refreshed = await _oauth_svc.get_valid_access_token(pool, user.id)
+        token_state = {
+            "ok": True,
+            "expires_at": exp.isoformat() if exp else None,
+            "refreshed_now": refreshed,
+            "token_prefix": token[:12] + "..." if token else None,
+        }
+    except Exception as err:  # noqa: BLE001
+        token = None
+        token_state = {"ok": False, "error": str(err)}
+
+    # 2. Storage state (logged-in scraper) — show whether env is set + decoded
+    storage_state_info: dict[str, Any] = {"loaded": False}
+    state = _scraper._storage_state()
+    if state is not None:
+        cookies = state.get("cookies") or []
+        storage_state_info = {
+            "loaded": True,
+            "cookies_count": len(cookies),
+            "auth_critical_present": [
+                c.get("name") for c in cookies
+                if c.get("name") in (
+                    "ssid", "nsa_rotok", "NSESSIONID_pampa_session",
+                    "_csrf", "cp", "ftid", "orguserid",
+                )
+            ],
+            "domains": sorted(set((c.get("domain") or "").lstrip(".") for c in cookies)),
+        }
+
+    # 3. JSON API direct call
+    json_api: dict[str, Any] = {"called": False}
+    if token:
+        url = (
+            f"https://api.mercadolibre.com/sites/{site_id}/search"
+            f"?q={quote_plus(keyword)}&limit=10&offset=0"
+        )
+        try:
+            async with httpx.AsyncClient() as http:
+                r = await http.get(
+                    url,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=15.0,
+                )
+            try:
+                body = r.json()
+            except Exception:  # noqa: BLE001
+                body = None
+            sample_ids = []
+            paging = None
+            if isinstance(body, dict):
+                paging = body.get("paging")
+                results = body.get("results") or []
+                for it in results[:5]:
+                    sample_ids.append({
+                        "id": it.get("id"),
+                        "title": (it.get("title") or "")[:80],
+                        "tags": it.get("tags") or [],
+                    })
+            json_api = {
+                "called": True,
+                "url": url,
+                "status": r.status_code,
+                "content_type": r.headers.get("content-type"),
+                "body_preview": r.text[:500],
+                "paging": paging,
+                "sample_first_5": sample_ids,
+            }
+        except Exception as err:  # noqa: BLE001
+            json_api = {"called": True, "url": url, "error": str(err)}
+
+    return {
+        "user_id": user.id,
+        "keyword": keyword,
+        "site_id": site_id,
+        "token": token_state,
+        "storage_state": storage_state_info,
+        "json_api": json_api,
+    }
+
+
 @router.get("/check", response_model=PositionCheckOut)
 async def check(
     item_id: str = Query(..., min_length=3),
