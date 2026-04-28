@@ -1343,6 +1343,71 @@ async def returns_probe(
 # To probe meaningfully we need an order_id the seller knows is the
 # unread one; user passes it in the query string.
 
+@router.get("/scraper/ip-probe")
+async def scraper_ip_probe(
+    user: CurrentUser = Depends(current_user),
+):
+    """Probe whether ML's seller-hub URL is reachable from Railway's IP at
+    all, BEFORE we ask the seller to extract their storage_state cookies.
+    Opens https://www.mercadolivre.com.br/ in headless Chromium and reports
+    the page title + first chunk of body — Cloudflare blocks return
+    'Access denied' / 'Pardon Our Interruption' / 'Cloudflare', success
+    returns the normal homepage.
+    """
+    import asyncio as _asyncio
+    from concurrent.futures import ThreadPoolExecutor as _Pool
+    from playwright.sync_api import sync_playwright as _sync_playwright
+
+    def _probe() -> dict[str, Any]:
+        with _sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                ctx = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/129.0.0.0 Safari/537.36"
+                    ),
+                    locale="pt-BR",
+                )
+                page = ctx.new_page()
+                page.set_default_timeout(20000)
+                resp = page.goto(
+                    "https://www.mercadolivre.com.br/",
+                    wait_until="domcontentloaded",
+                )
+                status = resp.status if resp else 0
+                title = page.title() or ""
+                body_preview = page.content()[:1500]
+                # Cloudflare / bot-detection markers
+                lowered = body_preview.lower()
+                blocked_markers = [
+                    "access denied",
+                    "pardon our interruption",
+                    "cloudflare",
+                    "checking your browser",
+                    "captcha",
+                    "blocked",
+                ]
+                blocked_hits = [m for m in blocked_markers if m in lowered]
+                ctx.close()
+                return {
+                    "status": status,
+                    "title": title,
+                    "blockedMarkers": blocked_hits,
+                    "blocked": bool(blocked_hits),
+                    "bodyPreview": body_preview[:600],
+                }
+            finally:
+                browser.close()
+
+    try:
+        result = await _asyncio.to_thread(_probe)
+        return result
+    except Exception as err:  # noqa: BLE001
+        return {"error": "probe_exception", "detail": str(err)}
+
+
 @router.get("/scraper/chat-read")
 async def scraper_chat_read(
     pack_id: str = Query(..., description="Pack ID from ML — first part of the URL after /mensagens/"),
