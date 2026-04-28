@@ -43,6 +43,11 @@ BRT = timezone(timedelta(hours=-3))
 PER_USER_INTER_KW_S = float(os.environ.get("POSITIONS_PER_USER_INTER_KW_S", "12"))
 PER_USER_INTER_KW_JITTER_S = float(os.environ.get("POSITIONS_PER_USER_INTER_KW_JITTER_S", "5"))
 PER_USER_MAX_KW = int(os.environ.get("POSITIONS_PER_USER_MAX_KW", "30"))
+# Don't re-check the same (item, keyword) more often than this. Default
+# 16h means 3 cron ticks/day (~5h apart) plus jitter never re-fires the
+# same row within a tick. With 200 keywords this naturally rotates the
+# queue: each tick picks the 30 staletest items.
+MIN_KW_INTERVAL_HOURS = float(os.environ.get("POSITIONS_MIN_KW_INTERVAL_HOURS", "16"))
 HEALTH_FAILURE_THRESHOLD = float(os.environ.get("POSITIONS_HEALTH_FAILURE_THRESHOLD", "0.7"))
 
 
@@ -78,20 +83,56 @@ async def _refresh_one_user(
     record into position_history. Returns counts of ok/fail/skipped."""
     from v2.storage import positions_storage  # late import to avoid circular
 
+    # Stale-first ordering with re-check throttle.
+    # LEFT JOIN against position_history's latest row per (item, keyword).
+    # NULL last_check (never checked) sorts first. Then those whose last
+    # check is OLDER than MIN_KW_INTERVAL_HOURS get refreshed in age
+    # order. Anything checked more recently is filtered out — so even if
+    # cron fires multiple times per day, we never re-check the same
+    # keyword within ~16h.
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, item_id, keyword, site_id, category_id
-              FROM tracked_keywords
-             WHERE user_id = $1
-             ORDER BY created_at ASC
+            WITH latest AS (
+                SELECT DISTINCT ON (user_id, item_id, keyword)
+                       user_id, item_id, keyword, checked_at
+                  FROM position_history
+                 WHERE user_id = $1
+                 ORDER BY user_id, item_id, keyword, checked_at DESC
+            )
+            SELECT t.id, t.item_id, t.keyword, t.site_id, t.category_id,
+                   l.checked_at AS last_checked_at
+              FROM tracked_keywords t
+              LEFT JOIN latest l
+                ON l.user_id = t.user_id
+               AND l.item_id = t.item_id
+               AND l.keyword = t.keyword
+             WHERE t.user_id = $1
+               AND (
+                 l.checked_at IS NULL
+                 OR l.checked_at < NOW() - ($3 * INTERVAL '1 hour')
+               )
+             ORDER BY l.checked_at NULLS FIRST, t.created_at ASC
              LIMIT $2
             """,
-            user_id, PER_USER_MAX_KW,
+            user_id, PER_USER_MAX_KW, MIN_KW_INTERVAL_HOURS,
         )
     tracked = [dict(r) for r in rows]
+
+    # Get total count of user's keywords for ratio context (skipped =
+    # those filtered by min-interval).
+    async with pool.acquire() as conn:
+        total_owned = await conn.fetchval(
+            "SELECT COUNT(*) FROM tracked_keywords WHERE user_id = $1",
+            user_id,
+        )
+
     if not tracked:
-        return {"tracked": 0, "ok": 0, "fail": 0, "skipped": 0}
+        return {
+            "tracked": 0, "ok": 0, "fail": 0, "skipped": 0,
+            "total_owned": int(total_owned or 0),
+            "reason": "all_recent" if total_owned else "no_keywords",
+        }
 
     # Get bearer once for all checks (auto-refreshed inside check_position
     # if it expires mid-run)
@@ -136,7 +177,14 @@ async def _refresh_one_user(
         # Polite inter-keyword pause regardless of success/failure
         await _polite_inter_keyword_sleep()
 
-    return {"tracked": len(tracked), "ok": ok, "fail": fail, "skipped": 0}
+    return {
+        "tracked": len(tracked),
+        "ok": ok,
+        "fail": fail,
+        "skipped": 0,
+        "total_owned": int(total_owned or len(tracked)),
+        "deferred_due_to_recent_check": int((total_owned or 0) - len(tracked)),
+    }
 
 
 # ── Health alert ──────────────────────────────────────────────────────────

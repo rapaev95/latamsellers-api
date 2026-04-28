@@ -727,46 +727,55 @@ async def _v2_startup() -> None:
         coalesce=True,
         replace_existing=True,
     )
-    # Daily positions refresh — once a day at a quiet hour but with
-    # heavy randomization so the schedule never lands on the same
-    # HH:MM:SS twice. ML's fraud detection weights perfectly periodic
-    # patterns — jitter + per-deploy hour offset breaks both.
+    # Positions refresh — 3 ticks per day so users with 100-200
+    # tracked keywords can rotate through their queue in ~2-3 days
+    # instead of a week. Each tick:
+    #   - picks PER_USER_MAX_KW (default 30) STALEST items
+    #   - skips items checked within MIN_KW_INTERVAL_HOURS (16h)
+    #   - throttles 12s ± 5s between keywords + 3-8s between users
+    # Combined with cron jitter ±25min, no two ticks fire at exactly
+    # the same time of day across deploys.
     #
-    # Schedule:
-    #   - hour: random within [08, 10] BRT (= [11, 13] UTC) per deploy
-    #   - minute: random 0-59 per deploy
-    #   - jitter: ±25min applied each fire so consecutive days drift
-    #
-    # Effective window: roughly 08:00-10:55 BRT, never the same minute
-    # twice in a row, never on a sharp hour boundary.
+    # Default schedule (env-overridable):
+    #   - tick 1: ~12 UTC (= 09 BRT) — morning
+    #   - tick 2: ~17 UTC (= 14 BRT) — afternoon
+    #   - tick 3: ~22 UTC (= 19 BRT) — evening
+    # Each minute is randomized per deploy → not on round numbers.
     import random as _rnd
-    _positions_hour = int(os.environ.get(
-        "POSITIONS_REFRESH_HOUR_UTC", str(_rnd.choice([11, 12, 13])),
-    ))
-    _positions_minute = int(os.environ.get(
-        "POSITIONS_REFRESH_MINUTE_UTC", str(_rnd.randint(3, 57)),
-    ))
     _positions_jitter_s = int(os.environ.get(
         "POSITIONS_REFRESH_JITTER_S", "1500",  # ±25 min
     ))
-    _ml_scheduler.add_job(
-        _dispatch_positions_refresh_job,
-        CronTrigger(
-            hour=_positions_hour,
-            minute=_positions_minute,
-            timezone="UTC",
-            jitter=_positions_jitter_s,
-        ),
-        id="positions_refresh_daily",
-        max_instances=1,
-        coalesce=True,
-        replace_existing=True,
-    )
-    _ml_log.info(
-        "positions_refresh_daily scheduled: %02d:%02d UTC ± %ds (≈ %02d:%02d BRT)",
-        _positions_hour, _positions_minute, _positions_jitter_s,
-        (_positions_hour - 3) % 24, _positions_minute,
-    )
+    _positions_default_hours_utc = [12, 17, 22]
+    _positions_hours_env = os.environ.get("POSITIONS_REFRESH_HOURS_UTC", "").strip()
+    if _positions_hours_env:
+        try:
+            _positions_hours = [int(x) for x in _positions_hours_env.split(",") if x.strip()]
+        except ValueError:
+            _positions_hours = _positions_default_hours_utc
+    else:
+        _positions_hours = _positions_default_hours_utc
+
+    for _idx, _hour in enumerate(_positions_hours):
+        # Per-tick random minute, never on the hour
+        _minute = _rnd.randint(3, 57)
+        _ml_scheduler.add_job(
+            _dispatch_positions_refresh_job,
+            CronTrigger(
+                hour=_hour,
+                minute=_minute,
+                timezone="UTC",
+                jitter=_positions_jitter_s,
+            ),
+            id=f"positions_refresh_tick_{_idx + 1}",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+        )
+        _ml_log.info(
+            "positions_refresh tick %d scheduled: %02d:%02d UTC ± %ds (≈ %02d:%02d BRT)",
+            _idx + 1, _hour, _minute, _positions_jitter_s,
+            (_hour - 3) % 24, _minute,
+        )
     # Anomalies dispatch — fires 30 minutes after daily-summary so the
     # seller sees the recap first, then the anomaly follow-up.
     _anomalies_hour = int(os.environ.get("ANOMALIES_TG_HOUR_UTC", "23"))
