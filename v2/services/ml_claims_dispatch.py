@@ -671,37 +671,45 @@ def _build_claim_card(
     return "\n".join(lines)
 
 
+def _seller_available_actions(claim: Optional[dict[str, Any]]) -> set[str]:
+    """Extract action names from claim.players[type=seller].available_actions.
+    Per ML official docs this is the source of truth — POSTs to ML for any
+    action NOT in this set return 400 'Not valid action ... for player role'.
+    """
+    if not isinstance(claim, dict):
+        return set()
+    out: set[str] = set()
+    for p in claim.get("players") or []:
+        if not isinstance(p, dict):
+            continue
+        if p.get("type") != "seller" and p.get("role") != "respondent":
+            continue
+        for a in p.get("available_actions") or []:
+            if isinstance(a, dict):
+                name = a.get("action")
+            else:
+                name = str(a)
+            if name:
+                out.add(name)
+    return out
+
+
 def _build_keyboard(
     claim_id: int,
     app_base_url: str,
     recommended_action: Optional[str] = None,
     claim: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Stage-aware inline keyboard.
+    """Build keyboard ONLY from actions ML lists in claim.players[seller]
+    .available_actions — anything else 400s with "Not valid action".
 
-    Per ML's official docs, the resolution flow has THREE phases each with
-    different valid endpoints:
-
-    1. EARLY (no return yet, claim.returns is empty)
-       → POST /expected-resolutions/{refund|return_product|change_product|partial-refund}
-       → Buttons: Reembolsar / Aceitar devolução / Trocar / Reembolso parcial
-
-    2. RETURN IN TRANSIT (returns[0].status in {label_generated, shipped, ...})
-       → No seller action available, just wait for delivery
-       → Buttons: only Atender no app / Ver no ML
-
-    3. RETURN DELIVERED (returns[0].status == 'delivered')
-       → POST /post-purchase/v1/returns/{return_id}/return-review
-         - Empty body {} for OK
-         - {reason, message, attachments[]} for FAIL (needs reason/photos → app)
-       → Buttons: ✅ Aprovar OK / ❌ Reportar problema (→ app) / app+ml
-
-    callback_data prefixes:
-      cl_rf:{claim_id}                 → refund (full)              [early]
-      cl_rt:{claim_id}                 → return_product             [early]
-      cl_ex:{claim_id}                 → change_product             [early]
-      cl_pa:{claim_id}                 → partial-refund (→ app)     [early]
-      cl_ok:{claim_id}:{return_id}     → return-review OK           [delivered]
+    Mapping ML action → our callback prefix:
+      refund                → cl_rf  (full refund)
+      return_product        → cl_rt  (accept return)
+      change_product        → cl_ex  (exchange)
+      partial_refund        → cl_pa  (partial — needs amount, → app)
+      return_review_ok      → cl_ok  (return arrived OK)
+      return_review_fail    → URL    (needs reason+photos, → app)
     """
     def _label(base: str, action_key: str) -> str:
         return f"⭐ {base}" if recommended_action == action_key else base
@@ -709,77 +717,60 @@ def _build_keyboard(
     app_link = f"{app_base_url.rstrip('/')}/escalar/claims"
     ml_link = f"https://myaccount.mercadolivre.com.br/post-purchase/cases/{claim_id}"
 
-    # Detect stage from claim.returns + claim.stage
+    # ML's source of truth — what seller can actually do on this claim.
+    seller_actions = _seller_available_actions(claim)
+
+    # Need return_id for return-review actions. From claim.returns[0].id.
     returns = (claim or {}).get("returns") if isinstance(claim, dict) else None
     head_return: dict[str, Any] = {}
     if isinstance(returns, list) and returns and isinstance(returns[0], dict):
         head_return = returns[0]
-    return_status = (head_return.get("status") or "").lower()
     return_id = head_return.get("id")
-    claim_stage = ((claim or {}).get("stage") or "").lower() if isinstance(claim, dict) else ""
 
-    # Stage 3: return delivered → return-review flow
-    if return_status == "delivered" and return_id:
-        return {
-            "inline_keyboard": [
-                [
-                    {
-                        "text": "✅ Aprovar devolução (OK)",
-                        "callback_data": f"cl_ok:{claim_id}:{return_id}",
-                    },
-                    # Failed review needs reason + message + attachments — too
-                    # complex for a single tap. Send to app where the form lives.
-                    {"text": "❌ Reportar problema", "url": f"{app_base_url.rstrip('/')}/escalar/claims"},
-                ],
-                [
-                    {"text": "⚡ Atender no app", "url": app_link},
-                    {"text": "🔗 Ver no ML", "url": ml_link},
-                ],
-            ],
-        }
+    rows: list[list[dict[str, Any]]] = []
 
-    # Stage 2: return in transit → no seller action available
-    if return_status and return_status not in ("delivered",):
-        return {
-            "inline_keyboard": [
-                [
-                    {"text": "⚡ Atender no app", "url": app_link},
-                    {"text": "🔗 Ver no ML", "url": ml_link},
-                ],
-            ],
-        }
+    # Row 1+: build action buttons strictly from ML's available_actions.
+    # If ML didn't list an action — don't show its button. No more 400s.
+    pair: list[dict[str, Any]] = []
 
-    # Stage 2b: claim in dispute/mediation stage WITHOUT a return yet —
-    # ML mediator already engaged, public /expected-resolutions endpoint
-    # 400s with "Resource not available". Only the seller-hub UI can pick.
-    if claim_stage in ("dispute", "mediation"):
-        return {
-            "inline_keyboard": [
-                [
-                    {"text": "⚡ Atender no app", "url": app_link},
-                    {"text": "🔗 Ver no ML", "url": ml_link},
-                ],
-            ],
-        }
+    def _add_btn(btn: dict[str, Any]) -> None:
+        pair.append(btn)
+        if len(pair) == 2:
+            rows.append(list(pair))
+            pair.clear()
 
-    # Stage 1: early (stage='claim', no return yet) — full action set works.
-    # ~3 of these closed today via /expected-resolutions/{action}.
-    return {
-        "inline_keyboard": [
-            [
-                {"text": _label("💵 Reembolsar", "cl_rf"), "callback_data": f"cl_rf:{claim_id}"},
-                {"text": _label("↩️ Aceitar devolução", "cl_rt"), "callback_data": f"cl_rt:{claim_id}"},
-            ],
-            [
-                {"text": _label("🔄 Trocar", "cl_ex"), "callback_data": f"cl_ex:{claim_id}"},
-                {"text": _label("💸 Reembolso parcial", "cl_pa"), "callback_data": f"cl_pa:{claim_id}"},
-            ],
-            [
-                {"text": "⚡ Atender no app", "url": app_link},
-                {"text": "🔗 Ver no ML", "url": ml_link},
-            ],
-        ],
-    }
+    # Early-stage actions (claim → expected-resolutions)
+    if "refund" in seller_actions:
+        _add_btn({"text": _label("💵 Reembolsar", "cl_rf"), "callback_data": f"cl_rf:{claim_id}"})
+    if "return_product" in seller_actions:
+        _add_btn({"text": _label("↩️ Aceitar devolução", "cl_rt"), "callback_data": f"cl_rt:{claim_id}"})
+    if "change_product" in seller_actions:
+        _add_btn({"text": _label("🔄 Trocar", "cl_ex"), "callback_data": f"cl_ex:{claim_id}"})
+    if "partial_refund" in seller_actions or "partial-refund" in seller_actions:
+        _add_btn({"text": _label("💸 Reembolso parcial", "cl_pa"), "callback_data": f"cl_pa:{claim_id}"})
+    # Return-delivered actions (return → return-review)
+    if "return_review_ok" in seller_actions and return_id:
+        _add_btn({
+            "text": "✅ Aprovar devolução (OK)",
+            "callback_data": f"cl_ok:{claim_id}:{return_id}",
+        })
+    if "return_review_fail" in seller_actions:
+        _add_btn({
+            "text": "❌ Reportar problema",
+            "url": f"{app_base_url.rstrip('/')}/escalar/claims",
+        })
+
+    # Flush any odd button into its own row
+    if pair:
+        rows.append(list(pair))
+
+    # Always offer escape hatches.
+    rows.append([
+        {"text": "⚡ Atender no app", "url": app_link},
+        {"text": "🔗 Ver no ML", "url": ml_link},
+    ])
+
+    return {"inline_keyboard": rows}
 
 
 async def _tg_post(http: httpx.AsyncClient, bot_token: str, payload: dict[str, Any]) -> tuple[int, str, Optional[str]]:
