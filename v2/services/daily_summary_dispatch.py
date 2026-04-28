@@ -174,19 +174,17 @@ async def _aggregate_user_metrics(
 
     # 4b. Enrich top/worst with SEO position + ads status. Two cheap
     # joins: position_history (latest per item across all tracked
-    # keywords) + ml_ad_ads (any active ad row for the item). Without
-    # this the seller has to guess «works in ads or organic» when
-    # planning what to scale.
+    # keywords, INCLUDING found=false rows so we can say «item не
+    # найден в топ-250 по X») + ml_ad_ads.
     enrich_mlbs = [it["mlb"] for it in (top_items + worst_items) if it.get("mlb")]
     if enrich_mlbs:
         async with pool.acquire() as conn:
             pos_rows = await conn.fetch(
                 """
                 SELECT DISTINCT ON (item_id)
-                       item_id, position, keyword, found
+                       item_id, position, keyword, found, total_results
                   FROM position_history
                  WHERE user_id = $1 AND item_id = ANY($2::text[])
-                   AND found = TRUE
                  ORDER BY item_id, checked_at DESC
                 """,
                 user_id, enrich_mlbs,
@@ -202,7 +200,15 @@ async def _aggregate_user_metrics(
                 """,
                 user_id, enrich_mlbs,
             )
-        pos_map = {r["item_id"]: {"position": r["position"], "keyword": r["keyword"]} for r in pos_rows}
+        pos_map = {
+            r["item_id"]: {
+                "position": r["position"],
+                "keyword": r["keyword"],
+                "found": r["found"],
+                "total_results": r["total_results"],
+            }
+            for r in pos_rows
+        }
         ads_map = {r["item_id"]: bool(r["ads_active"]) for r in ad_rows}
         for it in top_items + worst_items:
             mlb = it.get("mlb")
@@ -211,6 +217,13 @@ async def _aggregate_user_metrics(
             p = pos_map.get(mlb)
             it["position"] = p["position"] if p else None
             it["position_keyword"] = p["keyword"] if p else None
+            # `position_checked` = item HAS a position_history row, whether
+            # found or not. Renderer differentiates 3 states:
+            #   - never checked (no row): no SEO line
+            #   - checked + found:   🔍 ОРГАНИКА #N (kw)
+            #   - checked + not in scanned depth: 🔎 не найдена в топ-N
+            it["position_checked"] = p is not None
+            it["position_total"] = p.get("total_results") if p else None
             it["ads_active"] = ads_map.get(mlb, False)
 
     # 5. Conversion (orders / visits * 100)
@@ -378,22 +391,37 @@ def _build_card(
 
     def _seo_ads_line(it: dict[str, Any]) -> Optional[str]:
         """Build an inline 'SEO + ads' annotation under each top/worst
-        item. Skipped entirely when both signals are absent (item not
-        tracked + not in active ads) so we don't waste real estate."""
+        item. Three SEO states:
+          - never checked (no position_history row): SEO part skipped
+          - checked + found in organic: 🔍 ОРГАНИКА #N («keyword»)
+          - checked + not in scanned depth: 🔎 не найдена в топ-N («keyword»)
+        Plus ads ON/OFF on its own line (always shown when known).
+        Whole annotation skipped only if BOTH SEO and ads are unknown.
+        """
         position = it.get("position")
+        position_checked = bool(it.get("position_checked"))
         ads_active = it.get("ads_active")
-        if position is None and ads_active is None:
+        if not position_checked and ads_active is None:
             return None
         parts: list[str] = []
+        kw = (it.get("position_keyword") or "").strip()
+        kw_short = (kw[:25] + "…") if len(kw) > 26 else kw
         if position is not None and position > 0:
-            kw = (it.get("position_keyword") or "").strip()
-            kw_short = (kw[:25] + "…") if len(kw) > 26 else kw
             organic = "ОРГАНИКА" if lang == "ru" else "ORGÂNICO"
             place = "место" if lang == "ru" else "lugar"
             if kw_short:
                 parts.append(f"🔍 {_esc(organic)} \\#{int(position)} \\({_esc(kw_short)}\\)")
             else:
                 parts.append(f"🔍 {_esc(organic)} \\#{int(position)} {_esc(place)}")
+        elif position_checked:
+            # Item tracked but not in scanned depth — still surface a
+            # signal so the seller knows their listing ranks low.
+            depth_label = "топ\\-250" if lang == "ru" else "top\\-250"
+            not_in = "не найдена в" if lang == "ru" else "fora do"
+            if kw_short:
+                parts.append(f"🔎 {_esc(not_in)} {depth_label} \\(«{_esc(kw_short)}»\\)")
+            else:
+                parts.append(f"🔎 {_esc(not_in)} {depth_label}")
         if ads_active is True:
             ads_on = "РЕКЛАМА = ON" if lang == "ru" else "ADS = ON"
             parts.append(f"📢 {_esc(ads_on)}")
