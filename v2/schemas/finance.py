@@ -52,7 +52,11 @@ class PnLReportOut(BaseModel):
     # Retirada de estoque Full breakdown (вывоз/утилизация). См. legacy/finance.compute_retirada_cost.
     # Shape: {tarifa_envio, tarifa_descarte, cogs_descarte, tarifa_other, units_*,
     # missing_cost_skus: [{sku,units,mlb,titulo}], fallback_avg_used,
-    # by_sku: {sku → {forma, units, tarifa, cogs, cost_source, mlb, titulo}},
+    # by_sku: {sku → {forma, units, tarifa, cogs, cost_source, mlb, titulo, custo_ids}},
+    # by_custo_id: {custo_id → {custo_id, date, sku, mlb, titulo, variacao, units, valor,
+    #               original_forma, effective_forma, overridden}},
+    # overrides_applied: int — сколько строк было вручную переключено через
+    # POST /finance/retirada-overrides,
     # rows_count, source_files}.
     retirada_summary: Optional[dict[str, Any]] = None
 
@@ -253,6 +257,38 @@ class PnlMatrixOut(BaseModel):
     months: list[str]    # sorted YYYY-MM
     years: list[str]
     rows: list[PnlMatrixRow]
+
+
+# ── Retirada Overrides (per-row политика «списание / в обороте») ────────────
+#
+# Хранится в user_data JSONB (per-user, per-project, per-custo_id).
+# По умолчанию forma берётся из ML-отчёта (Forma de retirada). Override
+# переопределяет это значение — например, ML записал Envio para o endereço,
+# но реально товар утилизирован → пользователь ставит forma="descarte"
+# через POST /finance/retirada-overrides. Логика (Envio = только тариф,
+# Descarte = тариф + COGS) — в legacy/finance.compute_retirada_cost.
+
+class RetiradaOverrideItem(BaseModel):
+    """Один override для retirada-операции. forma — финальное значение."""
+    custo_id: str
+    forma: str  # "descarte" | "envio"
+
+
+class RetiradaOverridesIn(BaseModel):
+    """POST body. Заменяет override-map для проекта целиком (replace, не merge).
+    Передавай пустой `overrides: []` чтобы сбросить все overrides проекта.
+    """
+    project: str
+    overrides: list[RetiradaOverrideItem]
+
+
+class RetiradaOverridesOut(BaseModel):
+    project: str
+    # custo_id → forma ("descarte" | "envio"). Возвращается отфильтрованным:
+    # только legitimate values (legacy/reports.load_retirada_overrides
+    # канонизирует и отбрасывает мусор).
+    overrides: dict[str, str]
+    saved_count: int = 0     # сколько записей сохранилось (на ответе POST)
 
 
 # ── Orphan Pacotes (multi-item ML orders without per-SKU rows) ──────────────

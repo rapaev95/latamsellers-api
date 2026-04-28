@@ -3836,19 +3836,84 @@ def load_retirada_estoque_report() -> "pd.DataFrame | None":
     return df
 
 
+# ── Retirada overrides (per-row политика «списание / в обороте») ─────────────
+# Хранится в user_data JSONB по ключу `retirada_overrides`. Shape:
+#   {project: {custo_id: "descarte" | "envio"}}
+# При расчёте retirada (get_retirada_by_period) override переопределяет
+# `forma` из ML-отчёта на лету. UI редактирует через POST endpoint.
+
+_RETIRADA_OVERRIDES_KEY = "retirada_overrides"
+
+
+def load_retirada_overrides(project: str) -> dict[str, str]:
+    """Возвращает {custo_id: forma} для проекта текущего пользователя.
+
+    Если override не задан или БД недоступна — пустой dict (значит используется
+    `forma` из ML без изменений).
+    """
+    try:
+        from .db_storage import db_load
+        all_data = db_load(_RETIRADA_OVERRIDES_KEY) or {}
+    except Exception:
+        return {}
+    if not isinstance(all_data, dict):
+        return {}
+    proj_data = all_data.get(project) or {}
+    if not isinstance(proj_data, dict):
+        return {}
+    # Канонизируем значения: только descarte/envio. Пустые/неизвестные — отбрасываем.
+    out: dict[str, str] = {}
+    for cid, forma in proj_data.items():
+        f = str(forma or "").strip().lower()
+        if f == "descarte":
+            out[str(cid)] = RETIRADA_FORMA_DESCARTE
+        elif f in ("envio", "envio_endereco", "envio para o endereço", "envio para o endereco"):
+            out[str(cid)] = RETIRADA_FORMA_ENVIO
+    return out
+
+
+def save_retirada_overrides(project: str, overrides: dict[str, str]) -> bool:
+    """Заменяет override-map для проекта целиком. Передавай пустой dict
+    `{}` чтобы сбросить все overrides проекта.
+
+    Возвращает True если запись прошла. Канонизирует forma — допустимо только
+    `descarte` или `envio`; всё остальное отбрасывается.
+    """
+    try:
+        from .db_storage import db_load, db_save
+    except Exception:
+        return False
+    all_data = db_load(_RETIRADA_OVERRIDES_KEY) or {}
+    if not isinstance(all_data, dict):
+        all_data = {}
+    cleaned: dict[str, str] = {}
+    for cid, forma in (overrides or {}).items():
+        f = str(forma or "").strip().lower()
+        if f == "descarte":
+            cleaned[str(cid)] = "descarte"
+        elif f in ("envio", "envio_endereco", "envio para o endereço", "envio para o endereco"):
+            cleaned[str(cid)] = "envio"
+    all_data[project] = cleaned
+    return bool(db_save(_RETIRADA_OVERRIDES_KEY, all_data))
+
+
 def get_retirada_by_period(project: str, period_from, period_to) -> dict:
     """Сумма retirada (тариф + единицы) для проекта в окне [from, to].
 
-    Возвращает {total_tarifa, total_units, by_forma, rows_count, source_files}.
-    by_forma — dict[forma_name → {tarifa, units, by_sku: {sku → {units, tarifa,
-    mlb, titulo}}}]. by_sku нужен для расчёта COGS в compute_retirada_cost
-    (per-SKU из каталога с fallback на avg_cost_per_unit_brl).
+    Возвращает {total_tarifa, total_units, by_forma, by_custo_id, rows_count,
+    source_files, overrides_applied}.
+    - by_forma — dict[forma → {tarifa, units, by_sku: {sku → {units, tarifa,
+      mlb, titulo, custo_ids: [str]}}}]
+    - by_custo_id — dict[custo_id → row_detail], нужен UI для показа модалки
+      с тогглами per-row.
+    - overrides_applied — int, сколько строк было переопределено вручную.
     """
     df = load_retirada_estoque_report()
     if df is None or df.empty:
         return {
             "total_tarifa": 0.0, "total_units": 0,
-            "by_forma": {}, "rows_count": 0, "source_files": [],
+            "by_forma": {}, "by_custo_id": {}, "rows_count": 0,
+            "source_files": [], "overrides_applied": 0,
         }
     sources = df.attrs.get("__source_files", [])
     sub = df[(df["__project"] == project) &
@@ -3857,18 +3922,30 @@ def get_retirada_by_period(project: str, period_from, period_to) -> dict:
     if sub.empty:
         return {
             "total_tarifa": 0.0, "total_units": 0,
-            "by_forma": {}, "rows_count": 0, "source_files": sources,
+            "by_forma": {}, "by_custo_id": {}, "rows_count": 0,
+            "source_files": sources, "overrides_applied": 0,
         }
 
+    overrides = load_retirada_overrides(project)
+    overrides_applied = 0
     by_forma: dict = {}
+    by_custo_id: dict = {}
     for _, r in sub.iterrows():
-        forma = r["forma"] or "—"
-        bucket = by_forma.setdefault(forma, {"tarifa": 0.0, "units": 0, "by_sku": {}})
+        original_forma = r["forma"] or "—"
+        custo_id = r.get("custo_id") or ""
+        # Применяем override если есть.
+        effective_forma = original_forma
+        if custo_id and custo_id in overrides:
+            effective_forma = overrides[custo_id]
+            if effective_forma != original_forma:
+                overrides_applied += 1
+        bucket = by_forma.setdefault(effective_forma, {"tarifa": 0.0, "units": 0, "by_sku": {}})
         bucket["tarifa"] += float(r["valor"])
         bucket["units"] += int(r["units"])
         sku = r["sku"] or "N/A"
         sku_b = bucket["by_sku"].setdefault(sku, {
             "units": 0, "tarifa": 0.0, "mlb": r["mlb"], "titulo": r["titulo"],
+            "custo_ids": [],
         })
         sku_b["units"] += int(r["units"])
         sku_b["tarifa"] += float(r["valor"])
@@ -3876,13 +3953,31 @@ def get_retirada_by_period(project: str, period_from, period_to) -> dict:
             sku_b["mlb"] = r["mlb"]
         if not sku_b["titulo"] and r["titulo"]:
             sku_b["titulo"] = r["titulo"]
+        if custo_id:
+            sku_b["custo_ids"].append(custo_id)
+        if custo_id:
+            by_custo_id[custo_id] = {
+                "custo_id": custo_id,
+                "date": r["date"].isoformat() if hasattr(r["date"], "isoformat") else str(r["date"]),
+                "sku": sku,
+                "mlb": r["mlb"],
+                "titulo": r["titulo"],
+                "variacao": r["variacao"],
+                "units": int(r["units"]),
+                "valor": float(r["valor"]),
+                "original_forma": original_forma,
+                "effective_forma": effective_forma,
+                "overridden": effective_forma != original_forma,
+            }
 
     return {
         "total_tarifa": float(sub["valor"].sum()),
         "total_units": int(sub["units"].sum()),
         "by_forma": by_forma,
+        "by_custo_id": by_custo_id,
         "rows_count": int(len(sub)),
         "source_files": sources,
+        "overrides_applied": overrides_applied,
     }
 
 

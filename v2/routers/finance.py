@@ -24,6 +24,7 @@ from v2.schemas.finance import (
     SkuMappingOut, SkuBulkSaveIn, SkuBulkSaveOut,
     PnlMatrixOut,
     OrphanPacotesResponse, OrphanSaveIn, OrphanSaveOut,
+    RetiradaOverridesIn,
     UploadsListOut, UploadSaveOut, SourceCatalogOut,
     RulesOut, RulesSaveIn, TransactionsOut,
     ClassificationSaveIn, ClassificationSaveOut,
@@ -1177,6 +1178,59 @@ def save_orphan_pacotes(
     changed = save_orphan_assignments_bulk(body.assignments or {})
     total = len(load_orphan_assignments() or {})
     return {"saved": changed, "total_assignments": total}
+
+
+# ── Retirada Overrides (per-row политика «списание / в обороте») ────────────
+
+@router.get("/retirada-overrides")
+def get_retirada_overrides(
+    project: str = Query(..., min_length=1),
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Map текущих override'ов retirada-операций для проекта.
+
+    Если override не задан, в response будет `overrides: {}` — это значит
+    `Forma de retirada` берётся из ML-отчёта (Envio/Descarte) без изменений.
+    """
+    _bind_user(user)
+    from v2.legacy.reports import load_retirada_overrides
+    raw = load_retirada_overrides(project) or {}
+    # Канонизируем для UI: descarte/envio в lowercase.
+    canon = {
+        cid: ("descarte" if str(forma).strip().lower().startswith("descart") else "envio")
+        for cid, forma in raw.items()
+    }
+    return {"project": project, "overrides": canon, "saved_count": 0}
+
+
+@router.post("/retirada-overrides")
+def save_retirada_overrides_endpoint(
+    body: RetiradaOverridesIn,
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Замена (replace, не merge) override-карты для проекта.
+
+    Передай `overrides: []` чтобы сбросить все overrides проекта целиком.
+    legacy/reports.save_retirada_overrides канонизирует значения — допустимо
+    только `descarte` или `envio`, всё остальное отбрасывается.
+    """
+    _bind_user(user)
+    from v2.legacy.reports import save_retirada_overrides, load_retirada_overrides
+    overrides_map: dict[str, str] = {}
+    for item in body.overrides or []:
+        cid = str(item.custo_id or "").strip()
+        if not cid:
+            continue
+        overrides_map[cid] = str(item.forma or "").strip().lower()
+    ok = save_retirada_overrides(body.project, overrides_map)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to save retirada overrides")
+    saved = load_retirada_overrides(body.project) or {}
+    canon = {
+        cid: ("descarte" if str(forma).strip().lower().startswith("descart") else "envio")
+        for cid, forma in saved.items()
+    }
+    return {"project": body.project, "overrides": canon, "saved_count": len(canon)}
 
 
 # ── Uploads (Phase 4 — /finance/upload) ─────────────────────────────────────

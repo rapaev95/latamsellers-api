@@ -350,6 +350,10 @@ def compute_retirada_cost(project: str, period: tuple[date, date]) -> dict:
         "missing_cost_skus": [],
         "fallback_avg_used": 0,
         "by_sku": {},
+        # by_custo_id — детализация для UI (модалка с тогглами per-row).
+        "by_custo_id": dict(raw.get("by_custo_id") or {}),
+        # Сколько строк было вручную переключено через override (для UI badge).
+        "overrides_applied": int(raw.get("overrides_applied", 0) or 0),
         "rows_count": int(raw.get("rows_count", 0) or 0),
         "source_files": list(raw.get("source_files", []) or []),
     }
@@ -676,7 +680,7 @@ def compute_pnl(
     if retirada_envio_val > 0:
         envio_units = int(retirada_data.get("units_envio", 0) or 0)
         opex_items.append((
-            "Retirada Full — вывоз (тариф)",
+            "Вывоз со склада ML (тариф)",
             retirada_envio_val,
             f"{envio_units} ед. вывезено на склад продавца, COGS не списан",
         ))
@@ -685,11 +689,14 @@ def compute_pnl(
         d_tarifa = float(retirada_data.get("tarifa_descarte", 0.0) or 0.0)
         d_cogs = float(retirada_data.get("cogs_descarte", 0.0) or 0.0)
         missing_count = len(retirada_data.get("missing_cost_skus") or [])
-        note_parts = [f"{d_units} ед. утилизировано: тариф {d_tarifa:.2f} + COGS {d_cogs:.2f}"]
+        ovr = int(retirada_data.get("overrides_applied", 0) or 0)
+        note_parts = [f"{d_units} ед. списано: тариф {d_tarifa:.2f} + COGS {d_cogs:.2f}"]
+        if ovr:
+            note_parts.append(f"{ovr} строк переопределены вручную")
         if missing_count:
             note_parts.append(f"{missing_count} SKU без cost (COGS не учтён, проверь каталог)")
         opex_items.append((
-            "Retirada Full — descarte (тариф + COGS)",
+            "Списание товара (тариф + COGS)",
             retirada_descarte_total,
             "; ".join(note_parts),
         ))
