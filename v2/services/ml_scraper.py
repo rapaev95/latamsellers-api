@@ -87,6 +87,65 @@ class PositionScraperError(RuntimeError):
 # manually-exported `state.json` covers both flows. Logged-in browsing
 # significantly reduces ML's bot-detection on search-result pages.
 
+def _apply_stealth(context: BrowserContext) -> None:
+    """Apply playwright-stealth patches to a context.
+
+    Without stealth, navigator.webdriver === true is the single most
+    obvious bot signal — ML can flag a session in one request. Stealth
+    also patches navigator.plugins, languages, chrome.runtime, the
+    permissions API and a dozen other minor leaks.
+
+    Library is optional: if not installed, fall through silently —
+    UA rotation + headers + storage_state still provide partial
+    coverage. Logged via debug only.
+    """
+    try:
+        from playwright_stealth import stealth_sync  # type: ignore
+    except ImportError:
+        log.debug("playwright-stealth not installed — context not patched")
+        return
+    try:
+        stealth_sync(context)
+    except Exception as err:  # noqa: BLE001
+        log.warning("playwright-stealth apply failed: %s", err)
+
+
+def _warmup_navigation(context: BrowserContext) -> None:
+    """Visit ML home before the actual search.
+
+    Real users hit the homepage / a category page / a previous search
+    before the deep search URL we care about. Direct navigation to a
+    `/<slug>_Desde_<offset>` URL with no referer history is one of the
+    cheap signals ML's fraud filter weights heavily. A 1-2s warm-up
+    fixes that.
+
+    Best-effort: failure here doesn't fail the scrape.
+    """
+    try:
+        page = context.new_page()
+        try:
+            page.goto(
+                "https://www.mercadolivre.com.br/",
+                wait_until="domcontentloaded",
+                timeout=int(TIMEOUT_S * 1000),
+            )
+            # Tiny pause + small scroll to look more like a person
+            # before opening a new tab. Sync API doesn't have
+            # asyncio.sleep, use page.wait_for_timeout (ms).
+            page.wait_for_timeout(random.randint(800, 1800))
+            try:
+                page.evaluate("window.scrollBy(0, 200 + Math.random()*300)")
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            try:
+                page.close()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception as err:  # noqa: BLE001
+        log.debug("warmup nav skipped: %s", err)
+
+
 def _storage_state() -> Optional[dict[str, Any]]:
     """Decode ML_SCRAPER_STORAGE_STATE_B64 → dict.
 
@@ -398,11 +457,40 @@ def _scrape_sync(item_id: str, keyword: str, site_id: str, max_pages: int) -> Ra
     proxy_arg = _build_proxy_arg()
     storage_state = _storage_state()
 
+    # Sec-Ch-Ua client hints — real Chrome sends these on every request,
+    # bots usually omit them and ML's fraud detection notices.
+    chrome_major = "129"
+    if "Chrome/128" in ua:
+        chrome_major = "128"
+    sec_ch_ua = (
+        f'"Chromium";v="{chrome_major}", "Not=A?Brand";v="24", '
+        f'"Google Chrome";v="{chrome_major}"'
+    )
+    sec_ch_ua_platform = '"Windows"' if "Windows" in ua else (
+        '"macOS"' if "Mac OS" in ua else '"Linux"'
+    )
+
     ctx_kwargs: dict[str, Any] = {
         "user_agent": ua,
         "viewport": viewport,
         "locale": "pt-BR",
-        "extra_http_headers": {"Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"},
+        "timezone_id": "America/Sao_Paulo",  # consistent with locale
+        "extra_http_headers": {
+            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,image/apng,*/*;q=0.8"
+            ),
+            "Sec-Ch-Ua": sec_ch_ua,
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": sec_ch_ua_platform,
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        },
         "proxy": proxy_arg,
     }
     if storage_state is not None:
@@ -411,6 +499,15 @@ def _scrape_sync(item_id: str, keyword: str, site_id: str, max_pages: int) -> Ra
         ctx_kwargs["storage_state"] = storage_state
 
     context = browser.new_context(**ctx_kwargs)
+    # Stealth patches: navigator.webdriver=undefined, plugins.length=3,
+    # chrome.runtime, languages, permissions API quirks. Library is
+    # optional — if not installed, log and continue without (still
+    # better than nothing thanks to UA + headers + storage_state).
+    _apply_stealth(context)
+    # Brief warm-up: visit ML home first so referer chain looks like a
+    # real user landing page → search. ML's fraud signal weight on
+    # «direct nav to deep search URL» is non-trivial.
+    _warmup_navigation(context)
     try:
         organic_rank = 0
         ads_above_total = 0

@@ -727,18 +727,45 @@ async def _v2_startup() -> None:
         coalesce=True,
         replace_existing=True,
     )
-    # Daily positions refresh — once a day at quiet hour. Walks tracked
-    # keywords, throttled, persists to position_history. Failed runs
-    # trigger TG health alert (suppressed to once per 48h).
-    _positions_hour = int(os.environ.get("POSITIONS_REFRESH_HOUR_UTC", "12"))
-    _positions_minute = int(os.environ.get("POSITIONS_REFRESH_MINUTE_UTC", "0"))
+    # Daily positions refresh — once a day at a quiet hour but with
+    # heavy randomization so the schedule never lands on the same
+    # HH:MM:SS twice. ML's fraud detection weights perfectly periodic
+    # patterns — jitter + per-deploy hour offset breaks both.
+    #
+    # Schedule:
+    #   - hour: random within [08, 10] BRT (= [11, 13] UTC) per deploy
+    #   - minute: random 0-59 per deploy
+    #   - jitter: ±25min applied each fire so consecutive days drift
+    #
+    # Effective window: roughly 08:00-10:55 BRT, never the same minute
+    # twice in a row, never on a sharp hour boundary.
+    import random as _rnd
+    _positions_hour = int(os.environ.get(
+        "POSITIONS_REFRESH_HOUR_UTC", str(_rnd.choice([11, 12, 13])),
+    ))
+    _positions_minute = int(os.environ.get(
+        "POSITIONS_REFRESH_MINUTE_UTC", str(_rnd.randint(3, 57)),
+    ))
+    _positions_jitter_s = int(os.environ.get(
+        "POSITIONS_REFRESH_JITTER_S", "1500",  # ±25 min
+    ))
     _ml_scheduler.add_job(
         _dispatch_positions_refresh_job,
-        CronTrigger(hour=_positions_hour, minute=_positions_minute, timezone="UTC"),
+        CronTrigger(
+            hour=_positions_hour,
+            minute=_positions_minute,
+            timezone="UTC",
+            jitter=_positions_jitter_s,
+        ),
         id="positions_refresh_daily",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
+    )
+    _ml_log.info(
+        "positions_refresh_daily scheduled: %02d:%02d UTC ± %ds (≈ %02d:%02d BRT)",
+        _positions_hour, _positions_minute, _positions_jitter_s,
+        (_positions_hour - 3) % 24, _positions_minute,
     )
     # Anomalies dispatch — fires 30 minutes after daily-summary so the
     # seller sees the recap first, then the anomaly follow-up.
