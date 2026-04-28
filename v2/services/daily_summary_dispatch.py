@@ -172,6 +172,47 @@ async def _aggregate_user_metrics(
     # ROI requires joining ml_ad_ads.metrics, which we keep out of MVP.
     worst_items = items_sorted[-2:] if len(items_sorted) > 5 else []
 
+    # 4b. Enrich top/worst with SEO position + ads status. Two cheap
+    # joins: position_history (latest per item across all tracked
+    # keywords) + ml_ad_ads (any active ad row for the item). Without
+    # this the seller has to guess «works in ads or organic» when
+    # planning what to scale.
+    enrich_mlbs = [it["mlb"] for it in (top_items + worst_items) if it.get("mlb")]
+    if enrich_mlbs:
+        async with pool.acquire() as conn:
+            pos_rows = await conn.fetch(
+                """
+                SELECT DISTINCT ON (item_id)
+                       item_id, position, keyword, found
+                  FROM position_history
+                 WHERE user_id = $1 AND item_id = ANY($2::text[])
+                   AND found = TRUE
+                 ORDER BY item_id, checked_at DESC
+                """,
+                user_id, enrich_mlbs,
+            )
+            ad_rows = await conn.fetch(
+                """
+                SELECT item_id,
+                       BOOL_OR(LOWER(COALESCE(status, '')) IN
+                               ('active', 'enabled', 'on')) AS ads_active
+                  FROM ml_ad_ads
+                 WHERE user_id = $1 AND item_id = ANY($2::text[])
+                 GROUP BY item_id
+                """,
+                user_id, enrich_mlbs,
+            )
+        pos_map = {r["item_id"]: {"position": r["position"], "keyword": r["keyword"]} for r in pos_rows}
+        ads_map = {r["item_id"]: bool(r["ads_active"]) for r in ad_rows}
+        for it in top_items + worst_items:
+            mlb = it.get("mlb")
+            if not mlb:
+                continue
+            p = pos_map.get(mlb)
+            it["position"] = p["position"] if p else None
+            it["position_keyword"] = p["keyword"] if p else None
+            it["ads_active"] = ads_map.get(mlb, False)
+
     # 5. Conversion (orders / visits * 100)
     conversion_pct = (orders_count / visits * 100) if visits > 0 else 0.0
 
@@ -335,6 +376,34 @@ def _build_card(
                 f"ROAS: {today['roas']:.1f}x"
             )
 
+    def _seo_ads_line(it: dict[str, Any]) -> Optional[str]:
+        """Build an inline 'SEO + ads' annotation under each top/worst
+        item. Skipped entirely when both signals are absent (item not
+        tracked + not in active ads) so we don't waste real estate."""
+        position = it.get("position")
+        ads_active = it.get("ads_active")
+        if position is None and ads_active is None:
+            return None
+        parts: list[str] = []
+        if position is not None and position > 0:
+            kw = (it.get("position_keyword") or "").strip()
+            kw_short = (kw[:25] + "…") if len(kw) > 26 else kw
+            organic = "ОРГАНИКА" if lang == "ru" else "ORGÂNICO"
+            place = "место" if lang == "ru" else "lugar"
+            if kw_short:
+                parts.append(f"🔍 {_esc(organic)} \\#{int(position)} \\({_esc(kw_short)}\\)")
+            else:
+                parts.append(f"🔍 {_esc(organic)} \\#{int(position)} {_esc(place)}")
+        if ads_active is True:
+            ads_on = "РЕКЛАМА = ON" if lang == "ru" else "ADS = ON"
+            parts.append(f"📢 {_esc(ads_on)}")
+        elif ads_active is False:
+            ads_off = "РЕКЛАМА = OFF" if lang == "ru" else "ADS = OFF"
+            parts.append(f"💤 {_esc(ads_off)}")
+        if not parts:
+            return None
+        return "    " + " · ".join(parts)
+
     # Top items
     top = today.get("top_items") or []
     if top:
@@ -350,6 +419,9 @@ def _build_card(
             lines.append(
                 f"  • {_esc(title_short)} — {_fmt_brl(it['revenue'])} \\({_esc(units_lbl)}\\)"
             )
+            seo_line = _seo_ads_line(it)
+            if seo_line:
+                lines.append(seo_line)
 
     # Worst (only if more than ~5 items in the day to make it meaningful)
     worst = today.get("worst_items") or []
@@ -359,6 +431,9 @@ def _build_card(
         for it in worst:
             title_short = (it.get("title") or it.get("mlb") or "")[:55]
             lines.append(f"  • {_esc(title_short)} — {_fmt_brl(it['revenue'])}")
+            seo_line = _seo_ads_line(it)
+            if seo_line:
+                lines.append(seo_line)
 
     return "\n".join(lines)
 
