@@ -1110,6 +1110,59 @@ async def claim_decide_probe(
     return {"claim_id": claim_id, "results": results}
 
 
+@router.post("/user-claims/{claim_id}/send-message-action")
+async def send_message_to_mediator_test(
+    claim_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+    body: dict[str, Any] = Body(...),
+):
+    """Test endpoint: try POST /claims/{id}/expected-resolutions/send_message_to_mediator
+    with various body formats. Returns ML's raw response so we can iterate
+    on body shape without polluting the keyboard.
+    Body: { "text": "..." } — message content.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    text = (body or {}).get("text") or ""
+    if not text:
+        return {"error": "text_required"}
+    try:
+        token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except Exception as err:  # noqa: BLE001
+        return {"error": "oauth_failed", "detail": str(err)}
+
+    base = "https://api.mercadolibre.com"
+    url = f"{base}/post-purchase/v1/claims/{claim_id}/expected-resolutions/send_message_to_mediator"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    # Try several body shapes
+    shapes = [
+        ("plain", {"message": text}),
+        ("text_field", {"text": text}),
+        ("body_field", {"body": text}),
+        ("array_form", [{"message": text}]),
+        ("attachments_empty", {"message": text, "attachments": []}),
+    ]
+    results = []
+    async with httpx.AsyncClient() as http:
+        for label, payload in shapes:
+            try:
+                r = await http.post(url, json=payload, headers=headers, timeout=20.0)
+                ct = r.headers.get("content-type", "")
+                results.append({
+                    "shape": label,
+                    "status": r.status_code,
+                    "body": r.json() if "json" in ct else r.text[:300],
+                })
+                # If we hit 200 — stop, we created a real message; don't try more shapes
+                if r.status_code < 400:
+                    break
+            except Exception as err:  # noqa: BLE001
+                results.append({"shape": label, "error": str(err)})
+    return {"claim_id": claim_id, "url": url, "results": results}
+
+
 @router.post("/user-claims/{claim_id}/send-message")
 async def send_claim_message(
     claim_id: int,
