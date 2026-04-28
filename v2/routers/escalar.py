@@ -1000,6 +1000,58 @@ async def claim_attachments_probe(
 
 
 @router.get("/user-claims/{claim_id}/decide-probe")
+@router.get("/user-claims/{claim_id}/send-message-probe")
+async def claim_send_message_probe(
+    claim_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Discover the POST endpoint for the `send_message_to_mediator`
+    action. Diagnostic only — uses HEAD/OPTIONS so we don't actually
+    create a real chat message.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    try:
+        token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except Exception as err:  # noqa: BLE001
+        return {"error": "oauth_failed", "detail": str(err)}
+
+    base = "https://api.mercadolibre.com"
+    headers = {"Authorization": f"Bearer {token}"}
+    candidates = [
+        # Generic actions endpoint patterns
+        ("v1_actions", f"{base}/post-purchase/v1/claims/{claim_id}/actions"),
+        ("v1_action_named", f"{base}/post-purchase/v1/claims/{claim_id}/actions/send_message_to_mediator"),
+        # Specific named endpoints
+        ("v1_send_message", f"{base}/post-purchase/v1/claims/{claim_id}/send-message"),
+        ("v1_messages_mediator", f"{base}/post-purchase/v1/claims/{claim_id}/messages-to-mediator"),
+        ("v1_mediator_message", f"{base}/post-purchase/v1/claims/{claim_id}/mediator-message"),
+        ("v1_messages_post", f"{base}/post-purchase/v1/claims/{claim_id}/messages"),
+        # v2 / mediations namespace
+        ("v2_messages", f"{base}/post-purchase/v2/claims/{claim_id}/messages"),
+        ("v1_mediations_messages", f"{base}/post-purchase/v1/mediations/{claim_id}/messages"),
+    ]
+    results = []
+    async with httpx.AsyncClient() as http:
+        for label, url in candidates:
+            try:
+                # Use OPTIONS — non-mutating, returns Allow header.
+                r = await http.options(url, headers=headers, timeout=10.0)
+                results.append({
+                    "method": "OPTIONS",
+                    "label": label,
+                    "url": url,
+                    "status": r.status_code,
+                    "allow": r.headers.get("allow", ""),
+                    "body_preview": r.text[:200],
+                })
+            except Exception as err:  # noqa: BLE001
+                results.append({"label": label, "error": str(err)})
+    return {"claim_id": claim_id, "results": results}
+
+
+@router.get("/user-claims/{claim_id}/decide-probe")
 async def claim_decide_probe(
     claim_id: int,
     user: CurrentUser = Depends(current_user),
