@@ -291,6 +291,37 @@ class RetiradaOverridesOut(BaseModel):
     saved_count: int = 0     # сколько записей сохранилось (на ответе POST)
 
 
+class RetiradaPreviewRow(BaseModel):
+    """Одна retirada-операция в preview-списке (для модалки после upload)."""
+    custo_id: str
+    date: str
+    sku: str
+    mlb: str = ""
+    anuncio: str = ""
+    titulo: str = ""
+    variacao: str = ""
+    units: int = 0
+    valor: float = 0
+    project: str = ""
+    original_forma: str = ""
+    # "descarte" | "envio" | None — текущий сохранённый override (None = нет).
+    current_override: Optional[str] = None
+    # Финальная forma после применения override (или original если override нет).
+    effective_forma: str = ""
+
+
+class RetiradaPreviewOut(BaseModel):
+    """GET /finance/retirada/preview — все retirada-операции пользователя.
+
+    Без project/period-фильтра. Используется модалкой после upload
+    Relatorio_Tarifas_Full_*.xlsx, чтобы пользователь сразу мог разметить
+    что списано, а что вернётся в оборот.
+    """
+    rows: list[RetiradaPreviewRow]
+    rows_count: int = 0
+    projects: list[str] = []   # уникальные projects в rows (для UI-фильтра)
+
+
 # ── Orphan Pacotes (multi-item ML orders without per-SKU rows) ──────────────
 
 class OrphanPacoteOut(BaseModel):

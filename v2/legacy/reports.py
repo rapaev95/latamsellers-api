@@ -3981,6 +3981,74 @@ def get_retirada_by_period(project: str, period_from, period_to) -> dict:
     }
 
 
+def list_all_retirada_rows() -> list[dict]:
+    """Все retirada-операции текущего пользователя без period/project фильтра.
+
+    Используется модалкой после upload Relatorio_Tarifas_Full_*.xlsx — там
+    пользователь ещё не выбрал project/period, нужно показать все операции
+    с тогглами «Списать / В обороте». Override применяется per-project, поэтому
+    в каждой строке возвращается также `current_override` (если есть в БД).
+
+    Возвращает список:
+        [{custo_id, date, sku, mlb, anuncio, titulo, variacao, units, valor,
+          project, original_forma, current_override, effective_forma}]
+    """
+    df = load_retirada_estoque_report()
+    if df is None or df.empty:
+        return []
+    # Загружаем overrides по всем проектам разом (db_load возвращает full map).
+    try:
+        from .db_storage import db_load
+        all_overrides = db_load(_RETIRADA_OVERRIDES_KEY) or {}
+    except Exception:
+        all_overrides = {}
+    if not isinstance(all_overrides, dict):
+        all_overrides = {}
+
+    rows: list[dict] = []
+    for _, r in df.iterrows():
+        project = str(r.get("__project") or "").strip()
+        custo_id = str(r.get("custo_id") or "").strip()
+        original_forma = r.get("forma") or ""
+        # Override может быть только если custo_id и project известны.
+        proj_overrides = all_overrides.get(project) if isinstance(all_overrides.get(project), dict) else None
+        current_override = None
+        if custo_id and proj_overrides:
+            raw_override = proj_overrides.get(custo_id)
+            if raw_override:
+                f = str(raw_override).strip().lower()
+                if f == "descarte":
+                    current_override = "descarte"
+                elif f in ("envio", "envio para o endereço", "envio para o endereco"):
+                    current_override = "envio"
+        if current_override == "descarte":
+            effective_forma = RETIRADA_FORMA_DESCARTE
+        elif current_override == "envio":
+            effective_forma = RETIRADA_FORMA_ENVIO
+        else:
+            effective_forma = original_forma
+        d = r.get("date")
+        date_iso = d.isoformat() if hasattr(d, "isoformat") else str(d)
+        rows.append({
+            "custo_id": custo_id,
+            "date": date_iso,
+            "sku": r.get("sku") or "",
+            "mlb": r.get("mlb") or "",
+            "anuncio": r.get("anuncio") or "",
+            "titulo": r.get("titulo") or "",
+            "variacao": r.get("variacao") or "",
+            "units": int(r.get("units") or 0),
+            "valor": float(r.get("valor") or 0.0),
+            "project": project,
+            "original_forma": original_forma,
+            "current_override": current_override,
+            "effective_forma": effective_forma,
+        })
+    # Сортировка: новые первыми, потом по units desc.
+    rows.sort(key=lambda x: (x["date"], -x["units"]), reverse=True)
+    return rows
+
+
 def get_fulfillment_by_period(project: str, period_from, period_to) -> float:
     """Сумма BRL фулфилмент-расходов за период.
 

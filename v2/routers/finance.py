@@ -25,6 +25,7 @@ from v2.schemas.finance import (
     PnlMatrixOut,
     OrphanPacotesResponse, OrphanSaveIn, OrphanSaveOut,
     RetiradaOverridesIn,
+    RetiradaPreviewOut,
     UploadsListOut, UploadSaveOut, SourceCatalogOut,
     RulesOut, RulesSaveIn, TransactionsOut,
     ClassificationSaveIn, ClassificationSaveOut,
@@ -1201,6 +1202,24 @@ def get_retirada_overrides(
         for cid, forma in raw.items()
     }
     return {"project": project, "overrides": canon, "saved_count": 0}
+
+
+@router.get("/retirada/preview", response_model=RetiradaPreviewOut)
+def get_retirada_preview(
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Все retirada-операции пользователя без project/period-фильтра.
+
+    Используется UI-модалкой после upload Relatorio_Tarifas_Full_*.xlsx —
+    пользователь сразу размечает что списано, а что вернётся в оборот.
+    Каждая строка содержит уже применённый override (если задан) и
+    оригинальную ML forma.
+    """
+    _bind_user(user)
+    from v2.legacy.reports import list_all_retirada_rows
+    rows = list_all_retirada_rows() or []
+    projects = sorted({str(r.get("project") or "").strip() for r in rows if r.get("project")})
+    return {"rows": rows, "rows_count": len(rows), "projects": projects}
 
 
 @router.post("/retirada-overrides")
