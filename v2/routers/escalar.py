@@ -808,6 +808,11 @@ async def claim_messages_probe(
         ("v1_history", f"{base}/post-purchase/v1/claims/{claim_id}/history"),
         ("v1_actions", f"{base}/post-purchase/v1/claims/{claim_id}/actions"),
         ("v2_full", f"{base}/post-purchase/v2/claims/{claim_id}"),
+        # For mediation/dispute claims the seller's reply lives on a
+        # different thread — these probe URLs reveal which path actually
+        # has the data so we know /claims/{id}/messages alone isn't enough.
+        ("v1_mediation_full", f"{base}/post-purchase/v1/mediations/{claim_id}"),
+        ("v1_mediation_messages", f"{base}/post-purchase/v1/mediations/{claim_id}/messages"),
     ]
     results = []
     async with httpx.AsyncClient() as http:

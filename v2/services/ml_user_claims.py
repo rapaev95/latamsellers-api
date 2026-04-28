@@ -208,9 +208,35 @@ async def _enrich_one(http: httpx.AsyncClient, token: str, claim: dict) -> dict:
         except Exception as err:  # noqa: BLE001
             log.warning("mediations/%s exception: %s", cid, err)
 
-    # 5. Messages thread — buyer's complaint + ML mediator notes. Used by
-    # ml_claims_dispatch to surface the "why this claim opened" text in the
-    # Telegram card. Without it the seller has to open the app to triage.
+    # 5. Messages thread — buyer's complaint + ML mediator notes + seller
+    # replies. Three sources we have to merge:
+    #   a) /claims/{id}/messages — the regular thread
+    #   b) /mediations/{id}/messages — once a claim escalates to dispute
+    #      stage, ML's UI routes the seller's "Responder" action to this
+    #      thread, NOT the claims thread; without (b) every mediation
+    #      shows as un-replied even after the seller answered.
+    #   c) claim.mediation.messages — sometimes the mediation payload
+    #      itself embeds the message list, no separate fetch needed.
+    # All three are merged + de-duped so _compute_needs_action and the
+    # Telegram dispatcher see the latest reply regardless of source.
+
+    def _absorb(msg_list: Any) -> list[dict]:
+        out: list[dict] = []
+        if isinstance(msg_list, dict):
+            inner = msg_list.get("messages")
+            if isinstance(inner, list):
+                msg_list = inner
+            else:
+                msg_list = [msg_list]
+        if not isinstance(msg_list, list):
+            return out
+        for m in msg_list:
+            if isinstance(m, dict):
+                out.append(m)
+        return out
+
+    aggregated: list[dict] = []
+    # (a) claims/{id}/messages
     try:
         r = await http.get(
             f"{ML_API_BASE}/post-purchase/v1/claims/{cid}/messages",
@@ -218,15 +244,54 @@ async def _enrich_one(http: httpx.AsyncClient, token: str, claim: dict) -> dict:
             timeout=15.0,
         )
         if r.status_code == 200:
-            mdata = r.json()
-            if isinstance(mdata, dict) and isinstance(mdata.get("messages"), list):
-                claim["messages"] = mdata["messages"]
-            elif isinstance(mdata, list):
-                claim["messages"] = mdata
+            aggregated.extend(_absorb(r.json()))
         elif r.status_code not in (403, 404):
             log.info("claims/%s/messages status=%s body=%s", cid, r.status_code, r.text[:200])
     except Exception as err:  # noqa: BLE001
         log.warning("claims/%s/messages exception: %s", cid, err)
+
+    # (b) mediations/{id}/messages — only for dispute/mediation claims
+    if claim.get("type") == "mediations" or claim.get("stage") == "dispute":
+        try:
+            r = await http.get(
+                f"{ML_API_BASE}/post-purchase/v1/mediations/{cid}/messages",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15.0,
+            )
+            if r.status_code == 200:
+                aggregated.extend(_absorb(r.json()))
+            elif r.status_code not in (403, 404):
+                log.info("mediations/%s/messages status=%s body=%s", cid, r.status_code, r.text[:200])
+        except Exception as err:  # noqa: BLE001
+            log.warning("mediations/%s/messages exception: %s", cid, err)
+
+    # (c) embedded inside mediation payload (best-effort — keys vary)
+    mediation = claim.get("mediation")
+    if isinstance(mediation, dict):
+        for key in ("messages", "message_history", "thread"):
+            v = mediation.get(key)
+            if v:
+                aggregated.extend(_absorb(v))
+
+    # De-dupe: prefer message id; fall back to (sender_role, date_created, text)
+    if aggregated:
+        seen: set[Any] = set()
+        unique: list[dict] = []
+        for m in aggregated:
+            mid = m.get("id")
+            if mid is None:
+                key = (
+                    m.get("sender_role") or (m.get("sender") or {}).get("role") if isinstance(m.get("sender"), dict) else m.get("sender_role"),
+                    m.get("date_created") or m.get("date"),
+                    (m.get("message") or m.get("text") or "")[:80],
+                )
+            else:
+                key = ("id", mid)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(m)
+        claim["messages"] = unique
 
     # 6. Order item — surface the product title in the TG card so the seller
     # sees WHAT the claim is about, not just the order id. resource_id is
