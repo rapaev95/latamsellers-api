@@ -21,6 +21,7 @@ from v2.services import (
     ml_oauth as ml_oauth_svc,
     ml_quality as ml_quality_svc,
     ml_scraper_chat as ml_scraper_chat_svc,
+    daily_summary_dispatch as daily_summary_dispatch_svc,
     listing_journey as listing_journey_svc,
     ml_user_claims as ml_user_claims_svc,
     ml_user_items as ml_user_items_svc,
@@ -1212,6 +1213,41 @@ async def send_claim_message(
             }
         except Exception as err:  # noqa: BLE001
             return {"error": "exception", "detail": str(err)}
+
+
+@router.post("/daily-summary/preview")
+async def daily_summary_preview(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+    body: dict[str, Any] = Body(default={}),
+):
+    """Run the daily-summary dispatch immediately for the current user.
+
+    Lets the seller test the format without waiting for the 20:00 BRT cron.
+    Body (optional):
+      { date: 'YYYY-MM-DD' }   — target a specific BRT day (default: yesterday)
+      { force: true }          — bypass notify_daily_sales toggle
+    """
+    if pool is None:
+        return {"error": "no_db"}
+
+    target_date_str = (body or {}).get("date")
+    force = bool((body or {}).get("force", False))
+    target_date = None
+    if target_date_str:
+        try:
+            from datetime import date as _date
+            target_date = _date.fromisoformat(target_date_str)
+        except ValueError:
+            return {"error": "invalid_date_format", "expected": "YYYY-MM-DD"}
+
+    try:
+        result = await daily_summary_dispatch_svc._dispatch_for_user(
+            pool, user.id, target_date=target_date, force=force,
+        )
+        return {"ok": True, **result}
+    except Exception as err:  # noqa: BLE001
+        return {"error": "dispatch_failed", "detail": str(err)}
 
 
 @router.post("/user-claims/resend-tg")

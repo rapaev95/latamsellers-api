@@ -61,6 +61,7 @@ from v2.app import router as v2_router  # noqa: E402
 from v2.db import close_pool, create_pool, get_pool  # noqa: E402
 from v2.services import ml_backfill as ml_backfill_svc  # noqa: E402
 from v2.services import ml_claims_dispatch as ml_claims_dispatch_svc  # noqa: E402
+from v2.services import daily_summary_dispatch as daily_summary_dispatch_svc  # noqa: E402
 from v2.services import ml_item_context as ml_item_context_svc  # noqa: E402
 from v2.services import ml_messages_dispatch as ml_messages_dispatch_svc  # noqa: E402
 from v2.services import ml_notices as ml_notices_svc  # noqa: E402
@@ -137,6 +138,27 @@ async def _dispatch_claims_to_tg_job() -> None:
         )
     except Exception as err:  # noqa: BLE001
         _ml_log.exception("Claims dispatch job failed: %s", err)
+
+
+async def _dispatch_daily_sales_summary_job() -> None:
+    """Send yesterday's sales recap to every seller with notify_daily_sales=TRUE.
+
+    Cron-fires once per day at 23:00 UTC = 20:00 BRT (end-of-Brazil-day).
+    Reads vendas/visits/ads caches that other jobs already populate; we
+    only aggregate per-day and format for Telegram.
+    """
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("Daily summary tick skipped: no DB pool")
+            return
+        result = await daily_summary_dispatch_svc.dispatch_all_users(pool)
+        _ml_log.info(
+            "Daily summary tick: users=%s sent=%s skipped=%s",
+            result.get("users"), result.get("sent"), result.get("skipped"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("Daily summary job failed: %s", err)
 
 
 async def _dispatch_messages_to_tg_job() -> None:
@@ -587,6 +609,20 @@ async def _v2_startup() -> None:
         "interval",
         minutes=_msg_interval,
         id="messages_tg_dispatch",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Daily sales summary — fires at 23:00 UTC = 20:00 BRT (end-of-day for
+    # Brazilian sellers). Aggregates yesterday's vendas/visits/ads caches
+    # already populated by other jobs and ships the recap to each seller's
+    # Telegram. Hour env-tunable for ops (test runs / different markets).
+    _summary_hour = int(os.environ.get("DAILY_SUMMARY_TG_HOUR_UTC", "23"))
+    _summary_minute = int(os.environ.get("DAILY_SUMMARY_TG_MINUTE_UTC", "0"))
+    _ml_scheduler.add_job(
+        _dispatch_daily_sales_summary_job,
+        CronTrigger(hour=_summary_hour, minute=_summary_minute, timezone="UTC"),
+        id="daily_sales_summary_tg",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

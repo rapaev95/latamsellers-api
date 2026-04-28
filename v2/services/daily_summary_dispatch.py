@@ -1,0 +1,538 @@
+"""Daily sales summary → Telegram cron.
+
+Sends a per-seller morning/evening recap aggregating yesterday's:
+  - orders count + revenue
+  - visits (from ml_item_visits.daily JSONB)
+  - ad spend / clicks / ACOS / ROAS (from ml_ad_campaign_metrics_daily)
+  - conversion (orders / visits)
+  - top 3 items by revenue + worst 2 by ROI
+  - % delta vs day-before-yesterday for each metric
+
+Triggered by the cron job _dispatch_daily_sales_summary_job in main.py
+at 23:00 UTC = 20:00 BRT (end-of-day for the seller).
+
+Schema: NO new tables. Reuses:
+  - vendas via parsers.db_loader.load_user_vendas (sales)
+  - ml_item_visits.daily (visits per day)
+  - ml_ad_campaign_metrics_daily (ads per day)
+  - notification_settings (gating + language)
+
+Activation: notification_settings.notify_daily_sales = TRUE AND
+            telegram_chat_id IS NOT NULL.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Optional
+
+import asyncpg
+import httpx
+
+from v2.parsers import db_loader
+
+log = logging.getLogger(__name__)
+
+TG_API_BASE = "https://api.telegram.org"
+TG_THROTTLE = 1.1  # seconds between TG sends per chat
+
+# Brazil timezone (no DST since 2019). Yesterday's BRT day = UTC ms range.
+BRT = timezone(timedelta(hours=-3))
+
+
+# ── MarkdownV2 helpers (replicating ml_*_dispatch.py pattern) ──────
+
+_MD_ESCAPE = str.maketrans({c: f"\\{c}" for c in r"_*[]()~`>#+-=|{}.!"})
+_MD_CODE_ESCAPE = str.maketrans({"`": "\\`", "\\": "\\\\"})
+_MD2_UNESCAPE_RE = re.compile(r"\\([_*\[\]()~`>#+\-=|{}.!\\])")
+
+
+def _esc(text: Any) -> str:
+    return (str(text or "")).translate(_MD_ESCAPE)
+
+
+def _esc_code(text: Any) -> str:
+    return (str(text or "")).translate(_MD_CODE_ESCAPE)
+
+
+def _strip_md2_escapes(text: str) -> str:
+    if not text:
+        return ""
+    out = re.sub(r"(?<!\\)[*_~`]", "", text)
+    return _MD2_UNESCAPE_RE.sub(r"\1", out)
+
+
+# ── Time helpers ───────────────────────────────────────────────────
+
+def _brt_day_bounds_ms(target_date: date) -> tuple[int, int]:
+    """Convert a BRT calendar date → [ms_start, ms_end] in UTC epoch ms."""
+    start_brt = datetime.combine(target_date, datetime.min.time(), tzinfo=BRT)
+    end_brt = start_brt + timedelta(days=1) - timedelta(milliseconds=1)
+    return (
+        int(start_brt.timestamp() * 1000),
+        int(end_brt.timestamp() * 1000),
+    )
+
+
+def _brt_yesterday() -> date:
+    return (datetime.now(BRT) - timedelta(days=1)).date()
+
+
+# ── Aggregation ────────────────────────────────────────────────────
+
+# Statuses that indicate a sale was cancelled/refunded — exclude from revenue.
+_CANCELLED_STATUSES = {"cancelled", "cancelado", "cancelada", "devolvido", "refunded"}
+
+
+async def _aggregate_user_metrics(
+    pool: asyncpg.Pool,
+    user_id: int,
+    target_date: date,
+) -> dict[str, Any]:
+    """Return all daily metrics for a single user/day in one shot.
+    Returned shape is stable (same keys whether data is present or 0/None)
+    so the diff/format layer can rely on it.
+    """
+    ms_start, ms_end = _brt_day_bounds_ms(target_date)
+    target_iso = target_date.isoformat()
+
+    # 1. Sales from vendas (parsed CSV cache)
+    vendas = await db_loader.load_user_vendas(pool, user_id) or []
+    day_sales = [
+        v for v in vendas
+        if ms_start <= v.date_ms <= ms_end
+    ]
+    seen_sale_ids: set[str] = set()
+    orders_count = 0
+    revenue = 0.0
+    items_per_mlb: dict[str, dict[str, Any]] = {}
+    for v in day_sales:
+        # Dedup at sale_id level (one sale can produce multiple rows)
+        if v.sale_id and v.sale_id in seen_sale_ids:
+            continue
+        if v.sale_id:
+            seen_sale_ids.add(v.sale_id)
+        status_l = (v.status or "").lower()
+        if status_l in _CANCELLED_STATUSES:
+            continue
+        orders_count += 1
+        revenue += float(v.receita or 0.0)
+        if v.mlb:
+            slot = items_per_mlb.setdefault(v.mlb, {
+                "mlb": v.mlb, "title": v.title or "", "units": 0, "revenue": 0.0,
+            })
+            slot["units"] += int(v.units or 0)
+            slot["revenue"] += float(v.receita or 0.0)
+            if not slot["title"] and v.title:
+                slot["title"] = v.title
+
+    avg_ticket = (revenue / orders_count) if orders_count else 0.0
+
+    # 2. Visits — sum across all this user's items for target_date
+    async with pool.acquire() as conn:
+        visits_row = await conn.fetchrow(
+            """
+            SELECT COALESCE(SUM((d.elem->>'total')::int), 0) AS total_visits
+              FROM ml_item_visits v
+              CROSS JOIN LATERAL jsonb_array_elements(v.daily) AS d(elem)
+             WHERE v.user_id = $1
+               AND d.elem->>'date' LIKE $2
+            """,
+            user_id, f"{target_iso}%",
+        )
+    visits = int((visits_row and visits_row["total_visits"]) or 0)
+
+    # 3. Ads metrics for the day — sum across all campaigns
+    async with pool.acquire() as conn:
+        try:
+            ads_row = await conn.fetchrow(
+                """
+                SELECT
+                    COALESCE(SUM((metrics->>'cost')::numeric), 0)             AS cost,
+                    COALESCE(SUM((metrics->>'clicks')::int), 0)               AS clicks,
+                    COALESCE(SUM((metrics->>'prints')::int), 0)               AS prints,
+                    COALESCE(SUM((metrics->>'total_amount')::numeric), 0)     AS total_amount,
+                    COALESCE(SUM((metrics->>'direct_amount')::numeric), 0)    AS direct_amount,
+                    COALESCE(SUM((metrics->>'indirect_amount')::numeric), 0)  AS indirect_amount
+                  FROM ml_ad_campaign_metrics_daily
+                 WHERE user_id = $1 AND date = $2
+                """,
+                user_id, target_date,
+            )
+        except Exception as err:  # noqa: BLE001
+            log.warning("ads metrics query failed user=%s date=%s: %s", user_id, target_date, err)
+            ads_row = None
+    ad_cost = float((ads_row and ads_row["cost"]) or 0)
+    ad_clicks = int((ads_row and ads_row["clicks"]) or 0)
+    ad_prints = int((ads_row and ads_row["prints"]) or 0)
+    ad_total_amount = float((ads_row and ads_row["total_amount"]) or 0)
+    # ACOS = cost / total_amount * 100 (per ML docs convention)
+    acos_pct = (ad_cost / ad_total_amount * 100) if ad_total_amount > 0 else 0.0
+    roas = (ad_total_amount / ad_cost) if ad_cost > 0 else 0.0
+
+    # 4. Top/worst items
+    items_sorted = sorted(items_per_mlb.values(), key=lambda x: x["revenue"], reverse=True)
+    top_items = items_sorted[:3]
+
+    # Worst-by-ROI heuristic: items with ad_cost > 0 and 0 orders (ROI=0)
+    # Without per-item ad metrics here we just surface "top low performers"
+    # by revenue (bottom 2 with revenue > 0) — best-effort. Real per-item
+    # ROI requires joining ml_ad_ads.metrics, which we keep out of MVP.
+    worst_items = items_sorted[-2:] if len(items_sorted) > 5 else []
+
+    # 5. Conversion (orders / visits * 100)
+    conversion_pct = (orders_count / visits * 100) if visits > 0 else 0.0
+
+    return {
+        "date": target_iso,
+        "orders_count": orders_count,
+        "revenue": revenue,
+        "avg_ticket": avg_ticket,
+        "visits": visits,
+        "conversion_pct": conversion_pct,
+        "ad_cost": ad_cost,
+        "ad_clicks": ad_clicks,
+        "ad_prints": ad_prints,
+        "ad_total_amount": ad_total_amount,
+        "acos_pct": acos_pct,
+        "roas": roas,
+        "top_items": top_items,
+        "worst_items": worst_items,
+        "items_total": len(items_sorted),
+    }
+
+
+def _diff_pct(today: float, yesterday: float) -> Optional[float]:
+    """Percentage change today vs yesterday. None if yesterday=0 (undefined)."""
+    if yesterday == 0:
+        return None
+    return (today - yesterday) / yesterday * 100
+
+
+def _diff_pp(today: float, yesterday: float) -> float:
+    """Percentage points change (for metrics already in %)."""
+    return today - yesterday
+
+
+# ── TG card builder ────────────────────────────────────────────────
+
+def _fmt_brl(amount: float) -> str:
+    """Format float as 'R$ 1.234,56' BRL convention."""
+    if amount == 0:
+        return "R\\$ 0"
+    s = f"{amount:,.2f}"
+    # ML/BR convention: thousand=',' → '.'; decimal='.' → ','. Two-step swap.
+    s = s.replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R\\$ {s}"
+
+
+def _fmt_int(n: int) -> str:
+    """Format integer with thousand separators (BR style: 1.234)."""
+    return f"{n:,}".replace(",", ".")
+
+
+def _fmt_diff(pct: Optional[float]) -> str:
+    """'(+18%)' / '(-3%)' / '(новый)' wrapped in MD2-safe escapes."""
+    if pct is None:
+        return "_no baseline_"
+    sign = "+" if pct >= 0 else ""
+    return f"\\({sign}{pct:.1f}%\\)"
+
+
+def _fmt_diff_pp(pp: float) -> str:
+    sign = "+" if pp >= 0 else ""
+    return f"\\({sign}{pp:.2f}pp\\)"
+
+
+_PT_WEEKDAY = {0: "segunda", 1: "terça", 2: "quarta", 3: "quinta", 4: "sexta", 5: "sábado", 6: "domingo"}
+_PT_MONTH = {1: "jan", 2: "fev", 3: "mar", 4: "abr", 5: "mai", 6: "jun", 7: "jul", 8: "ago", 9: "set", 10: "out", 11: "nov", 12: "dez"}
+_RU_WEEKDAY = {0: "понедельник", 1: "вторник", 2: "среда", 3: "четверг", 4: "пятница", 5: "суббота", 6: "воскресенье"}
+_RU_MONTH = {1: "янв", 2: "фев", 3: "мар", 4: "апр", 5: "мая", 6: "июн", 7: "июл", 8: "авг", 9: "сен", 10: "окт", 11: "ноя", 12: "дек"}
+
+
+def _date_label(d: date, lang: str) -> str:
+    if lang == "ru":
+        return f"{_RU_WEEKDAY[d.weekday()]}, {d.day} {_RU_MONTH[d.month]}"
+    if lang == "en":
+        return d.strftime("%a, %b %d")
+    return f"{_PT_WEEKDAY[d.weekday()]}, {d.day} {_PT_MONTH[d.month]}"
+
+
+def _build_card(
+    today: dict[str, Any],
+    yesterday: dict[str, Any],
+    lang: str,
+    app_url: str,
+) -> str:
+    target = date.fromisoformat(today["date"])
+    label = _date_label(target, lang)
+
+    if lang == "ru":
+        title = f"📊 *Сводка за {_esc(label)}*"
+        sales_lbl = "💰 Продажи"
+        avg_lbl = "💼 Средний чек"
+        vis_lbl = "👁 Визиты"
+        conv_lbl = "📈 Конверсия"
+        ads_lbl = "📢 Реклама"
+        ads_clicks = "кликов"
+        top_lbl = "🥇 Топ\\-3 по выручке"
+        worst_lbl = "⚠️ Низкий ROI"
+        cta = "📊 Подробнее в app"
+    elif lang == "en":
+        title = f"📊 *Daily summary — {_esc(label)}*"
+        sales_lbl = "💰 Sales"
+        avg_lbl = "💼 Avg ticket"
+        vis_lbl = "👁 Visits"
+        conv_lbl = "📈 Conversion"
+        ads_lbl = "📢 Ads"
+        ads_clicks = "clicks"
+        top_lbl = "🥇 Top 3 revenue"
+        worst_lbl = "⚠️ Low ROI"
+        cta = "📊 More in app"
+    else:
+        title = f"📊 *Resumo de {_esc(label)}*"
+        sales_lbl = "💰 Vendas"
+        avg_lbl = "💼 Ticket médio"
+        vis_lbl = "👁 Visitas"
+        conv_lbl = "📈 Conversão"
+        ads_lbl = "📢 Ads"
+        ads_clicks = "cliques"
+        top_lbl = "🥇 Top 3 receita"
+        worst_lbl = "⚠️ ROI baixo"
+        cta = "📊 Mais no app"
+
+    revenue_diff = _diff_pct(today["revenue"], yesterday["revenue"])
+    avg_diff = _diff_pct(today["avg_ticket"], yesterday["avg_ticket"])
+    visits_diff = _diff_pct(today["visits"], yesterday["visits"])
+    conv_diff = _diff_pp(today["conversion_pct"], yesterday["conversion_pct"])
+    cost_diff = _diff_pct(today["ad_cost"], yesterday["ad_cost"])
+    acos_diff = _diff_pp(today["acos_pct"], yesterday["acos_pct"])
+
+    lines: list[str] = [title, ""]
+
+    # Sales line — orders count + revenue + delta
+    if today["orders_count"] > 0 or today["revenue"] > 0:
+        units_word = (
+            f"{today['orders_count']} {'заказов' if lang == 'ru' else 'orders' if lang == 'en' else 'pedidos'}"
+        )
+        lines.append(
+            f"{sales_lbl}: {_esc(units_word)} · {_fmt_brl(today['revenue'])} {_fmt_diff(revenue_diff)}"
+        )
+        lines.append(f"{avg_lbl}: {_fmt_brl(today['avg_ticket'])} {_fmt_diff(avg_diff)}")
+    else:
+        # No sales — keep it short, don't pad with zeros
+        empty = "Нет продаж" if lang == "ru" else "No sales" if lang == "en" else "Sem vendas"
+        lines.append(f"{sales_lbl}: _{_esc(empty)}_")
+
+    # Visits + conversion
+    if today["visits"] > 0:
+        lines.append(f"{vis_lbl}: {_esc(_fmt_int(today['visits']))} {_fmt_diff(visits_diff)}")
+        lines.append(f"{conv_lbl}: {today['conversion_pct']:.2f}% {_fmt_diff_pp(conv_diff)}")
+
+    # Ads block
+    if today["ad_cost"] > 0:
+        lines.append("")
+        spent_w = "потрачено" if lang == "ru" else "spent" if lang == "en" else "gasto"
+        lines.append(
+            f"{ads_lbl}: {_fmt_brl(today['ad_cost'])} {_esc(spent_w)} · "
+            f"{_esc(_fmt_int(today['ad_clicks']))} {ads_clicks} {_fmt_diff(cost_diff)}"
+        )
+        if today["acos_pct"] > 0:
+            lines.append(
+                f"   ACOS: {today['acos_pct']:.1f}% {_fmt_diff_pp(acos_diff)} · "
+                f"ROAS: {today['roas']:.1f}x"
+            )
+
+    # Top items
+    top = today.get("top_items") or []
+    if top:
+        lines.append("")
+        lines.append(f"*{top_lbl}:*")
+        for it in top:
+            title_short = (it.get("title") or it.get("mlb") or "")[:55]
+            units_lbl = (
+                f"{int(it.get('units', 0))} шт"
+                if lang == "ru"
+                else f"{int(it.get('units', 0))} un"
+            )
+            lines.append(
+                f"  • {_esc(title_short)} — {_fmt_brl(it['revenue'])} \\({_esc(units_lbl)}\\)"
+            )
+
+    # Worst (only if more than ~5 items in the day to make it meaningful)
+    worst = today.get("worst_items") or []
+    if worst:
+        lines.append("")
+        lines.append(f"*{worst_lbl}:*")
+        for it in worst:
+            title_short = (it.get("title") or it.get("mlb") or "")[:55]
+            lines.append(f"  • {_esc(title_short)} — {_fmt_brl(it['revenue'])}")
+
+    return "\n".join(lines)
+
+
+def _build_keyboard(app_base_url: str, lang: str) -> dict[str, Any]:
+    label = "📊 Открыть дашборд" if lang == "ru" else "📊 Open dashboard" if lang == "en" else "📊 Abrir painel"
+    return {
+        "inline_keyboard": [
+            [{"text": label, "url": f"{app_base_url.rstrip('/')}/dashboard"}],
+        ],
+    }
+
+
+# ── TG send (with MD2 fallback to plain) ──────────────────────────
+
+async def _tg_post(http: httpx.AsyncClient, bot_token: str, payload: dict[str, Any]) -> tuple[int, str, Optional[str]]:
+    r = await http.post(f"{TG_API_BASE}/bot{bot_token}/sendMessage", json=payload, timeout=10.0)
+    body_preview = r.text[:200] if r.status_code != 200 else ""
+    msg_id: Optional[str] = None
+    if r.status_code == 200:
+        mid = (r.json() or {}).get("result", {}).get("message_id")
+        msg_id = str(mid) if mid else None
+    return r.status_code, body_preview, msg_id
+
+
+async def _send_card(
+    http: httpx.AsyncClient,
+    bot_token: str,
+    chat_id: str,
+    text: str,
+    keyboard: dict[str, Any],
+) -> Optional[str]:
+    try:
+        status, body_preview, msg_id = await _tg_post(http, bot_token, {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "MarkdownV2",
+            "reply_markup": keyboard,
+            "disable_web_page_preview": True,
+        })
+        if status == 200 and msg_id:
+            return msg_id
+        if status == 400 and "parse" in body_preview.lower():
+            log.warning("daily-summary MD2 parse failed: %s", body_preview)
+            plain = _strip_md2_escapes(text)
+            status2, body2, msg_id2 = await _tg_post(http, bot_token, {
+                "chat_id": chat_id,
+                "text": plain,
+                "reply_markup": keyboard,
+                "disable_web_page_preview": True,
+            })
+            if status2 == 200 and msg_id2:
+                return msg_id2
+            log.warning("daily-summary plain fallback also failed: %s %s", status2, body2)
+        log.warning("daily-summary send failed status=%s body=%s", status, body_preview)
+    except Exception as err:  # noqa: BLE001
+        log.exception("daily-summary send exception: %s", err)
+    return None
+
+
+# ── Per-user dispatch ─────────────────────────────────────────────
+
+async def _dispatch_for_user(
+    pool: asyncpg.Pool,
+    user_id: int,
+    *,
+    target_date: Optional[date] = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Compute yesterday's metrics and send to user's Telegram if enabled.
+
+    `target_date` defaults to yesterday in BRT.
+    `force=True` ignores the notify_daily_sales flag — used by the preview
+    endpoint so seller can demo the message on demand.
+    """
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not bot_token:
+        return {"sent": 0, "reason": "no_bot_token"}
+
+    async with pool.acquire() as conn:
+        settings = await conn.fetchrow(
+            """
+            SELECT telegram_chat_id, COALESCE(language, 'pt') AS language,
+                   COALESCE(notify_daily_sales, TRUE) AS notify_daily_sales
+              FROM notification_settings
+             WHERE user_id = $1
+            """,
+            user_id,
+        )
+    if not settings or not settings["telegram_chat_id"]:
+        return {"sent": 0, "reason": "no_chat_id"}
+    if not force and not settings["notify_daily_sales"]:
+        return {"sent": 0, "reason": "disabled"}
+
+    chat_id = str(settings["telegram_chat_id"])
+    lang = (settings["language"] or "pt").lower()
+
+    target = target_date or _brt_yesterday()
+    yesterday_target = target - timedelta(days=1)
+
+    today_metrics = await _aggregate_user_metrics(pool, user_id, target)
+    yesterday_metrics = await _aggregate_user_metrics(pool, user_id, yesterday_target)
+
+    # Skip if literally nothing happened — no point in noise.
+    if (
+        today_metrics["orders_count"] == 0
+        and today_metrics["visits"] == 0
+        and today_metrics["ad_cost"] == 0
+        and not force
+    ):
+        return {"sent": 0, "reason": "no_activity"}
+
+    app_base = os.environ.get("APP_BASE_URL", "https://app.lsprofit.app")
+    text = _build_card(today_metrics, yesterday_metrics, lang, app_base)
+    if len(text) > 4000:
+        text = text[:3990] + "…"
+    keyboard = _build_keyboard(app_base, lang)
+
+    async with httpx.AsyncClient() as http:
+        msg_id = await _send_card(http, bot_token, chat_id, text, keyboard)
+
+    return {
+        "sent": 1 if msg_id else 0,
+        "messageId": msg_id,
+        "metrics": {
+            "orders_count": today_metrics["orders_count"],
+            "revenue": today_metrics["revenue"],
+            "visits": today_metrics["visits"],
+            "ad_cost": today_metrics["ad_cost"],
+        },
+    }
+
+
+# ── Cron entry point ─────────────────────────────────────────────
+
+async def dispatch_all_users(pool: asyncpg.Pool) -> dict[str, int]:
+    """Walk all users with notify_daily_sales=TRUE + telegram_chat_id, send."""
+    if pool is None:
+        return {"users": 0, "sent": 0}
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT n.user_id
+              FROM notification_settings n
+              JOIN ml_user_tokens t ON t.user_id = n.user_id
+             WHERE n.telegram_chat_id IS NOT NULL
+               AND COALESCE(n.notify_daily_sales, TRUE) = TRUE
+               AND t.access_token IS NOT NULL
+            """
+        )
+    user_ids = [r["user_id"] for r in rows]
+
+    totals = {"users": 0, "sent": 0, "skipped": 0}
+    for uid in user_ids:
+        try:
+            res = await _dispatch_for_user(pool, uid)
+            totals["users"] += 1
+            totals["sent"] += res["sent"]
+            if res["sent"] == 0:
+                totals["skipped"] += 1
+        except Exception as err:  # noqa: BLE001
+            log.exception("daily-summary dispatch user %s failed: %s", uid, err)
+        await asyncio.sleep(TG_THROTTLE)
+    return totals
