@@ -109,12 +109,31 @@ async def get_status(
 
     now = datetime.now(timezone.utc)
     expired = tokens["access_token_expires_at"] <= now
+
+    # nickname/site_id may be null on ml_user_tokens — OAuth callbacks
+    # before we started persisting these fields, plus some refresh paths
+    # don't carry the nickname. Account-health table caches the same
+    # values from /users/me with a 6h TTL, so fall back to it. Without
+    # this, ml-status reads as "connected: true, nickname: null" which
+    # confuses callers expecting a display name.
+    nickname = tokens.get("ml_nickname")
+    site_id = tokens.get("ml_site_id")
+    if not nickname or not site_id:
+        async with pool.acquire() as conn:
+            ah = await conn.fetchrow(
+                "SELECT nickname, site_id FROM ml_account_health WHERE user_id = $1",
+                user.id,
+            )
+        if ah:
+            nickname = nickname or ah["nickname"]
+            site_id = site_id or ah["site_id"]
+
     return MLStatusOut(
         connected=not expired,
         hasCredentials=has_creds,
         mlUserId=tokens.get("ml_user_id"),
-        nickname=tokens.get("ml_nickname"),
-        siteId=tokens.get("ml_site_id"),
+        nickname=nickname,
+        siteId=site_id,
         expiresAt=tokens.get("access_token_expires_at"),
         lastRefreshedAt=tokens.get("last_refreshed_at"),
         message="token_expired" if expired else None,

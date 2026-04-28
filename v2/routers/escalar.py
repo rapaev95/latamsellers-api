@@ -2155,13 +2155,20 @@ async def notifications_diagnostic(
         "noticesSyncIntervalMin": _os.environ.get("NOTICES_SYNC_INTERVAL_MIN", "5"),
     }
 
-    # 5. ML OAuth status — if user's token is dead, cron cannot fetch /communications/notices
+    # 5. ML OAuth status — if user's token is dead, cron cannot fetch /communications/notices.
+    # The column name on ml_user_tokens is `access_token_expires_at`, not
+    # `expires_at` — earlier diag had this misspelled and always returned null.
     try:
         token_row = await ml_oauth_svc.load_user_tokens(pool, user.id)
+        expires_at = token_row.get("access_token_expires_at") if token_row else None
         out["mlOauth"] = {
             "hasToken": bool(token_row and token_row.get("access_token")),
             "mlUserId": token_row.get("ml_user_id") if token_row else None,
-            "expiresAt": str(token_row.get("expires_at")) if token_row and token_row.get("expires_at") else None,
+            "expiresAt": expires_at.isoformat() if expires_at else None,
+            "lastRefreshedAt": (
+                token_row["last_refreshed_at"].isoformat()
+                if token_row and token_row.get("last_refreshed_at") else None
+            ),
         }
     except Exception as err:  # noqa: BLE001
         out["mlOauth"] = {"error": str(err)}

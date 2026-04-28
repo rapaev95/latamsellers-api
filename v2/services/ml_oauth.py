@@ -119,10 +119,27 @@ async def save_app_config(
 
 
 def mask_config(cfg: dict) -> dict:
-    """Build frontend-safe view of app config."""
+    """Build frontend-safe view of app config.
+
+    redirect_uri falls back to env ML_REDIRECT_URI then to a hardcoded
+    default for the prod app — empty string in DB used to leak through
+    to the UI which complicated the OAuth flow debugging.
+    """
+    import os
     secret = cfg.get("client_secret") or ""
     client_id = cfg.get("client_id") or ""
     redirect_uri = cfg.get("redirect_uri") or ""
+    redirect_source = "db" if redirect_uri else "none"
+    if not redirect_uri:
+        env_redirect = os.environ.get("ML_REDIRECT_URI", "").strip()
+        if env_redirect:
+            redirect_uri = env_redirect
+            redirect_source = "env"
+        else:
+            # Last-resort default — what's currently registered in
+            # developers.mercadolivre.com.br for this app.
+            redirect_uri = "https://app.lsprofit.app/api/ml-oauth/callback"
+            redirect_source = "default"
     return {
         "clientId": client_id,
         "clientSecretSet": bool(secret),
@@ -131,7 +148,7 @@ def mask_config(cfg: dict) -> dict:
         "source": {
             "clientId": "db" if client_id else "none",
             "clientSecret": "db" if secret else "none",
-            "redirectUri": "db" if redirect_uri else "none",
+            "redirectUri": redirect_source,
         },
     }
 

@@ -8,10 +8,14 @@ Gated by `require_tier("escalar")` — paywall handled by the frontend.
 """
 from __future__ import annotations
 
+import logging
+import traceback
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+
+log = logging.getLogger(__name__)
 
 from v2.deps import CurrentUser, current_user, get_pool, require_admin, require_tier
 from v2.schemas.ads import (
@@ -115,6 +119,30 @@ def _handle_ml_error(err: ml_ads.MLAdsError) -> None:
     raise HTTPException(status_code=502, detail=f"ml_error: {err.message[:200]}")
 
 
+def _safe_call_label(label: str, advertiser_id: int, user_id: int) -> str:
+    return f"{label}(advertiser={advertiser_id}, user={user_id})"
+
+
+def _explain_unhandled(err: Exception, label: str) -> HTTPException:
+    """Convert any unexpected exception into a structured 500.
+
+    Without this the Next.js proxy gets `Internal Server Error` plain
+    text from Starlette and we have to dig through Railway logs to
+    learn what actually broke. With this, the response carries the
+    error type + message + the first 1500 chars of the traceback so
+    the diagnostic loop closes in one round instead of three.
+    """
+    log.exception("[ads] %s unhandled exception", label)
+    detail = {
+        "error": "ads_internal",
+        "label": label,
+        "exception_type": type(err).__name__,
+        "message": str(err)[:500],
+        "traceback": traceback.format_exc()[-1500:],
+    }
+    return HTTPException(status_code=500, detail=detail)
+
+
 # ── Advertisers ───────────────────────────────────────────────────────────
 
 @router.get("/advertisers", response_model=AdvertisersOut)
@@ -174,41 +202,47 @@ async def get_campaigns(
     if pool is None:
         raise HTTPException(status_code=503, detail="no_db")
 
-    synced_at = await ads_storage.campaign_staleness(
-        pool, user.id, advertiser_id, product_id=product_type,
-    )
-    should_sync = refresh or synced_at is None or _stale(synced_at)
+    label = _safe_call_label("get_campaigns", advertiser_id, user.id)
+    try:
+        synced_at = await ads_storage.campaign_staleness(
+            pool, user.id, advertiser_id, product_id=product_type,
+        )
+        should_sync = refresh or synced_at is None or _stale(synced_at)
 
-    if should_sync:
-        try:
-            if product_type == "PADS":
-                # PADS still uses the dedicated ensure_fresh helper which
-                # also pulls ads — preserves existing behaviour.
-                await ml_ads_sync.ensure_fresh_for_advertiser(
-                    pool, user.id, advertiser_id, site_id,
-                    max_age_seconds=0 if refresh else ml_ads_sync.STALE_THRESHOLD_SECONDS,
-                )
-            else:
-                await ml_ads.sync_advertiser_campaigns_dispatch(
-                    pool, user.id, advertiser_id, site_id, product_type,
-                )
-        except ml_oauth_svc.MLRefreshError as err:
-            raise HTTPException(status_code=428, detail=f"ml_oauth_required: {err}")
-        except ml_ads.MLAdsError as err:
-            _handle_ml_error(err)
+        if should_sync:
+            try:
+                if product_type == "PADS":
+                    # PADS still uses the dedicated ensure_fresh helper which
+                    # also pulls ads — preserves existing behaviour.
+                    await ml_ads_sync.ensure_fresh_for_advertiser(
+                        pool, user.id, advertiser_id, site_id,
+                        max_age_seconds=0 if refresh else ml_ads_sync.STALE_THRESHOLD_SECONDS,
+                    )
+                else:
+                    await ml_ads.sync_advertiser_campaigns_dispatch(
+                        pool, user.id, advertiser_id, site_id, product_type,
+                    )
+            except ml_oauth_svc.MLRefreshError as err:
+                raise HTTPException(status_code=428, detail=f"ml_oauth_required: {err}")
+            except ml_ads.MLAdsError as err:
+                _handle_ml_error(err)
 
-    rows = await ads_storage.list_campaigns(
-        pool, user.id, advertiser_id, product_id=product_type,
-    )
-    fresh_synced_at = await ads_storage.campaign_staleness(
-        pool, user.id, advertiser_id, product_id=product_type,
-    )
-    return CampaignsOut(
-        campaigns=[_to_campaign(r) for r in rows],
-        total=len(rows),
-        stale=_stale(fresh_synced_at),
-        synced_at=_iso(fresh_synced_at),
-    )
+        rows = await ads_storage.list_campaigns(
+            pool, user.id, advertiser_id, product_id=product_type,
+        )
+        fresh_synced_at = await ads_storage.campaign_staleness(
+            pool, user.id, advertiser_id, product_id=product_type,
+        )
+        return CampaignsOut(
+            campaigns=[_to_campaign(r) for r in rows],
+            total=len(rows),
+            stale=_stale(fresh_synced_at),
+            synced_at=_iso(fresh_synced_at),
+        )
+    except HTTPException:
+        raise
+    except Exception as err:  # noqa: BLE001
+        raise _explain_unhandled(err, label)
 
 
 @router.get("/campaigns/{campaign_id}", response_model=CampaignDetail)
@@ -254,35 +288,41 @@ async def get_ads(
     if pool is None:
         raise HTTPException(status_code=503, detail="no_db")
 
-    synced_at = await ads_storage.campaign_staleness(pool, user.id, advertiser_id)
-    should_sync = refresh or synced_at is None or _stale(synced_at)
-    if should_sync:
-        try:
-            await ml_ads_sync.ensure_fresh_for_advertiser(
-                pool, user.id, advertiser_id, site_id,
-                max_age_seconds=0 if refresh else ml_ads_sync.STALE_THRESHOLD_SECONDS,
-            )
-        except ml_oauth_svc.MLRefreshError as err:
-            raise HTTPException(status_code=428, detail=f"ml_oauth_required: {err}")
-        except ml_ads.MLAdsError as err:
-            _handle_ml_error(err)
+    label = _safe_call_label("get_ads", advertiser_id, user.id)
+    try:
+        synced_at = await ads_storage.campaign_staleness(pool, user.id, advertiser_id)
+        should_sync = refresh or synced_at is None or _stale(synced_at)
+        if should_sync:
+            try:
+                await ml_ads_sync.ensure_fresh_for_advertiser(
+                    pool, user.id, advertiser_id, site_id,
+                    max_age_seconds=0 if refresh else ml_ads_sync.STALE_THRESHOLD_SECONDS,
+                )
+            except ml_oauth_svc.MLRefreshError as err:
+                raise HTTPException(status_code=428, detail=f"ml_oauth_required: {err}")
+            except ml_ads.MLAdsError as err:
+                _handle_ml_error(err)
 
-    rows, total = await ads_storage.list_ads(
-        pool, user.id,
-        advertiser_id=advertiser_id,
-        campaign_id=campaign_id,
-        status=status,
-        limit=limit, offset=offset,
-    )
-    fresh_synced_at = await ads_storage.campaign_staleness(pool, user.id, advertiser_id)
-    return AdsOut(
-        ads=[_to_ad(r) for r in rows],
-        total=total,
-        limit=limit,
-        offset=offset,
-        stale=_stale(fresh_synced_at),
-        synced_at=_iso(fresh_synced_at),
-    )
+        rows, total = await ads_storage.list_ads(
+            pool, user.id,
+            advertiser_id=advertiser_id,
+            campaign_id=campaign_id,
+            status=status,
+            limit=limit, offset=offset,
+        )
+        fresh_synced_at = await ads_storage.campaign_staleness(pool, user.id, advertiser_id)
+        return AdsOut(
+            ads=[_to_ad(r) for r in rows],
+            total=total,
+            limit=limit,
+            offset=offset,
+            stale=_stale(fresh_synced_at),
+            synced_at=_iso(fresh_synced_at),
+        )
+    except HTTPException:
+        raise
+    except Exception as err:  # noqa: BLE001
+        raise _explain_unhandled(err, label)
 
 
 # ── Manual trigger (admin only) ───────────────────────────────────────────
