@@ -675,24 +675,81 @@ def _build_keyboard(
     claim_id: int,
     app_base_url: str,
     recommended_action: Optional[str] = None,
+    claim: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Inline keyboard with one-click resolution actions.
+    """Stage-aware inline keyboard.
 
-    callback_data prefixes (handled by the Next.js telegram-webhook route):
-      cl_rf:{id}  → refund (full)
-      cl_rt:{id}  → return_product (accept return; buyer ships back)
-      cl_ex:{id}  → change_product (exchange / accept return for replacement)
-      cl_pa:{id}  → partial-refund — opens the app (needs amount input)
+    Per ML's official docs, the resolution flow has THREE phases each with
+    different valid endpoints:
 
-    `recommended_action` (from ML mediator's "Melhor opção ⭐") prefixes
-    the corresponding label with ⭐ so the seller sees ML's recommendation
-    at a glance.
+    1. EARLY (no return yet, claim.returns is empty)
+       → POST /expected-resolutions/{refund|return_product|change_product|partial-refund}
+       → Buttons: Reembolsar / Aceitar devolução / Trocar / Reembolso parcial
+
+    2. RETURN IN TRANSIT (returns[0].status in {label_generated, shipped, ...})
+       → No seller action available, just wait for delivery
+       → Buttons: only Atender no app / Ver no ML
+
+    3. RETURN DELIVERED (returns[0].status == 'delivered')
+       → POST /post-purchase/v1/returns/{return_id}/return-review
+         - Empty body {} for OK
+         - {reason, message, attachments[]} for FAIL (needs reason/photos → app)
+       → Buttons: ✅ Aprovar OK / ❌ Reportar problema (→ app) / app+ml
+
+    callback_data prefixes:
+      cl_rf:{claim_id}                 → refund (full)              [early]
+      cl_rt:{claim_id}                 → return_product             [early]
+      cl_ex:{claim_id}                 → change_product             [early]
+      cl_pa:{claim_id}                 → partial-refund (→ app)     [early]
+      cl_ok:{claim_id}:{return_id}     → return-review OK           [delivered]
     """
     def _label(base: str, action_key: str) -> str:
         return f"⭐ {base}" if recommended_action == action_key else base
 
     app_link = f"{app_base_url.rstrip('/')}/escalar/claims"
     ml_link = f"https://myaccount.mercadolivre.com.br/post-purchase/cases/{claim_id}"
+
+    # Detect stage from claim.returns
+    returns = (claim or {}).get("returns") if isinstance(claim, dict) else None
+    head_return: dict[str, Any] = {}
+    if isinstance(returns, list) and returns and isinstance(returns[0], dict):
+        head_return = returns[0]
+    return_status = (head_return.get("status") or "").lower()
+    return_id = head_return.get("id")
+
+    # Stage 3: return delivered → return-review flow
+    if return_status == "delivered" and return_id:
+        return {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "✅ Aprovar devolução (OK)",
+                        "callback_data": f"cl_ok:{claim_id}:{return_id}",
+                    },
+                    # Failed review needs reason + message + attachments — too
+                    # complex for a single tap. Send to app where the form lives.
+                    {"text": "❌ Reportar problema", "url": f"{app_base_url.rstrip('/')}/escalar/claims"},
+                ],
+                [
+                    {"text": "⚡ Atender no app", "url": app_link},
+                    {"text": "🔗 Ver no ML", "url": ml_link},
+                ],
+            ],
+        }
+
+    # Stage 2: return in transit → no seller action available
+    if return_status and return_status not in ("delivered",):
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "⚡ Atender no app", "url": app_link},
+                    {"text": "🔗 Ver no ML", "url": ml_link},
+                ],
+            ],
+        }
+
+    # Stage 1: early — full action set (still useful for early-stage claims
+    # where ML hasn't built a return yet; ~3 of these closed today via API).
     return {
         "inline_keyboard": [
             [
@@ -747,7 +804,11 @@ async def _send_claim(
     )
     if len(text) > 4000:
         text = text[:3990] + "…"
-    keyboard = _build_keyboard(cid, app_base_url, recommended_action=recommended_action)
+    keyboard = _build_keyboard(
+        cid, app_base_url,
+        recommended_action=recommended_action,
+        claim=claim,
+    )
 
     try:
         # First attempt: MarkdownV2
