@@ -18,6 +18,7 @@ from v2.services import (
     ml_item_context as ml_item_context_svc,
     ml_normalize as ml_normalize_svc,
     ml_notices as ml_notices_svc,
+    ml_anomalies as ml_anomalies_svc,
     ml_oauth as ml_oauth_svc,
     ml_orders as ml_orders_svc,
     ml_quality as ml_quality_svc,
@@ -3461,15 +3462,59 @@ async def add_changelog_event(
 
 @router.get("/anomalies")
 async def get_anomalies(
+    days: int = Query(14, ge=1, le=60),
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ):
-    """List today's anomaly flags across all the user's items.
-    Powers the dashboard widget."""
+    """Account-level anomalies (ACOS spike, sales drop, visits drop) for
+    the last N days. Reads from `escalar_anomalies` cache populated by
+    the cron / preview endpoint. Returns history so the UI can show
+    trend, not just today.
+    """
     if pool is None:
         return {"error": "no_db", "anomalies": []}
-    await listing_journey_svc.ensure_schema(pool)
-    return {"anomalies": await listing_journey_svc.detect_anomalies(pool, user.id)}
+    await ml_anomalies_svc.ensure_schema(pool)
+    rows = await ml_anomalies_svc.list_recent(pool, user.id, days=days)
+    return {
+        "anomalies": rows,
+        "total": len(rows),
+        "fetchedAt": rows[0]["created_at"] if rows else None,
+    }
+
+
+@router.post("/anomalies/preview")
+async def anomalies_preview(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+    body: dict[str, Any] = Body(default={}),
+):
+    """Run detect+upsert+dispatch for the current user immediately.
+    Bypasses notify toggle when force=true. Returns counts so the UI
+    knows whether anything was found / sent.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    target_str = (body or {}).get("date")
+    target = None
+    if target_str:
+        try:
+            from datetime import date as _date
+            target = _date.fromisoformat(target_str)
+        except ValueError:
+            return {"error": "invalid_date"}
+    return await ml_anomalies_svc._dispatch_for_user(pool, user.id, target_date=target)
+
+
+@router.get("/anomalies/probe")
+async def anomalies_probe(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Run detectors WITHOUT persisting or dispatching. For dev — see
+    what would have fired today."""
+    if pool is None:
+        return {"error": "no_db"}
+    return {"anomalies": await ml_anomalies_svc.detect_for_user(pool, user.id)}
 
 
 # ──────────────────────────────────────────────────────────────────────

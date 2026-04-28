@@ -62,6 +62,7 @@ from v2.db import close_pool, create_pool, get_pool  # noqa: E402
 from v2.services import ml_backfill as ml_backfill_svc  # noqa: E402
 from v2.services import ml_claims_dispatch as ml_claims_dispatch_svc  # noqa: E402
 from v2.services import daily_summary_dispatch as daily_summary_dispatch_svc  # noqa: E402
+from v2.services import ml_anomalies as ml_anomalies_svc  # noqa: E402
 from v2.services import photo_ab_dispatch as photo_ab_dispatch_svc  # noqa: E402
 from v2.services import ml_item_context as ml_item_context_svc  # noqa: E402
 from v2.services import ml_messages_dispatch as ml_messages_dispatch_svc  # noqa: E402
@@ -185,6 +186,33 @@ async def _dispatch_daily_sales_summary_job() -> None:
         )
     except Exception as err:  # noqa: BLE001
         _ml_log.exception("Daily summary job failed: %s", err)
+
+
+async def _dispatch_anomalies_job() -> None:
+    """Detect ACOS spike / sales drop / visits drop for yesterday and
+    push a single TG card per user.
+
+    Runs at 23:30 UTC = 20:30 BRT — 30 minutes after the daily-summary
+    cron so the seller sees the recap card first, then the anomaly
+    follow-up if anything actually misbehaved.
+
+    Cache `escalar_anomalies` dedups: re-running the cron does not
+    double-ping. Storing happens regardless of TG dispatch state so
+    the in-app dashboard shows history.
+    """
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("Anomalies tick skipped: no DB pool")
+            return
+        result = await ml_anomalies_svc.dispatch_all_users(pool)
+        _ml_log.info(
+            "Anomalies tick: users=%s detected=%s new=%s sent=%s",
+            result.get("users"), result.get("detected"),
+            result.get("new"), result.get("sent"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("Anomalies job failed: %s", err)
 
 
 async def _dispatch_messages_to_tg_job() -> None:
@@ -566,6 +594,10 @@ async def _v2_startup() -> None:
             await _ml_orders_svc.ensure_schema(pool)
         except Exception as err:  # noqa: BLE001
             _ml_log.exception("ml_orders schema bootstrap failed: %s", err)
+        try:
+            await ml_anomalies_svc.ensure_schema(pool)
+        except Exception as err:  # noqa: BLE001
+            _ml_log.exception("ml_anomalies schema bootstrap failed: %s", err)
 
     # Spin up the headless Chromium used by /escalar/positions scraper.
     # Failure here is logged but non-fatal — the scraper self-heals on first use.
@@ -663,6 +695,18 @@ async def _v2_startup() -> None:
         _dispatch_daily_sales_summary_job,
         CronTrigger(hour=_summary_hour, minute=_summary_minute, timezone="UTC"),
         id="daily_sales_summary_tg",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Anomalies dispatch — fires 30 minutes after daily-summary so the
+    # seller sees the recap first, then the anomaly follow-up.
+    _anomalies_hour = int(os.environ.get("ANOMALIES_TG_HOUR_UTC", "23"))
+    _anomalies_minute = int(os.environ.get("ANOMALIES_TG_MINUTE_UTC", "30"))
+    _ml_scheduler.add_job(
+        _dispatch_anomalies_job,
+        CronTrigger(hour=_anomalies_hour, minute=_anomalies_minute, timezone="UTC"),
+        id="anomalies_tg",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
