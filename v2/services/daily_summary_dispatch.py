@@ -11,8 +11,10 @@ Sends a per-seller morning/evening recap aggregating yesterday's:
 Triggered by the cron job _dispatch_daily_sales_summary_job in main.py
 at 23:00 UTC = 20:00 BRT (end-of-day for the seller).
 
-Schema: NO new tables. Reuses:
-  - vendas via parsers.db_loader.load_user_vendas (sales)
+Schema: NO new tables here. Sources:
+  - ml_user_orders via ml_orders.refresh_for_period + get_orders_for_day
+    (replaced db_loader.load_user_vendas which was CSV-bound and stale
+    when the seller stopped uploading files)
   - ml_item_visits.daily (visits per day)
   - ml_ad_campaign_metrics_daily (ads per day)
   - notification_settings (gating + language)
@@ -33,7 +35,7 @@ from typing import Any, Optional
 import asyncpg
 import httpx
 
-from v2.parsers import db_loader
+from v2.services import ml_orders as ml_orders_svc
 
 log = logging.getLogger(__name__)
 
@@ -84,10 +86,6 @@ def _brt_yesterday() -> date:
 
 # ── Aggregation ────────────────────────────────────────────────────
 
-# Statuses that indicate a sale was cancelled/refunded — exclude from revenue.
-_CANCELLED_STATUSES = {"cancelled", "cancelado", "cancelada", "devolvido", "refunded"}
-
-
 async def _aggregate_user_metrics(
     pool: asyncpg.Pool,
     user_id: int,
@@ -100,35 +98,25 @@ async def _aggregate_user_metrics(
     ms_start, ms_end = _brt_day_bounds_ms(target_date)
     target_iso = target_date.isoformat()
 
-    # 1. Sales from vendas (parsed CSV cache)
-    vendas = await db_loader.load_user_vendas(pool, user_id) or []
-    day_sales = [
-        v for v in vendas
-        if ms_start <= v.date_ms <= ms_end
-    ]
-    seen_sale_ids: set[str] = set()
-    orders_count = 0
-    revenue = 0.0
-    items_per_mlb: dict[str, dict[str, Any]] = {}
-    for v in day_sales:
-        # Dedup at sale_id level (one sale can produce multiple rows)
-        if v.sale_id and v.sale_id in seen_sale_ids:
-            continue
-        if v.sale_id:
-            seen_sale_ids.add(v.sale_id)
-        status_l = (v.status or "").lower()
-        if status_l in _CANCELLED_STATUSES:
-            continue
-        orders_count += 1
-        revenue += float(v.receita or 0.0)
-        if v.mlb:
-            slot = items_per_mlb.setdefault(v.mlb, {
-                "mlb": v.mlb, "title": v.title or "", "units": 0, "revenue": 0.0,
-            })
-            slot["units"] += int(v.units or 0)
-            slot["revenue"] += float(v.receita or 0.0)
-            if not slot["title"] and v.title:
-                slot["title"] = v.title
+    # 1. Sales from ML /orders/search cache.
+    # We pull a 2-day window (target_date and the day before) so we
+    # cover late-arriving orders that ML backfilled after they were
+    # initially created. Cache is then read filtered to the exact BRT
+    # day. Day-before is also cached "for free" — useful for the diff
+    # against yesterday in _build_card.
+    refresh_end = max(target_date, _brt_yesterday())  # never future
+    try:
+        await ml_orders_svc.refresh_for_period(
+            pool, user_id, days_back=2, end_date_brt=refresh_end,
+        )
+    except Exception as err:  # noqa: BLE001
+        log.warning("orders refresh user=%s date=%s failed (continuing with cache): %s",
+                    user_id, target_date, err)
+
+    day_agg = await ml_orders_svc.get_orders_for_day(pool, user_id, target_date)
+    orders_count = day_agg["orders_count"]
+    revenue = day_agg["revenue"]
+    items_per_mlb = day_agg["items_per_mlb"]
 
     avg_ticket = (revenue / orders_count) if orders_count else 0.0
 

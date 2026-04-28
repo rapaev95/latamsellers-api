@@ -11,8 +11,9 @@ Flow:
    'completed'.
 
 Schema: ONE new table `escalar_photo_experiments`. Reuses ml_item_visits
-.daily JSONB for visits and parsers.db_loader.load_user_vendas for
-orders — same sources daily_summary_dispatch uses.
+.daily JSONB for visits and ml_user_orders (via ml_orders service) for
+orders — same sources daily_summary_dispatch uses, so baseline matches
+what the seller sees in the Daily Summary card.
 
 Triggered by _dispatch_photo_experiments_results_job in main.py at
 hourly cadence (ends_at granularity is fine to within an hour).
@@ -30,7 +31,7 @@ from typing import Any, Optional
 import asyncpg
 import httpx
 
-from v2.parsers import db_loader
+from v2.services import ml_orders as ml_orders_svc
 
 log = logging.getLogger(__name__)
 
@@ -109,9 +110,6 @@ def _brt_day_bounds_ms(target_date: date) -> tuple[int, int]:
     )
 
 
-_CANCELLED_STATUSES = {"cancelled", "cancelado", "cancelada", "devolvido", "refunded"}
-
-
 async def _aggregate_window_for_item(
     pool: asyncpg.Pool,
     user_id: int,
@@ -122,15 +120,17 @@ async def _aggregate_window_for_item(
     """Sum visits + orders for a single item over the [start, end] BRT
     window. Used identically for baseline (before swap) and treatment
     (after swap) so the diff is apples-to-apples.
+
+    Orders come from ml_user_orders (live ML cache). Caller is expected
+    to call ml_orders_svc.refresh_for_period before this if freshness
+    matters — start_experiment and _close_one_experiment do.
     """
     start_brt = start.astimezone(BRT)
     end_brt = end.astimezone(BRT)
     start_date = start_brt.date()
     end_date = end_brt.date()
 
-    # 1. Visits — from ml_item_visits.daily JSONB. Date strings are
-    #    ISO-prefix matched (LIKE 'YYYY-MM-DD%') so we don't worry about
-    #    timestamp-vs-date format differences in the cached payload.
+    # 1. Visits — from ml_item_visits.daily JSONB.
     visits = 0
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -165,24 +165,11 @@ async def _aggregate_window_for_item(
             except (TypeError, ValueError):
                 continue
 
-    # 2. Orders — from vendas. Filter by mlb + date_ms in window.
-    ms_start = int(start.timestamp() * 1000)
-    ms_end = int(end.timestamp() * 1000)
-    vendas = await db_loader.load_user_vendas(pool, user_id) or []
-    seen_sale_ids: set[str] = set()
-    orders = 0
-    for v in vendas:
-        if v.mlb != item_id:
-            continue
-        if not (ms_start <= v.date_ms <= ms_end):
-            continue
-        if v.sale_id and v.sale_id in seen_sale_ids:
-            continue
-        if v.sale_id:
-            seen_sale_ids.add(v.sale_id)
-        if (v.status or "").lower() in _CANCELLED_STATUSES:
-            continue
-        orders += 1
+    # 2. Orders — from ml_user_orders cache (filled by ml_orders_svc).
+    orders_agg = await ml_orders_svc.get_orders_for_window(
+        pool, user_id, item_id, start, end,
+    )
+    orders = orders_agg["orders"]
 
     return {"visits": visits, "orders": orders}
 
@@ -211,6 +198,16 @@ async def start_experiment(
 
     now_utc = datetime.now(timezone.utc)
     baseline_start = now_utc - timedelta(days=duration_days)
+    # Refresh ML orders cache for the baseline window before aggregating
+    # so we don't snapshot stale numbers. +2 day buffer for late-arriving
+    # orders ML may backfill.
+    try:
+        await ml_orders_svc.refresh_for_period(
+            pool, user_id, days_back=duration_days + 2,
+        )
+    except Exception as err:  # noqa: BLE001
+        log.warning("photo-ab start: orders refresh user=%s failed (using cache): %s",
+                    user_id, err)
     metrics = await _aggregate_window_for_item(
         pool, user_id, item_id, baseline_start, now_utc,
     )
@@ -480,6 +477,18 @@ async def _close_one_experiment(
         started_at = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
     if isinstance(ends_at, str):
         ends_at = datetime.fromisoformat(ends_at.replace("Z", "+00:00"))
+
+    # Refresh ML orders cache for the treatment window before aggregating.
+    # The window may extend back duration_days, plus a small buffer for
+    # late-arriving orders.
+    duration_days = int(experiment.get("duration_days") or 7)
+    try:
+        await ml_orders_svc.refresh_for_period(
+            pool, user_id, days_back=duration_days + 2,
+        )
+    except Exception as err:  # noqa: BLE001
+        log.warning("photo-ab close: orders refresh user=%s exp=%s failed (using cache): %s",
+                    user_id, experiment.get("id"), err)
 
     # Compute treatment metrics over [started_at, ends_at] same window length
     treatment = await _aggregate_window_for_item(

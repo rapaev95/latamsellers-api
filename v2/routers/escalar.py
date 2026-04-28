@@ -19,6 +19,7 @@ from v2.services import (
     ml_normalize as ml_normalize_svc,
     ml_notices as ml_notices_svc,
     ml_oauth as ml_oauth_svc,
+    ml_orders as ml_orders_svc,
     ml_quality as ml_quality_svc,
     ml_scraper_chat as ml_scraper_chat_svc,
     daily_summary_dispatch as daily_summary_dispatch_svc,
@@ -1306,6 +1307,75 @@ async def photo_experiment_close_now(
     async with httpx.AsyncClient() as http:
         ok = await photo_ab_dispatch_svc._close_one_experiment(pool, http, dict(row))
     return {"ok": ok, "experiment_id": experiment_id}
+
+
+# ── Orders cache (ml_user_orders — feeds daily-summary + photo A/B) ──────────
+
+
+@router.get("/orders-probe")
+async def orders_probe(
+    days_back: int = Query(2, ge=0, le=60),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """TEST step: hit /orders/search directly for [today-days_back, today]
+    BRT and return raw status + sample so we can verify ML token + shape
+    before relying on the cache."""
+    if pool is None:
+        return {"error": "no_db"}
+    return await ml_orders_svc.probe(pool, user.id, days_back=days_back)
+
+
+@router.post("/orders/refresh")
+async def orders_refresh(
+    days_back: int = Query(14, ge=1, le=60),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Force-pull orders from ML for the last `days_back` BRT days into
+    `ml_user_orders`. Daily-summary calls this implicitly with
+    days_back=2 before aggregating; photo A/B calls it with
+    days_back=duration_days+2 at start and at close. This endpoint is
+    for manual smoke-tests / backfill."""
+    if pool is None:
+        return {"error": "no_db"}
+    return await ml_orders_svc.refresh_for_period(pool, user.id, days_back=days_back)
+
+
+@router.get("/orders")
+async def orders_list(
+    days: int = Query(7, ge=1, le=60),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Read cached orders for the last N BRT days. Cache-only, no
+    ML fetch — call /orders/refresh first if you need fresh data."""
+    if pool is None:
+        return {"orders": []}
+    await ml_orders_svc.ensure_schema(pool)
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    BRT_TZ = _tz(_td(hours=-3))
+    end = _dt.now(BRT_TZ)
+    start = end - _td(days=days)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT order_id, pack_id,
+                   to_char(date_created AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS date_created,
+                   status, total_amount, currency, items
+              FROM ml_user_orders
+             WHERE user_id = $1
+               AND date_created BETWEEN $2 AND $3
+             ORDER BY date_created DESC
+             LIMIT 500
+            """,
+            user.id, start, end,
+        )
+    return {
+        "orders": [dict(r) for r in rows],
+        "total": len(rows),
+        "fetchedAt": await ml_orders_svc.get_latest_fetched_at(pool, user.id),
+    }
 
 
 @router.post("/daily-summary/preview")
