@@ -1,9 +1,11 @@
 """Anomaly detection on top of the live caches we already maintain.
 
-Three detectors that run against yesterday's BRT day vs the 7-day median:
+Four detectors that run against yesterday's BRT day vs the 7-day median:
   1. acos_spike     — today_acos > max(2× median_acos, settings.acos_threshold)
   2. sales_drop     — today_orders < 0.5× median_orders AND median_orders >= 4
   3. visits_drop    — today_visits < 0.5× median_visits AND median_visits >= 100
+  4. position_drop  — current position dropped >= 5 ranks AND now > 30
+                      (or fell off the page entirely from a top-30 spot)
 
 Detector deliberately uses the same per-day building blocks the Daily
 Summary uses (ml_user_orders, ml_item_visits.daily, ml_ad_campaign_metrics_daily)
@@ -46,6 +48,11 @@ SALES_DROP_RATIO = float(os.environ.get("ANOMALIES_SALES_RATIO", "0.5"))
 SALES_DROP_MIN_BASELINE = int(os.environ.get("ANOMALIES_SALES_MIN_BASE", "4"))
 VISITS_DROP_RATIO = float(os.environ.get("ANOMALIES_VISITS_RATIO", "0.5"))
 VISITS_DROP_MIN_BASELINE = int(os.environ.get("ANOMALIES_VISITS_MIN_BASE", "100"))
+# Position drop: trigger if rank dropped by at least N places AND new
+# rank is past the first ~3 pages (50 results per page). Falling from
+# top-30 to «not found» also fires.
+POSITION_DROP_MIN_DELTA = int(os.environ.get("ANOMALIES_POSITION_MIN_DELTA", "5"))
+POSITION_DROP_THRESHOLD = int(os.environ.get("ANOMALIES_POSITION_THRESHOLD", "30"))
 HISTORY_DAYS = 7  # baseline window
 
 
@@ -263,7 +270,102 @@ async def detect_for_user(
                 ),
             })
 
+    # 4. Position drop — per (item_id, keyword) tracked by the seller.
+    # We compare the latest position vs the prior 7-day median.
+    position_anomalies = await _detect_position_drops(pool, user_id)
+    anomalies.extend(position_anomalies)
+
     return anomalies
+
+
+async def _detect_position_drops(
+    pool: asyncpg.Pool, user_id: int,
+) -> list[dict[str, Any]]:
+    """For each tracked keyword × item, compare the most recent
+    position against the 7-day median. Fire if dropped by
+    POSITION_DROP_MIN_DELTA places AND new rank is past
+    POSITION_DROP_THRESHOLD (or vanished from top-N entirely).
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH latest AS (
+                    SELECT DISTINCT ON (user_id, item_id, keyword)
+                           user_id, item_id, keyword,
+                           position AS today_position,
+                           found AS today_found,
+                           checked_at AS today_at
+                      FROM position_history
+                     WHERE user_id = $1
+                       AND checked_at >= NOW() - INTERVAL '36 hours'
+                     ORDER BY user_id, item_id, keyword, checked_at DESC
+                ),
+                baseline AS (
+                    SELECT user_id, item_id, keyword,
+                           PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY position) AS med_pos,
+                           COUNT(*) AS samples
+                      FROM position_history
+                     WHERE user_id = $1
+                       AND found = TRUE
+                       AND position IS NOT NULL
+                       AND checked_at BETWEEN NOW() - INTERVAL '8 days'
+                                          AND NOW() - INTERVAL '36 hours'
+                     GROUP BY user_id, item_id, keyword
+                    HAVING COUNT(*) >= 3
+                )
+                SELECT l.item_id, l.keyword, l.today_position, l.today_found,
+                       b.med_pos, b.samples
+                  FROM latest l
+                  JOIN baseline b
+                    ON b.user_id = l.user_id
+                   AND b.item_id = l.item_id
+                   AND b.keyword = l.keyword
+                """,
+                user_id,
+            )
+    except Exception as err:  # noqa: BLE001
+        log.warning("position_drop query user=%s failed (skipping): %s", user_id, err)
+        return out
+
+    for r in rows:
+        med = float(r["med_pos"]) if r["med_pos"] is not None else None
+        if med is None:
+            continue
+        # Vanished entirely (was in top-N, now not_found)
+        if not r["today_found"] and med <= POSITION_DROP_THRESHOLD:
+            out.append({
+                "type": "position_drop",
+                "severity": "critical",
+                "item_id": r["item_id"],
+                "metric_value": None,
+                "baseline_value": round(med, 1),
+                "delta_pct": None,
+                "message": (
+                    f"\"{r['keyword']}\" — каіу da busca \\(antes ~{med:.0f}\\). "
+                    f"Verifique status do anúncio + reputação."
+                ),
+            })
+            continue
+        if r["today_position"] is None:
+            continue
+        today = int(r["today_position"])
+        delta_places = today - med  # positive = worse rank
+        if delta_places >= POSITION_DROP_MIN_DELTA and today > POSITION_DROP_THRESHOLD:
+            out.append({
+                "type": "position_drop",
+                "severity": "warn",
+                "item_id": r["item_id"],
+                "metric_value": float(today),
+                "baseline_value": round(med, 1),
+                "delta_pct": None,  # places moved, not %
+                "message": (
+                    f"\"{r['keyword']}\" passou de #{med:.0f} para #{today} "
+                    f"\\({int(delta_places)} posições para baixo\\)."
+                ),
+            })
+    return out
 
 
 # ── Storage ───────────────────────────────────────────────────────────────
@@ -329,11 +431,13 @@ _TYPE_TITLE_RU = {
     "acos_spike": "Скачок ACOS",
     "sales_drop": "Просадка продаж",
     "visits_drop": "Просадка визитов",
+    "position_drop": "Падение позиции",
 }
 _TYPE_TITLE_PT = {
     "acos_spike": "Pico de ACOS",
     "sales_drop": "Queda de vendas",
     "visits_drop": "Queda de visitas",
+    "position_drop": "Queda de posição",
 }
 
 

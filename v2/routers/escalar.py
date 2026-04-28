@@ -1501,6 +1501,84 @@ async def orders_list(
     }
 
 
+@router.delete("/photo-experiments/{experiment_id}")
+async def delete_photo_experiment(
+    experiment_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Delete a photo A/B experiment row outright. Used for cleanup of
+    test rows created during smoke tests. Only deletes rows owned by
+    the current user."""
+    if pool is None:
+        return {"error": "no_db"}
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM escalar_photo_experiments WHERE id = $1 AND user_id = $2",
+            experiment_id, user.id,
+        )
+    deleted = result.endswith(" 1")
+    return {"deleted": deleted, "experiment_id": experiment_id}
+
+
+@router.post("/_admin/trigger-cron")
+async def trigger_cron_admin(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+    body: dict[str, Any] = Body(default={}),
+):
+    """Manually fire any of the scheduled cron jobs RIGHT NOW for the
+    current user. Useful to verify everything works without waiting
+    for 23:00 UTC daily summary or 23:30 UTC anomalies.
+
+    Body: `{ jobs: ["daily_summary", "anomalies", "questions", "claims",
+                    "messages", "promotions", "all"] }`
+    Default `["all"]` — runs every dispatch in sequence.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+
+    requested = (body or {}).get("jobs") or ["all"]
+    if isinstance(requested, str):
+        requested = [requested]
+
+    results: dict[str, Any] = {}
+
+    async def _run(name: str, coro_factory: Any) -> None:
+        try:
+            results[name] = await coro_factory()
+        except Exception as err:  # noqa: BLE001
+            import traceback
+            results[name] = {
+                "error": type(err).__name__,
+                "message": str(err)[:300],
+                "traceback": traceback.format_exc()[-800:],
+            }
+
+    do_all = "all" in requested
+
+    if do_all or "daily_summary" in requested:
+        await _run(
+            "daily_summary",
+            lambda: daily_summary_dispatch_svc._dispatch_for_user(pool, user.id),
+        )
+
+    if do_all or "anomalies" in requested:
+        from v2.services import ml_anomalies as _anomalies_svc
+        await _run(
+            "anomalies",
+            lambda: _anomalies_svc._dispatch_for_user(pool, user.id),
+        )
+
+    if do_all or "photo_ab" in requested:
+        await _run(
+            "photo_ab",
+            lambda: photo_ab_dispatch_svc.dispatch_pending_results(pool),
+        )
+
+    return {"user_id": user.id, "ran": list(results.keys()), "results": results}
+
+
 @router.post("/daily-summary/preview")
 async def daily_summary_preview(
     user: CurrentUser = Depends(current_user),

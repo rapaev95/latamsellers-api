@@ -35,154 +35,192 @@ def _parse_dt(value: Any) -> Optional[datetime]:
     return None
 
 
-CREATE_TABLES_SQL = """
-CREATE TABLE IF NOT EXISTS ml_advertisers (
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    advertiser_id BIGINT NOT NULL,
-    site_id TEXT,
-    advertiser_name TEXT,
-    account_name TEXT,
-    product_id TEXT NOT NULL DEFAULT 'PADS',
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (user_id, advertiser_id, product_id)
-);
+# Base CREATE TABLE statements — split into individual SQL strings so
+# each can run in its own connection acquire. The original DO + EXCEPTION
+# WHEN OTHERS THEN NULL pattern silently swallowed migration failures
+# on production (commit 73a4fbc fix). Now every step is explicit and
+# loggable.
 
--- Migrate legacy 2-col PK to include product_id so the same advertiser_id
--- can have separate rows for PADS / DISPLAY / BADS (a seller routinely
--- has different IDs per product type, but ML's APIs sometimes overlap).
-DO $migrate_pk$
-DECLARE
-  pk_cols int;
-BEGIN
-  SELECT count(*) INTO pk_cols
-    FROM information_schema.key_column_usage
-   WHERE table_name = 'ml_advertisers'
-     AND constraint_name = 'ml_advertisers_pkey';
-  IF pk_cols = 2 THEN
-    ALTER TABLE ml_advertisers DROP CONSTRAINT ml_advertisers_pkey;
-    ALTER TABLE ml_advertisers ADD PRIMARY KEY (user_id, advertiser_id, product_id);
-  END IF;
-END
-$migrate_pk$;
+_CREATE_TABLES_SQL = [
+    # ml_advertisers — base table, includes product_id from day one
+    """
+    CREATE TABLE IF NOT EXISTS ml_advertisers (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        advertiser_id BIGINT NOT NULL,
+        site_id TEXT,
+        advertiser_name TEXT,
+        account_name TEXT,
+        product_id TEXT NOT NULL DEFAULT 'PADS',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (user_id, advertiser_id, product_id)
+    )
+    """,
+    # ml_ad_campaigns — base table, includes product_id from day one
+    """
+    CREATE TABLE IF NOT EXISTS ml_ad_campaigns (
+        user_id INTEGER NOT NULL,
+        advertiser_id BIGINT NOT NULL,
+        campaign_id BIGINT NOT NULL,
+        product_id TEXT NOT NULL DEFAULT 'PADS',
+        name TEXT,
+        status TEXT,
+        strategy TEXT,
+        budget NUMERIC,
+        automatic_budget BOOLEAN,
+        roas_target NUMERIC,
+        channel TEXT,
+        date_created TIMESTAMPTZ,
+        last_updated TIMESTAMPTZ,
+        start_date TIMESTAMPTZ,
+        end_date TIMESTAMPTZ,
+        campaign_type TEXT,
+        goal TEXT,
+        site_id TEXT,
+        headline TEXT,
+        cpc NUMERIC,
+        currency TEXT,
+        official_store_id BIGINT,
+        destination_id BIGINT,
+        raw JSONB,
+        metrics JSONB,
+        metrics_date_from DATE,
+        metrics_date_to DATE,
+        synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (user_id, advertiser_id, campaign_id, product_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ml_ad_campaigns_user_idx ON ml_ad_campaigns (user_id, advertiser_id, product_id)",
+    # ml_ad_campaign_metrics_daily
+    """
+    CREATE TABLE IF NOT EXISTS ml_ad_campaign_metrics_daily (
+        user_id INTEGER NOT NULL,
+        advertiser_id BIGINT NOT NULL,
+        campaign_id BIGINT NOT NULL,
+        date DATE NOT NULL,
+        metrics JSONB,
+        synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (user_id, advertiser_id, campaign_id, date)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ml_ad_campaign_metrics_daily_lookup_idx ON ml_ad_campaign_metrics_daily (user_id, campaign_id, date DESC)",
+    # ml_ad_ads
+    """
+    CREATE TABLE IF NOT EXISTS ml_ad_ads (
+        user_id INTEGER NOT NULL,
+        advertiser_id BIGINT NOT NULL,
+        item_id TEXT NOT NULL,
+        campaign_id BIGINT,
+        title TEXT,
+        status TEXT,
+        price NUMERIC,
+        thumbnail TEXT,
+        permalink TEXT,
+        domain_id TEXT,
+        brand_value_name TEXT,
+        metrics JSONB,
+        metrics_date_from DATE,
+        metrics_date_to DATE,
+        synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (user_id, advertiser_id, item_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ml_ad_ads_user_idx ON ml_ad_ads (user_id, advertiser_id, status)",
+]
 
-CREATE TABLE IF NOT EXISTS ml_ad_campaigns (
-    user_id INTEGER NOT NULL,
-    advertiser_id BIGINT NOT NULL,
-    campaign_id BIGINT NOT NULL,
-    product_id TEXT NOT NULL DEFAULT 'PADS',
-    name TEXT,
-    status TEXT,
-    strategy TEXT,            -- PADS only
-    budget NUMERIC,           -- PADS / BADS
-    automatic_budget BOOLEAN, -- PADS only
-    roas_target NUMERIC,      -- PADS only
-    channel TEXT,             -- PADS only
-    date_created TIMESTAMPTZ,
-    last_updated TIMESTAMPTZ,
-    -- Generic time-window for the row (start_date / end_date as ML returns them).
-    -- DISPLAY uses these from /display/campaigns; BADS uses them too.
-    start_date TIMESTAMPTZ,
-    end_date TIMESTAMPTZ,
-    -- DISPLAY fields
-    campaign_type TEXT,       -- BADS: 'automatic'/'custom'; DISPLAY: 'GUARANTEED'/'PROGRAMMATIC'
-    goal TEXT,                -- DISPLAY only
-    site_id TEXT,
-    -- BADS fields
-    headline TEXT,
-    cpc NUMERIC,
-    currency TEXT,
-    official_store_id BIGINT,
-    destination_id BIGINT,
-    -- Whole campaign payload — keeps type-specific fields without schema churn.
-    raw JSONB,
-    metrics JSONB,
-    metrics_date_from DATE,
-    metrics_date_to DATE,
-    synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (user_id, advertiser_id, campaign_id, product_id)
-);
+# Per-table column migrations for installations created BEFORE these
+# columns existed. Each tuple is (table, column_name, column_type).
+# Step pattern: ADD COLUMN nullable → backfill default → SET DEFAULT →
+# SET NOT NULL (only for columns that need NOT NULL).
+_BACKFILL_NULLABLE_COLUMNS = [
+    ("ml_advertisers", "product_id", "TEXT", "PADS"),
+    ("ml_ad_campaigns", "product_id", "TEXT", "PADS"),
+]
 
-CREATE INDEX IF NOT EXISTS ml_ad_campaigns_user_idx
-    ON ml_ad_campaigns (user_id, advertiser_id, product_id);
+# Optional columns added later, no NOT NULL needed (just ADD if missing).
+_OPTIONAL_COLUMNS = [
+    ("ml_ad_campaigns", "start_date", "TIMESTAMPTZ"),
+    ("ml_ad_campaigns", "end_date", "TIMESTAMPTZ"),
+    ("ml_ad_campaigns", "campaign_type", "TEXT"),
+    ("ml_ad_campaigns", "goal", "TEXT"),
+    ("ml_ad_campaigns", "site_id", "TEXT"),
+    ("ml_ad_campaigns", "headline", "TEXT"),
+    ("ml_ad_campaigns", "cpc", "NUMERIC"),
+    ("ml_ad_campaigns", "currency", "TEXT"),
+    ("ml_ad_campaigns", "official_store_id", "BIGINT"),
+    ("ml_ad_campaigns", "destination_id", "BIGINT"),
+    ("ml_ad_campaigns", "raw", "JSONB"),
+]
 
--- Idempotent migration for installations created before product_id existed.
-DO $migrate_camp_pk$
-BEGIN
-    BEGIN
-        ALTER TABLE ml_ad_campaigns ADD COLUMN IF NOT EXISTS product_id TEXT NOT NULL DEFAULT 'PADS';
-    EXCEPTION WHEN duplicate_column THEN NULL;
-    END;
-    BEGIN
-        ALTER TABLE ml_ad_campaigns ADD COLUMN IF NOT EXISTS start_date TIMESTAMPTZ;
-        ALTER TABLE ml_ad_campaigns ADD COLUMN IF NOT EXISTS end_date TIMESTAMPTZ;
-        ALTER TABLE ml_ad_campaigns ADD COLUMN IF NOT EXISTS campaign_type TEXT;
-        ALTER TABLE ml_ad_campaigns ADD COLUMN IF NOT EXISTS goal TEXT;
-        ALTER TABLE ml_ad_campaigns ADD COLUMN IF NOT EXISTS site_id TEXT;
-        ALTER TABLE ml_ad_campaigns ADD COLUMN IF NOT EXISTS headline TEXT;
-        ALTER TABLE ml_ad_campaigns ADD COLUMN IF NOT EXISTS cpc NUMERIC;
-        ALTER TABLE ml_ad_campaigns ADD COLUMN IF NOT EXISTS currency TEXT;
-        ALTER TABLE ml_ad_campaigns ADD COLUMN IF NOT EXISTS official_store_id BIGINT;
-        ALTER TABLE ml_ad_campaigns ADD COLUMN IF NOT EXISTS destination_id BIGINT;
-        ALTER TABLE ml_ad_campaigns ADD COLUMN IF NOT EXISTS raw JSONB;
-    EXCEPTION WHEN OTHERS THEN NULL;
-    END;
-    -- Update PK to include product_id if it's still 3-cols.
-    DECLARE
-        pk_cols int;
-    BEGIN
-        SELECT count(*) INTO pk_cols
-          FROM information_schema.key_column_usage
-         WHERE table_name = 'ml_ad_campaigns'
-           AND constraint_name = 'ml_ad_campaigns_pkey';
-        IF pk_cols = 3 THEN
-            ALTER TABLE ml_ad_campaigns DROP CONSTRAINT ml_ad_campaigns_pkey;
-            ALTER TABLE ml_ad_campaigns ADD PRIMARY KEY (user_id, advertiser_id, campaign_id, product_id);
-        END IF;
-    END;
-END
-$migrate_camp_pk$;
-
-CREATE TABLE IF NOT EXISTS ml_ad_campaign_metrics_daily (
-    user_id INTEGER NOT NULL,
-    advertiser_id BIGINT NOT NULL,
-    campaign_id BIGINT NOT NULL,
-    date DATE NOT NULL,
-    metrics JSONB,
-    synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (user_id, advertiser_id, campaign_id, date)
-);
-
-CREATE INDEX IF NOT EXISTS ml_ad_campaign_metrics_daily_lookup_idx
-    ON ml_ad_campaign_metrics_daily (user_id, campaign_id, date DESC);
-
-CREATE TABLE IF NOT EXISTS ml_ad_ads (
-    user_id INTEGER NOT NULL,
-    advertiser_id BIGINT NOT NULL,
-    item_id TEXT NOT NULL,
-    campaign_id BIGINT,
-    title TEXT,
-    status TEXT,
-    price NUMERIC,
-    thumbnail TEXT,
-    permalink TEXT,
-    domain_id TEXT,
-    brand_value_name TEXT,
-    metrics JSONB,
-    metrics_date_from DATE,
-    metrics_date_to DATE,
-    synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (user_id, advertiser_id, item_id)
-);
-
-CREATE INDEX IF NOT EXISTS ml_ad_ads_user_idx
-    ON ml_ad_ads (user_id, advertiser_id, status);
-"""
+# PK migrations: target PK definition per table. Run if the live
+# constraint has fewer columns than the target.
+_PK_MIGRATIONS = [
+    {
+        "table": "ml_advertisers",
+        "expected_cols": 3,
+        "constraint": "ml_advertisers_pkey",
+        "new_pk": "(user_id, advertiser_id, product_id)",
+    },
+    {
+        "table": "ml_ad_campaigns",
+        "expected_cols": 4,
+        "constraint": "ml_ad_campaigns_pkey",
+        "new_pk": "(user_id, advertiser_id, campaign_id, product_id)",
+    },
+]
 
 
 async def ensure_schema(pool: asyncpg.Pool) -> None:
-    """Create the four cache tables if missing. Idempotent."""
-    async with pool.acquire() as conn:
-        await conn.execute(CREATE_TABLES_SQL)
+    """Create + migrate the four cache tables. Idempotent.
+
+    Each step runs in its own connection acquire so a partial failure
+    doesn't roll back the whole bootstrap. Errors propagate to caller
+    (no silent EXCEPTION WHEN OTHERS THEN NULL like the original SQL).
+    """
+    # 1. Base CREATE TABLE / INDEX statements
+    for stmt in _CREATE_TABLES_SQL:
+        async with pool.acquire() as conn:
+            await conn.execute(stmt)
+
+    # 2. Backfill-required columns (NOT NULL DEFAULT) — split into 4 steps
+    #    each, since `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT 'X'`
+    #    in a single statement can fail mid-way on existing tables.
+    for table, col, ctype, default_val in _BACKFILL_NULLABLE_COLUMNS:
+        async with pool.acquire() as conn:
+            await conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {ctype}")
+        async with pool.acquire() as conn:
+            await conn.execute(f"UPDATE {table} SET {col} = $1 WHERE {col} IS NULL", default_val)
+        async with pool.acquire() as conn:
+            await conn.execute(f"ALTER TABLE {table} ALTER COLUMN {col} SET DEFAULT '{default_val}'")
+        async with pool.acquire() as conn:
+            await conn.execute(f"ALTER TABLE {table} ALTER COLUMN {col} SET NOT NULL")
+
+    # 3. Optional columns — single ADD IF NOT EXISTS each
+    for table, col, ctype in _OPTIONAL_COLUMNS:
+        async with pool.acquire() as conn:
+            await conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {ctype}")
+
+    # 4. PK migrations — re-create primary key if it's missing the new
+    #    columns (e.g. legacy install pre-product_id)
+    for mig in _PK_MIGRATIONS:
+        async with pool.acquire() as conn:
+            cols = await conn.fetchval(
+                """
+                SELECT count(*)
+                  FROM information_schema.key_column_usage
+                 WHERE table_name = $1
+                   AND constraint_name = $2
+                """,
+                mig["table"], mig["constraint"],
+            )
+        if cols and cols < mig["expected_cols"]:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    f"ALTER TABLE {mig['table']} DROP CONSTRAINT {mig['constraint']}"
+                )
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    f"ALTER TABLE {mig['table']} ADD PRIMARY KEY {mig['new_pk']}"
+                )
 
 
 def _json(value: Any) -> str:
