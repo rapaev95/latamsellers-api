@@ -383,6 +383,7 @@ async def send_notice(
         promo_id = str(raw_block.get("id") or raw_block.get("promotion_id") or "").strip()
         promo_item_id = str(raw_block.get("item_id") or "").strip().upper()
         promo_type = str(raw_block.get("type") or raw_block.get("promotion_type") or "").upper()
+        promo_status = str(raw_block.get("status") or "candidate").lower()
         # callback_data ≤ 64 bytes. Most promo ids look like "MLB-PROMO-123" (≤30
         # bytes) and MLB ids ≤16 bytes — fits comfortably with `pa:` prefix.
         if promo_id and promo_item_id:
@@ -418,46 +419,71 @@ async def send_notice(
             else:
                 exact_pct = 15
 
-            accept_label = {
-                "ru": "✅ Принять (мин)",
-                "en": "✅ Accept (min)",
-                "pt": "✅ Aceitar (min)",
-            }.get(language, "✅ Aceitar (min)")
-            exact_label = {
-                "ru": f"🎯 Поднять +{exact_pct}% (точно к оригиналу)",
-                "en": f"🎯 Raise +{exact_pct}% (back to original)",
-                "pt": f"🎯 Subir +{exact_pct}% (preço original)",
-            }.get(language, f"🎯 Subir +{exact_pct}% (preço original)")
-            reject_label = {
-                "ru": "❌ Отклонить",
-                "en": "❌ Reject",
-                "pt": "❌ Rejeitar",
-            }.get(language, "❌ Rejeitar")
             details_label = {
                 "ru": "🔍 Детали",
                 "en": "🔍 Details",
                 "pt": "🔍 Detalhes",
             }.get(language, "🔍 Detalhes")
-            # Three rows: [accept_min, reject] / [exact raise] / [details].
-            # callback_data prefixes:
-            #   pa:  → accept at entrada (min discount required by ML)
-            #   paf: → exact raise (D/(1-D/100)%) then accept
-            #          → effective price = original exactly ("preço fixo")
-            #   pr:  → reject
-            # The webhook router still accepts pas: (linear raise) for any
-            # old-format messages already in the seller's chat history.
-            row_accept_reject = [
-                {"text": accept_label, "callback_data": f"pa:{promo_id}:{promo_item_id}"},
-                {"text": reject_label, "callback_data": f"pr:{promo_id}:{promo_item_id}"},
-            ]
-            row_raise_exact = [
-                {"text": exact_label, "callback_data": f"paf:{promo_id}:{promo_item_id}"},
-            ]
             details_url = f"https://www.mercadolivre.com.br/anuncios/promotions/{promo_id}"
             details_row = [{"text": details_label, "url": details_url}]
-            payload["reply_markup"] = {
-                "inline_keyboard": [row_accept_reject, row_raise_exact, details_row],
-            }
+
+            if promo_status == "started":
+                # ── STARTED flow: акция УЖЕ активна (ML могла включить SMART
+                # сама). Принимать не нужно — даём «Выйти» и «Поднять цену».
+                # callback prefixes:
+                #   pe:  → exit promotion (DELETE)
+                #   pup: → raise listing price by D/(1−D/100)% (preço original)
+                exit_label = {
+                    "ru": "🚪 Выйти из акции",
+                    "en": "🚪 Exit promotion",
+                    "pt": "🚪 Sair da promoção",
+                }.get(language, "🚪 Sair da promoção")
+                raise_label = {
+                    "ru": f"💰 Поднять цену +{exact_pct}%",
+                    "en": f"💰 Raise price +{exact_pct}%",
+                    "pt": f"💰 Subir preço +{exact_pct}%",
+                }.get(language, f"💰 Subir preço +{exact_pct}%")
+                payload["reply_markup"] = {
+                    "inline_keyboard": [
+                        [{"text": exit_label, "callback_data": f"pe:{promo_id}:{promo_item_id}"}],
+                        [{"text": raise_label, "callback_data": f"pup:{promo_id}:{promo_item_id}"}],
+                        details_row,
+                    ],
+                }
+            else:
+                # ── CANDIDATE flow (исходный): accept/reject/raise+accept.
+                accept_label = {
+                    "ru": "✅ Принять (мин)",
+                    "en": "✅ Accept (min)",
+                    "pt": "✅ Aceitar (min)",
+                }.get(language, "✅ Aceitar (min)")
+                exact_label = {
+                    "ru": f"🎯 Поднять +{exact_pct}% (точно к оригиналу)",
+                    "en": f"🎯 Raise +{exact_pct}% (back to original)",
+                    "pt": f"🎯 Subir +{exact_pct}% (preço original)",
+                }.get(language, f"🎯 Subir +{exact_pct}% (preço original)")
+                reject_label = {
+                    "ru": "❌ Отклонить",
+                    "en": "❌ Reject",
+                    "pt": "❌ Rejeitar",
+                }.get(language, "❌ Rejeitar")
+                # callback_data prefixes:
+                #   pa:  → accept at entrada (min discount required by ML)
+                #   paf: → exact raise (D/(1-D/100)%) then accept
+                #          → effective price = original exactly ("preço fixo")
+                #   pr:  → reject
+                # The webhook router still accepts pas: (linear raise) for any
+                # old-format messages already in the seller's chat history.
+                row_accept_reject = [
+                    {"text": accept_label, "callback_data": f"pa:{promo_id}:{promo_item_id}"},
+                    {"text": reject_label, "callback_data": f"pr:{promo_id}:{promo_item_id}"},
+                ]
+                row_raise_exact = [
+                    {"text": exact_label, "callback_data": f"paf:{promo_id}:{promo_item_id}"},
+                ]
+                payload["reply_markup"] = {
+                    "inline_keyboard": [row_accept_reject, row_raise_exact, details_row],
+                }
 
     if topic == "items":
         item_id = ""

@@ -286,18 +286,42 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
         start_date = enriched.get("start_date")
         finish_date = enriched.get("finish_date")
 
-        type_friendly = {
-            "DEAL": "Oferta do dia",
-            "DOD": "Oferta do dia",
-            "LIGHTNING": "Promoção Relâmpago",
-            "SELLER_CAMPAIGN": "Campanha do vendedor",
-            "PRICE_DISCOUNT": "Desconto de preço",
-            "PRICE_MATCHING": "Pareamento de preço (reduz tarifas)",
-            "MARKETPLACE_CAMPAIGN": "Campanha Mercado Livre",
-            "VOLUME": "Desconto por volume",
-            "SMART": "Promoção SMART (ativada automaticamente pela ML)",
-            "UNHEALTHY_STOCK": "Estoque parado no Full",
-        }.get(promo_type, promo_type or "Promoção")
+        # type_friendly выбирается с учётом статуса:
+        # - candidate: SMART/UNHEALTHY ещё НЕ активна, ML может опт-ин если ничего
+        #   не делать. Текущее «ativada automaticamente» сбивает с толку (читается
+        #   как «уже активна, без согласия»). Делаем явно: «pode ser ativada
+        #   automaticamente se você não decidir».
+        # - started: акция РЕАЛЬНО включена (если SMART — ML её auto-opt-in).
+        #   Пользователю нужны кнопки «Выйти / Поднять цену», не «Принять».
+        is_started = status == "started"
+        if is_started:
+            type_friendly = {
+                "DEAL": "Oferta do dia (ativa)",
+                "DOD": "Oferta do dia (ativa)",
+                "LIGHTNING": "Promoção Relâmpago (ativa)",
+                "SELLER_CAMPAIGN": "Campanha do vendedor (ativa)",
+                "PRICE_DISCOUNT": "Desconto de preço (ativo)",
+                "PRICE_MATCHING": "Pareamento de preço (ativo, reduz tarifas)",
+                "MARKETPLACE_CAMPAIGN": "Campanha Mercado Livre (ativa)",
+                "VOLUME": "Desconto por volume (ativo)",
+                "SMART": "Promoção SMART ATIVADA automaticamente pela ML",
+                "UNHEALTHY_STOCK": "Estoque parado no Full (promoção ativa)",
+            }.get(promo_type, (promo_type or "Promoção") + " (ativa)")
+        else:
+            type_friendly = {
+                "DEAL": "Oferta do dia",
+                "DOD": "Oferta do dia",
+                "LIGHTNING": "Promoção Relâmpago",
+                "SELLER_CAMPAIGN": "Campanha do vendedor",
+                "PRICE_DISCOUNT": "Desconto de preço",
+                "PRICE_MATCHING": "Pareamento de preço (reduz tarifas)",
+                "MARKETPLACE_CAMPAIGN": "Campanha Mercado Livre",
+                "VOLUME": "Desconto por volume",
+                # Для candidate явно говорим что ЕЩЁ НЕ активна — но если seller
+                # не примет решение, ML может сама опт-ин: «pode ser ativada».
+                "SMART": "Promoção SMART (pode ser ativada automaticamente pela ML)",
+                "UNHEALTHY_STOCK": "Estoque parado no Full",
+            }.get(promo_type, promo_type or "Promoção")
         promo_name = str(enriched.get("name") or "").strip()
         meli_pct = enriched.get("meli_percentage")
         seller_pct = enriched.get("seller_percentage")
@@ -482,7 +506,23 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
 
         if status == "candidate":
             desc_lines.append("")
-            desc_lines.append("⏰ Aceite agora para participar")
+            # Для SMART/UNHEALTHY кандидата явно предупреждаем что если seller
+            # не примет решение — ML может опт-ин активировать сама. Для
+            # остальных типов это не происходит, обычная подсказка.
+            if promo_type in ("SMART", "UNHEALTHY_STOCK"):
+                desc_lines.append("⚠ Se você não decidir, ML pode ativar automaticamente")
+                desc_lines.append("⏰ Aceite ou rejeite agora")
+            else:
+                desc_lines.append("⏰ Aceite agora para participar")
+        elif status == "started":
+            desc_lines.append("")
+            # Для started SMART подчёркиваем что ML её саму активировала, и
+            # предлагаем 2 действия: выйти из акции или поднять цену чтобы
+            # покупатель видел тот же оригинальный price (даже после скидки ML).
+            if promo_type in ("SMART", "UNHEALTHY_STOCK"):
+                desc_lines.append("🤖 ML ativou automaticamente. Quer sair ou subir o preço?")
+            else:
+                desc_lines.append("✅ Promoção em andamento")
 
         return {
             **base,

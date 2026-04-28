@@ -2212,7 +2212,16 @@ async def refresh_user_promotions(
 # isn't available from Telegram's webhook context.
 
 class _PromoActionIn(__import__("pydantic").BaseModel):
-    action: str          # "accept" | "reject" | "accept_with_raise"
+    # actions:
+    #   "accept" / "reject" / "accept_with_raise" — для status=candidate
+    #     (исходный flow: ML предложил, seller решает).
+    #   "exit"  — для status=started: выйти из УЖЕ активной акции (DELETE
+    #     /seller-promotions/items/{ITEM_ID}). Используется на SMART/UNHEALTHY
+    #     которые ML auto-opt-in включила.
+    #   "raise_only" — для status=started: поднять цену листинга (PUT /items/{ID})
+    #     без accept/reject. Промо остаётся активной, но cena покупателя растёт
+    #     обратно к оригиналу. raise_pct/raise_mode те же что и в accept_with_raise.
+    action: str
     user_id: int
     promotion_id: str
     item_id: str
@@ -2651,6 +2660,74 @@ async def promotions_tg_action(
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=15.0,
             )
+        elif body.action == "exit":
+            # Exit from an already-active promotion (status=started). Same DELETE
+            # call as reject, but used for promotions ML auto-opt-in (e.g. SMART).
+            promo_type = offer["promotion_type"] or ""
+            r = await http.delete(
+                f"{url}&promotion_type={promo_type}&promotion_id={offer['promotion_id']}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15.0,
+            )
+        elif body.action == "raise_only":
+            # Standalone price raise — used on started promotions to push the
+            # buyer-facing price back toward the seller's original (the promo
+            # stays active, but its discount applies to a higher base).
+            item_url = f"https://api.mercadolibre.com/items/{mlb}"
+            try:
+                gr = await http.get(
+                    item_url,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=15.0,
+                )
+            except Exception as err:  # noqa: BLE001
+                return {"error": "ml_item_fetch_failed", "detail": str(err)}
+            if gr.status_code >= 400:
+                return {
+                    "error": "ml_item_fetch_rejected",
+                    "status": gr.status_code,
+                    "detail": gr.text[:300],
+                }
+            try:
+                old_price = float((gr.json() or {}).get("price") or 0.0)
+            except (TypeError, ValueError):
+                old_price = 0.0
+            if old_price <= 0:
+                return {"error": "no_current_price"}
+            new_price = round(old_price * (1.0 + raise_pct / 100.0), 2)
+            try:
+                pr = await http.put(
+                    item_url,
+                    json={"price": new_price},
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=15.0,
+                )
+            except Exception as err:  # noqa: BLE001
+                return {"error": "ml_price_update_failed", "detail": str(err)}
+            if pr.status_code >= 400:
+                return {
+                    "error": "ml_price_update_rejected",
+                    "status": pr.status_code,
+                    "detail": pr.text[:300],
+                    "old_price": old_price,
+                    "attempted_new_price": new_price,
+                }
+            raise_info = {
+                "old_price": old_price,
+                "new_price": new_price,
+                "raise_pct": raise_pct,
+                "raise_mode": (body.raise_mode or "exact").lower(),
+                "entrada_pct": entrada_pct,
+            }
+            # raise_only doesn't talk to /seller-promotions endpoint; we synthesize
+            # a 200-shaped response so the downstream success-path handles it.
+            class _OkResp:
+                status_code = 200
+                text = ""
+            r = _OkResp()  # type: ignore
         else:
             return {"error": "bad_action"}
 
@@ -2666,10 +2743,13 @@ async def promotions_tg_action(
         await ml_user_promotions_svc.mark_accepted(
             pool, body.user_id, body.item_id, body.promotion_id,
         )
-    else:
+    elif body.action in ("reject", "exit"):
+        # exit на started SMART = effective dismiss. Помечаем строку чтобы
+        # повторное TG-уведомление не приходило.
         await ml_user_promotions_svc.mark_dismissed(
             pool, body.user_id, body.item_id, body.promotion_id,
         )
+    # raise_only — оставляем строку как есть (промо ещё активна, цена выросла).
     # Also schedule a cache refresh of just this item so UI reflects change.
     try:
         await ml_user_promotions_svc.refresh_user_promotions(
