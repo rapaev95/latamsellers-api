@@ -643,6 +643,39 @@ def _build_claim_card(
             lines.append("💬 *Motivo do comprador:*")
             lines.append(_esc(clip))
 
+    # If ML expects the seller to respond to the mediator (action
+    # 'send_message_to_mediator' — common in dispute stage), surface the
+    # deadline prominently. Public API doesn't expose the message-send
+    # endpoint, but the seller MUST act on time or ML auto-resolves.
+    msg_action = _seller_action_meta(claim, "send_message_to_mediator")
+    if msg_action:
+        due = _format_due_date(msg_action.get("due_date"), lang=summary_lang)
+        mandatory = bool(msg_action.get("mandatory"))
+        if summary_lang == "ru":
+            label = "⏰ *ML ждёт ответа от вас*"
+            if mandatory:
+                label += " \\(обязательно\\)"
+            if due:
+                label += f" · через *{_esc(due)}*"
+            note = "_Ответьте через ML/app — иначе ML выберет вариант сам\\._"
+        elif summary_lang == "en":
+            label = "⏰ *ML is waiting for your reply*"
+            if mandatory:
+                label += " \\(required\\)"
+            if due:
+                label += f" · in *{_esc(due)}*"
+            note = "_Respond via ML/app — otherwise ML picks an option for you\\._"
+        else:
+            label = "⏰ *ML aguarda sua resposta*"
+            if mandatory:
+                label += " \\(obrigatório\\)"
+            if due:
+                label += f" · em *{_esc(due)}*"
+            note = "_Responda pelo ML/app — caso contrário, ML escolhe por você\\._"
+        lines.append("")
+        lines.append(label)
+        lines.append(note)
+
     # Surface ML mediator's recommendation as a one-line hint above the CTA
     # block so the seller spots it before scanning the buttons.
     if recommended_action:
@@ -672,10 +705,7 @@ def _build_claim_card(
 
 
 def _seller_available_actions(claim: Optional[dict[str, Any]]) -> set[str]:
-    """Extract action names from claim.players[type=seller].available_actions.
-    Per ML official docs this is the source of truth — POSTs to ML for any
-    action NOT in this set return 400 'Not valid action ... for player role'.
-    """
+    """Extract action names from claim.players[type=seller].available_actions."""
     if not isinstance(claim, dict):
         return set()
     out: set[str] = set()
@@ -692,6 +722,42 @@ def _seller_available_actions(claim: Optional[dict[str, Any]]) -> set[str]:
             if name:
                 out.add(name)
     return out
+
+
+def _seller_action_meta(claim: Optional[dict[str, Any]], action_name: str) -> Optional[dict[str, Any]]:
+    """Return the full action object (with due_date, mandatory flags) for
+    a specific action name, or None if not present."""
+    if not isinstance(claim, dict):
+        return None
+    for p in claim.get("players") or []:
+        if not isinstance(p, dict):
+            continue
+        if p.get("type") != "seller" and p.get("role") != "respondent":
+            continue
+        for a in p.get("available_actions") or []:
+            if isinstance(a, dict) and a.get("action") == action_name:
+                return a
+    return None
+
+
+def _format_due_date(iso: Optional[str], lang: str = "pt") -> Optional[str]:
+    """Compact relative date for action deadlines."""
+    if not iso:
+        return None
+    try:
+        from datetime import datetime, timezone
+        ts = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        delta = ts - datetime.now(timezone.utc)
+        secs = int(delta.total_seconds())
+        if secs <= 0:
+            return "EXPIRADO" if lang != "ru" else "ИСТЁК"
+        if secs < 3600:
+            return f"{max(1, secs // 60)} min" if lang != "ru" else f"{max(1, secs // 60)} мин"
+        if secs < 86400:
+            return f"{secs // 3600}h" if lang != "ru" else f"{secs // 3600} ч"
+        return f"{secs // 86400}d" if lang != "ru" else f"{secs // 86400} дн"
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _build_keyboard(
@@ -728,6 +794,19 @@ def _build_keyboard(
     return_id = head_return.get("id")
 
     rows: list[list[dict[str, Any]]] = []
+
+    # Special-case: send_message_to_mediator. ML's public API doesn't expose
+    # an endpoint for this action (we probed exhaustively — all candidates
+    # 400/404). Show a single PROMINENT URL button to ML so the seller can
+    # respond in time (mandatory deadlines on dispute claims).
+    if "send_message_to_mediator" in seller_actions:
+        rows.append([
+            {"text": "⏰ Responder ao mediador (ML)", "url": ml_link},
+        ])
+        rows.append([
+            {"text": "⚡ Abrir no app", "url": app_link},
+        ])
+        return {"inline_keyboard": rows}
 
     # Row 1+: build action buttons strictly from ML's available_actions.
     # If ML didn't list an action — don't show its button. No more 400s.
