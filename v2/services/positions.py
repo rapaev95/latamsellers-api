@@ -17,7 +17,10 @@ don't care which back-end produced the numbers.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+import random
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import quote_plus
@@ -31,6 +34,30 @@ log = logging.getLogger(__name__)
 ML_API_BASE = "https://api.mercadolibre.com"
 JSON_API_PAGE = 50
 JSON_API_MAX_DEPTH = 1000  # 20 pages × 50; matches scraper cap
+
+# Throttling: pauses between consecutive ML calls so we don't trip
+# bot-detection / 2FA challenges. Each pagination loop already sleeps
+# `JSON_API_INTER_PAGE_S` between pages. The whole call grants the
+# total time budget cap to avoid runaway loops on weird responses.
+JSON_API_INTER_PAGE_S = float(os.environ.get("POSITIONS_INTER_PAGE_S", "1.5"))
+JSON_API_JITTER_S = float(os.environ.get("POSITIONS_JITTER_S", "0.7"))
+JSON_API_TIMEOUT_S = float(os.environ.get("POSITIONS_TIMEOUT_S", "15"))
+
+
+async def _polite_sleep() -> None:
+    """Pause INTER_PAGE_S ± JITTER_S between paginated ML calls.
+
+    Two reasons:
+      1. ML Gateway rate-limits per token. Burst → 429 → token gets
+         flagged.
+      2. Steady cadence with jitter looks more human-like to ML's
+         fraud detection, which keeps the session/2FA cookies alive
+         longer. Without jitter, they catch the perfectly periodic
+         pattern within minutes.
+    """
+    base = JSON_API_INTER_PAGE_S
+    jitter = random.uniform(-JSON_API_JITTER_S, JSON_API_JITTER_S)
+    await asyncio.sleep(max(0.1, base + jitter))
 
 
 @dataclass
@@ -167,6 +194,10 @@ async def _check_via_json_api(
             if len(results) < JSON_API_PAGE:
                 break
             offset += JSON_API_PAGE
+            # Polite pause between pages so ML's rate-limiter and fraud
+            # detection don't flag the token. Empirically a 1-2s spacing
+            # with jitter keeps GANZA-style sessions alive for weeks.
+            await _polite_sleep()
 
     # Not found within scanned depth — explicit «not_found», don't fall back
     return PositionResult(

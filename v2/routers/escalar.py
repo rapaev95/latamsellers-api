@@ -1576,6 +1576,13 @@ async def trigger_cron_admin(
             lambda: photo_ab_dispatch_svc.dispatch_pending_results(pool),
         )
 
+    if do_all or "positions" in requested:
+        from v2.services import positions_refresh as _pr_svc
+        await _run(
+            "positions_refresh",
+            lambda: _pr_svc._refresh_one_user(pool, user.id),
+        )
+
     return {"user_id": user.id, "ran": list(results.keys()), "results": results}
 
 

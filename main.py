@@ -64,6 +64,7 @@ from v2.services import ml_claims_dispatch as ml_claims_dispatch_svc  # noqa: E4
 from v2.services import daily_summary_dispatch as daily_summary_dispatch_svc  # noqa: E402
 from v2.services import ml_anomalies as ml_anomalies_svc  # noqa: E402
 from v2.services import photo_ab_dispatch as photo_ab_dispatch_svc  # noqa: E402
+from v2.services import positions_refresh as positions_refresh_svc  # noqa: E402
 from v2.services import ml_item_context as ml_item_context_svc  # noqa: E402
 from v2.services import ml_messages_dispatch as ml_messages_dispatch_svc  # noqa: E402
 from v2.services import ml_notices as ml_notices_svc  # noqa: E402
@@ -213,6 +214,33 @@ async def _dispatch_anomalies_job() -> None:
         )
     except Exception as err:  # noqa: BLE001
         _ml_log.exception("Anomalies job failed: %s", err)
+
+
+async def _dispatch_positions_refresh_job() -> None:
+    """Daily walk of every tracked keyword: refresh position + write
+    history. Acts as the heartbeat for ML scraper auth — if the failure
+    rate spikes for a user, ml session probably expired and we send a
+    TG alert with re-login instructions.
+
+    Runs once a day at 12:00 UTC = 09:00 BRT — quiet hour for ML's
+    gateway, plus the seller's morning so action items land at a useful
+    time. Throttling inside the service paces calls so we don't trip
+    bot detection.
+    """
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("Positions refresh skipped: no DB pool")
+            return
+        result = await positions_refresh_svc.dispatch_all_users(pool)
+        _ml_log.info(
+            "Positions refresh tick: users=%s tracked=%s ok=%s fail=%s alerts=%s",
+            result.get("users"), result.get("tracked"),
+            result.get("ok"), result.get("fail"),
+            result.get("alerts_sent"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("Positions refresh job failed: %s", err)
 
 
 async def _dispatch_messages_to_tg_job() -> None:
@@ -695,6 +723,19 @@ async def _v2_startup() -> None:
         _dispatch_daily_sales_summary_job,
         CronTrigger(hour=_summary_hour, minute=_summary_minute, timezone="UTC"),
         id="daily_sales_summary_tg",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Daily positions refresh — once a day at quiet hour. Walks tracked
+    # keywords, throttled, persists to position_history. Failed runs
+    # trigger TG health alert (suppressed to once per 48h).
+    _positions_hour = int(os.environ.get("POSITIONS_REFRESH_HOUR_UTC", "12"))
+    _positions_minute = int(os.environ.get("POSITIONS_REFRESH_MINUTE_UTC", "0"))
+    _ml_scheduler.add_job(
+        _dispatch_positions_refresh_job,
+        CronTrigger(hour=_positions_hour, minute=_positions_minute, timezone="UTC"),
+        id="positions_refresh_daily",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
