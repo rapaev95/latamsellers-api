@@ -49,6 +49,12 @@ def detect_source_from_filename(filename: str) -> Optional[str]:
         return "dados_fiscais"
 
     # Logistics / inventory
+    # Retirada Full: вывоз/утилизация со склада (отдельно от armazenagem,
+    # хотя оба отчёта называются "Tarifas Full" в кабинете ML).
+    # Проверяем ДО armazenagem — у retirada-файла имя `Relatorio_Tarifas_Full_*`,
+    # а у armazenagem `Custos_por_servico_armazenamento_*` или `armazenagem_full*`.
+    if "tarifas_full" in fname or "relatorio_tarifas_full" in fname or "retirada" in fname:
+        return "retirada_full"
     if "armazenamento" in fname or "armazenagem" in fname:
         return "armazenagem_full"
     if "stock_general" in fname or "stock_full" in fname or fname.startswith("stock"):
