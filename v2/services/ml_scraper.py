@@ -110,6 +110,37 @@ def _apply_stealth(context: BrowserContext) -> None:
         log.warning("playwright-stealth apply failed: %s", err)
 
 
+def _simulate_mouse_jitter(page, moves: int = 3) -> None:
+    """Emit a few mousemove events with realistic curves + delays.
+
+    Bot signal we close: real users generate 50+ mousemove events per
+    page session (just by holding the mouse), bots emit 0. ML's fraud
+    detection scripts watch for this. Cost is ~500-1500ms total across
+    `moves` jumps; far cheaper than the value of looking human.
+
+    Best-effort: any failure (page closed, viewport unknown) is logged
+    at debug and we keep going.
+    """
+    try:
+        vp = page.viewport_size or {"width": 1366, "height": 800}
+        # Start somewhere reasonable, then make small relative jumps
+        # with steps>1 so Playwright generates intermediate mousemove
+        # events along the curve (single-point .move() emits just one
+        # event; with steps it emits N events).
+        x = random.randint(100, max(101, vp["width"] - 100))
+        y = random.randint(100, max(101, vp["height"] - 100))
+        page.mouse.move(x, y, steps=1)
+        for _ in range(moves):
+            dx = random.randint(-200, 200)
+            dy = random.randint(-150, 150)
+            x = max(20, min(vp["width"] - 20, x + dx))
+            y = max(20, min(vp["height"] - 20, y + dy))
+            page.mouse.move(x, y, steps=random.randint(8, 20))
+            page.wait_for_timeout(random.randint(120, 380))
+    except Exception as err:  # noqa: BLE001
+        log.debug("mouse jitter skipped: %s", err)
+
+
 def _warmup_navigation(context: BrowserContext) -> None:
     """Visit ML home before the actual search.
 
@@ -117,7 +148,7 @@ def _warmup_navigation(context: BrowserContext) -> None:
     before the deep search URL we care about. Direct navigation to a
     `/<slug>_Desde_<offset>` URL with no referer history is one of the
     cheap signals ML's fraud filter weights heavily. A 1-2s warm-up
-    fixes that.
+    plus a few mouse movements fixes that.
 
     Best-effort: failure here doesn't fail the scrape.
     """
@@ -133,10 +164,15 @@ def _warmup_navigation(context: BrowserContext) -> None:
             # before opening a new tab. Sync API doesn't have
             # asyncio.sleep, use page.wait_for_timeout (ms).
             page.wait_for_timeout(random.randint(800, 1800))
+            _simulate_mouse_jitter(page, moves=random.randint(2, 4))
             try:
                 page.evaluate("window.scrollBy(0, 200 + Math.random()*300)")
             except Exception:  # noqa: BLE001
                 pass
+            # Another short pause + jitter so the homepage gets a real
+            # mousemove footprint before we abandon it.
+            page.wait_for_timeout(random.randint(300, 700))
+            _simulate_mouse_jitter(page, moves=random.randint(1, 2))
         finally:
             try:
                 page.close()
@@ -396,6 +432,20 @@ def _fetch_and_parse_one(context: BrowserContext, url: str) -> tuple[list[Result
                 break
             except PlaywrightTimeout:
                 continue
+
+        # Look human while the cards "load": brief pause + mouse jitter
+        # + small scroll. ML's fraud scripts watch for mousemove count
+        # per page session — without these we'd emit 0 events and look
+        # automated even though the DOM-side checks already passed.
+        page.wait_for_timeout(random.randint(400, 1100))
+        _simulate_mouse_jitter(page, moves=random.randint(2, 4))
+        try:
+            page.evaluate(
+                "window.scrollBy(0, 250 + Math.random()*400)"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        page.wait_for_timeout(random.randint(200, 500))
 
         # Pull card list + total via single page.evaluate for speed.
         try:
