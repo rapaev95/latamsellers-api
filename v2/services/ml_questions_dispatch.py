@@ -37,9 +37,19 @@ TG_THROTTLE = 1.1  # 1 sec between TG sends per chat
 
 # Reminder cadence for questions still UNANSWERED after the first dispatch.
 # All three are env-tunable so cadence can change without a redeploy.
+#
+# Defaults pick a balance between "ML penalizes unanswered questions hard"
+# (so we WANT to keep reminding) and "don't spam the seller with one TG
+# message per stale question every hour".
+#   - first reminder 12h after the initial dispatch
+#   - subsequent every 48h (every 2 days)
+#   - up to 30 reminders per question — that's ~60 days of nagging.
+#     After that the seller has clearly chosen to ignore; either
+#     answer it or pause the item. The cap also keeps the BATCH safe
+#     when a user has dozens of stale questions on inactive listings.
 REMINDER_FIRST_HOURS = float(os.environ.get("QUESTIONS_REMINDER_FIRST_HOURS", "12"))
-REMINDER_INTERVAL_HOURS = float(os.environ.get("QUESTIONS_REMINDER_INTERVAL_HOURS", "12"))
-REMINDER_MAX_COUNT = int(os.environ.get("QUESTIONS_REMINDER_MAX_COUNT", "1"))
+REMINDER_INTERVAL_HOURS = float(os.environ.get("QUESTIONS_REMINDER_INTERVAL_HOURS", "48"))
+REMINDER_MAX_COUNT = int(os.environ.get("QUESTIONS_REMINDER_MAX_COUNT", "30"))
 
 # MarkdownV2 escape per Telegram spec
 _MD_ESCAPE = str.maketrans({c: f"\\{c}" for c in r"_*[]()~`>#+-=|{}.!"})
@@ -428,7 +438,15 @@ async def _tg_send_reminder(
     """Send a compact reminder for an unanswered question. Threads as a reply
     to the original card when possible; falls back to a standalone message
     if reply_to fails (original message deleted)."""
-    body_lines = [f"🔔 *LEMBRETE \\(sem resposta há ~{hours_pending}h\\)*"]
+    # Format the pending duration humanely — ">3000h pending" reads ugly
+    # for questions that have been stale for months.
+    if hours_pending < 48:
+        pending_label = f"~{hours_pending}h"
+    elif hours_pending < 24 * 60:  # < 60 days
+        pending_label = f"~{hours_pending // 24}d"
+    else:
+        pending_label = f"~{hours_pending // (24 * 30)}mo"
+    body_lines = [f"🔔 *LEMBRETE \\(sem resposta há {pending_label}\\)*"]
     if item_title:
         body_lines.append(f"📦 {_esc(item_title)}")
     if buyer_nickname:

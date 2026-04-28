@@ -400,6 +400,130 @@ async def dispatch_notices_now(
         }
 
 
+# ── Moderations: paused items + ML moderation notices ────────────────────────
+
+
+@router.get("/moderations")
+async def moderations_list(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Listings the seller needs to fix — paused/inactive items, sub_status
+    reasons, plus matching `item:MLB...` notices.
+
+    Two sources merged into one list:
+      1. `ml_user_items` rows with status = 'paused' / 'inactive' / 'closed'
+         → tells us WHICH item is down + sub_status array (the ML reason
+         tags like 'expired', 'out_of_stock', 'flagged_by_moderation', etc).
+      2. `ml_notices` rows whose notice_id starts with 'item:' AND label
+         hints at moderation/pausing → captures cases where ML emitted a
+         notice but our items cache hasn't refreshed yet.
+
+    De-dupes on item_id across sources (notice wins for label/description,
+    item row wins for sub_status + thumbnail).
+    """
+    if pool is None:
+        return {"moderations": [], "total": 0}
+
+    async with pool.acquire() as conn:
+        item_rows = await conn.fetch(
+            """
+            SELECT item_id, title, status, permalink, thumbnail, raw,
+                   to_char(fetched_at AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS fetched_at
+              FROM ml_user_items
+             WHERE user_id = $1
+               AND status IN ('paused', 'inactive', 'closed', 'under_review')
+             ORDER BY fetched_at DESC NULLS LAST
+            """,
+            user.id,
+        )
+        notice_rows = await conn.fetch(
+            """
+            SELECT notice_id, label, description, from_date, tags, raw, read_at,
+                   to_char(from_date AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS from_date_iso
+              FROM ml_notices
+             WHERE user_id = $1
+               AND notice_id LIKE 'item:%'
+               AND (
+                 label ILIKE '%pausa%'
+                 OR label ILIKE '%inativ%'
+                 OR label ILIKE '%moder%'
+                 OR label ILIKE '%bloque%'
+                 OR label ILIKE '%infra%'
+                 OR label ILIKE '%suspens%'
+               )
+             ORDER BY from_date DESC NULLS LAST
+            """,
+            user.id,
+        )
+
+    by_item: dict[str, dict[str, Any]] = {}
+
+    for r in item_rows:
+        raw = r["raw"]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                raw = {}
+        sub_status = (raw or {}).get("sub_status") or []
+        if not isinstance(sub_status, list):
+            sub_status = [sub_status]
+        by_item[r["item_id"]] = {
+            "item_id": r["item_id"],
+            "title": r["title"],
+            "status": r["status"],
+            "sub_status": sub_status,
+            "permalink": r["permalink"],
+            "thumbnail": r["thumbnail"],
+            "fetched_at": r["fetched_at"],
+            "label": None,
+            "description": None,
+            "notice_date": None,
+            "source": "items",
+        }
+
+    for r in notice_rows:
+        nid = (r["notice_id"] or "")
+        # notice_id format is 'item:MLB...'
+        item_id = nid.split(":", 1)[1] if ":" in nid else nid
+        slot = by_item.setdefault(item_id, {
+            "item_id": item_id,
+            "title": None,
+            "status": None,
+            "sub_status": [],
+            "permalink": None,
+            "thumbnail": None,
+            "fetched_at": None,
+            "source": "notice",
+        })
+        slot["label"] = r["label"]
+        slot["description"] = r["description"]
+        slot["notice_date"] = r["from_date_iso"]
+        slot["read_at"] = bool(r["read_at"])
+        if slot.get("source") == "items":
+            slot["source"] = "both"
+
+    moderations = sorted(
+        by_item.values(),
+        key=lambda m: m.get("notice_date") or m.get("fetched_at") or "",
+        reverse=True,
+    )
+    return {
+        "moderations": moderations,
+        "total": len(moderations),
+        "counts": {
+            "paused": sum(1 for m in moderations if m.get("status") == "paused"),
+            "inactive": sum(1 for m in moderations if m.get("status") == "inactive"),
+            "closed": sum(1 for m in moderations if m.get("status") == "closed"),
+            "under_review": sum(1 for m in moderations if m.get("status") == "under_review"),
+            "notice_only": sum(1 for m in moderations if m.get("source") == "notice"),
+        },
+    }
+
+
 @router.get("/products/quality-probe")
 async def quality_probe(
     item_id: str = Query(..., min_length=1),
