@@ -49,6 +49,12 @@ class PnLReportOut(BaseModel):
     # DAS/Simples/LP metadata for UI badge (regime, anexo, faixa, effective %).
     # Shape: см. compute_das() в v2/legacy/tax_brazil.py.
     tax_info: Optional[dict] = None
+    # Retirada de estoque Full breakdown (вывоз/утилизация). См. legacy/finance.compute_retirada_cost.
+    # Shape: {tarifa_envio, tarifa_descarte, cogs_descarte, tarifa_other, units_*,
+    # missing_cost_skus: [{sku,units,mlb,titulo}], fallback_avg_used,
+    # by_sku: {sku → {forma, units, tarifa, cogs, cost_source, mlb, titulo}},
+    # rows_count, source_files}.
+    retirada_summary: Optional[dict[str, Any]] = None
 
 
 # ── ДДС ─────────────────────────────────────────────────────────────────────

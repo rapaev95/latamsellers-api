@@ -3407,7 +3407,7 @@ def _build_mlb_to_sku_index_sync(user_id: int) -> dict[str, str]:
 
     for _fn, blob in _load_files_from_db_sync(user_id, "vendas_ml"):
         try:
-            for row in parse_vendas_bytes(blob):
+            for row in parse_vendas_bytes(blob, _fn):
                 mlb = (row.mlb or "").strip()
                 sku = (row.sku or "").strip()
                 if mlb and sku and mlb not in idx:
@@ -3635,6 +3635,254 @@ def get_armazenagem_by_period(project: str, period_from, period_to) -> dict:
         "days_in_period": len(relevant_cols),
         "skus_count": int(sub["SKU"].nunique()),
         "source_file": source_str,
+    }
+
+
+# ─────────────────────────────────────────────
+# Retirada de estoque Full (вывоз / утилизация)
+# ─────────────────────────────────────────────
+
+RETIRADA_FORMA_ENVIO = "Envio para o endereço"
+RETIRADA_FORMA_DESCARTE = "Descarte"
+
+# Заголовок листа Custo por retirada de estoque начинается с "Nº NF-e" в строке 5.
+_RETIRADA_SHEET_NAME = "Custo por retirada de estoque"
+
+
+def _parse_retirada_estoque_xlsx(xl, filename: str) -> dict | None:
+    """Source-agnostic парсер: принимает уже открытый pd.ExcelFile.
+
+    Возвращает {rows: [{custo_id, date, forma, sku, mlb, anuncio, titulo,
+    variacao, units, valor}, ...], source_file}.
+    Заголовок ML на строке 5 (header=5). Сторно отбрасываются через колонку
+    `Nº do custo estornado`.
+    """
+    from datetime import date as _date, datetime as _dt
+    target_sheet = None
+    for s in xl.sheet_names:
+        if s.strip().startswith(_RETIRADA_SHEET_NAME):
+            target_sheet = s
+            break
+    if target_sheet is None:
+        return None
+    try:
+        df = pd.read_excel(xl, sheet_name=target_sheet, header=5)
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+
+    cols = {str(c).strip(): c for c in df.columns}
+    required = ["Data do custo", "Forma de retirada", "Valor do custo", "Unidades retiradas", "SKU"]
+    for r in required:
+        if r not in cols:
+            return None
+
+    rows: list[dict] = []
+    for _, row in df.iterrows():
+        sku_raw = row.get(cols["SKU"])
+        sku = "" if pd.isna(sku_raw) else str(sku_raw).strip()
+        forma_raw = row.get(cols["Forma de retirada"])
+        if pd.isna(forma_raw):
+            continue
+        if "Nº do custo estornado" in cols:
+            estor = row.get(cols["Nº do custo estornado"])
+            if not pd.isna(estor) and str(estor).strip() not in ("", "-", "0"):
+                continue
+        forma = str(forma_raw).strip()
+
+        d_raw = row.get(cols["Data do custo"])
+        d_obj = None
+        if isinstance(d_raw, _dt):
+            d_obj = d_raw.date()
+        elif isinstance(d_raw, _date):
+            d_obj = d_raw
+        else:
+            try:
+                pdt = pd.to_datetime(d_raw, errors="coerce")
+                d_obj = None if pd.isna(pdt) else pdt.date()
+            except Exception:
+                d_obj = None
+        if d_obj is None:
+            continue
+
+        valor = pd.to_numeric(row.get(cols["Valor do custo"]), errors="coerce")
+        valor = 0.0 if pd.isna(valor) else float(valor)
+        units = pd.to_numeric(row.get(cols["Unidades retiradas"]), errors="coerce")
+        units = 0 if pd.isna(units) else int(units)
+
+        mlb = ""
+        if "Código ML" in cols and not pd.isna(row.get(cols["Código ML"])):
+            mlb = str(row.get(cols["Código ML"])).strip()
+        anuncio = ""
+        if "Nº do anúncio" in cols and not pd.isna(row.get(cols["Nº do anúncio"])):
+            anuncio = str(row.get(cols["Nº do anúncio"])).strip()
+        titulo = ""
+        if "Título do anúncio" in cols and not pd.isna(row.get(cols["Título do anúncio"])):
+            titulo = str(row.get(cols["Título do anúncio"])).strip()
+        variacao = ""
+        if "Variação" in cols and not pd.isna(row.get(cols["Variação"])):
+            variacao = str(row.get(cols["Variação"])).strip()
+
+        # Уникальный ID retirada — Nº do custo. Используется для дедупа при
+        # повторной загрузке того же файла; одинаковые SKU/день/тариф — это
+        # разные реальные операции, дедупить по ним нельзя.
+        custo_id = ""
+        if "Nº do custo" in cols and not pd.isna(row.get(cols["Nº do custo"])):
+            raw_cid = row.get(cols["Nº do custo"])
+            if isinstance(raw_cid, (int, float)) and not pd.isna(raw_cid):
+                custo_id = str(int(raw_cid))
+            else:
+                custo_id = str(raw_cid).strip()
+
+        rows.append({
+            "custo_id": custo_id,
+            "date": d_obj,
+            "forma": forma,
+            "sku": sku,
+            "mlb": mlb,
+            "anuncio": anuncio,
+            "titulo": titulo,
+            "variacao": variacao,
+            "units": units,
+            "valor": valor,
+        })
+
+    if not rows:
+        return None
+    return {"rows": rows, "source_file": filename}
+
+
+def _parse_retirada_estoque_file(path) -> dict | None:
+    """FS-variant: читает XLSX по файловому пути."""
+    try:
+        xl = pd.ExcelFile(path)
+    except Exception:
+        return None
+    return _parse_retirada_estoque_xlsx(xl, Path(path).name)
+
+
+def _parse_retirada_estoque_bytes(file_bytes: bytes, filename: str) -> dict | None:
+    """DB-variant: читает XLSX из bytes (LS_STORAGE_MODE=db, файлы в uploads-таблице)."""
+    try:
+        xl = pd.ExcelFile(io.BytesIO(file_bytes))
+    except Exception:
+        return None
+    return _parse_retirada_estoque_xlsx(xl, filename)
+
+
+def load_retirada_estoque_report() -> "pd.DataFrame | None":
+    """Объединяет все Relatorio_Tarifas_Full_*.xlsx из:
+    - LS_STORAGE_MODE=db: per-user uploads с source_key='retirada_full'
+    - LS_STORAGE_MODE=fs: `_data/retirada_full/*.xlsx` + `_data/*/retirada_full.xlsx`
+
+    Дедуп по `Nº do custo` через единое множество `seen` — переживает повторную
+    загрузку одного и того же файла. Возвращает DataFrame с колонками:
+    custo_id, date, forma, sku, mlb, anuncio, titulo, variacao, units, valor,
+    __project, __source.
+    """
+    import os
+
+    file_parses: list[tuple[str, dict]] = []  # (filename, parsed)
+
+    storage_mode = os.environ.get("LS_STORAGE_MODE", "fs").strip().lower()
+    if storage_mode == "db":
+        from .db_storage import _current_user_id
+        uid = _current_user_id()
+        if uid is not None:
+            for filename, file_bytes in _load_files_from_db_sync(uid, "retirada_full"):
+                parsed = _parse_retirada_estoque_bytes(file_bytes, filename)
+                if parsed:
+                    file_parses.append((filename, parsed))
+
+    if not file_parses:
+        candidates: list[Path] = []
+        sep_dir = DATA_DIR / "retirada_full"
+        if sep_dir.exists():
+            candidates.extend(sorted(sep_dir.glob("*.xlsx"), key=lambda p: p.stat().st_mtime))
+        for month_dir in sorted(DATA_DIR.glob("*/")):
+            f = month_dir / "retirada_full.xlsx"
+            if f.exists():
+                candidates.append(f)
+        for path in candidates:
+            parsed = _parse_retirada_estoque_file(path)
+            if parsed:
+                file_parses.append((parsed["source_file"], parsed))
+
+    if not file_parses:
+        return None
+
+    seen: set = set()
+    rows_out: list[dict] = []
+    sources: list[str] = []
+    for source_name, parsed in file_parses:
+        sources.append(source_name)
+        for r in parsed["rows"]:
+            if r["custo_id"]:
+                key = ("cid", r["custo_id"])
+            else:
+                key = ("fb", r["date"], r["sku"], r["forma"],
+                       round(r["valor"], 4), r["units"], r["mlb"], r["anuncio"])
+            if key in seen:
+                continue
+            seen.add(key)
+            proj = get_project_by_sku(r["sku"], r["mlb"] or r["anuncio"])
+            rows_out.append({**r, "__project": proj, "__source": source_name})
+
+    if not rows_out:
+        return None
+    df = pd.DataFrame(rows_out)
+    df.attrs["__source_files"] = sources
+    return df
+
+
+def get_retirada_by_period(project: str, period_from, period_to) -> dict:
+    """Сумма retirada (тариф + единицы) для проекта в окне [from, to].
+
+    Возвращает {total_tarifa, total_units, by_forma, rows_count, source_files}.
+    by_forma — dict[forma_name → {tarifa, units, by_sku: {sku → {units, tarifa,
+    mlb, titulo}}}]. by_sku нужен для расчёта COGS в compute_retirada_cost
+    (per-SKU из каталога с fallback на avg_cost_per_unit_brl).
+    """
+    df = load_retirada_estoque_report()
+    if df is None or df.empty:
+        return {
+            "total_tarifa": 0.0, "total_units": 0,
+            "by_forma": {}, "rows_count": 0, "source_files": [],
+        }
+    sources = df.attrs.get("__source_files", [])
+    sub = df[(df["__project"] == project) &
+             (df["date"] >= period_from) &
+             (df["date"] <= period_to)]
+    if sub.empty:
+        return {
+            "total_tarifa": 0.0, "total_units": 0,
+            "by_forma": {}, "rows_count": 0, "source_files": sources,
+        }
+
+    by_forma: dict = {}
+    for _, r in sub.iterrows():
+        forma = r["forma"] or "—"
+        bucket = by_forma.setdefault(forma, {"tarifa": 0.0, "units": 0, "by_sku": {}})
+        bucket["tarifa"] += float(r["valor"])
+        bucket["units"] += int(r["units"])
+        sku = r["sku"] or "N/A"
+        sku_b = bucket["by_sku"].setdefault(sku, {
+            "units": 0, "tarifa": 0.0, "mlb": r["mlb"], "titulo": r["titulo"],
+        })
+        sku_b["units"] += int(r["units"])
+        sku_b["tarifa"] += float(r["valor"])
+        if not sku_b["mlb"] and r["mlb"]:
+            sku_b["mlb"] = r["mlb"]
+        if not sku_b["titulo"] and r["titulo"]:
+            sku_b["titulo"] = r["titulo"]
+
+    return {
+        "total_tarifa": float(sub["valor"].sum()),
+        "total_units": int(sub["units"].sum()),
+        "by_forma": by_forma,
+        "rows_count": int(len(sub)),
+        "source_files": sources,
     }
 
 
@@ -4836,6 +5084,15 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
     das_by_month: dict = {}
     das_info_by_month: dict = {}  # per-month {faixa, effective_pct, rbt12, ...}
     aluguel_by_month: dict = {}
+    # Retirada Full: тариф вывоза (Envio para o endereço) и тариф+COGS утилизации
+    # (Descarte). См. memory feedback_returns_not_inventory_loss про политику COGS.
+    retirada_envio_by_month: dict = {}
+    retirada_descarte_by_month: dict = {}
+    # Локальный импорт чтобы избежать циклических зависимостей с finance.py.
+    try:
+        from .finance import compute_retirada_cost as _compute_retirada_cost
+    except Exception:
+        _compute_retirada_cost = None
     # Company-wide bruto для RBT12 (суммируем все сиблинги same company_cnpj)
     _company_bruto_by_month = get_company_monthly_bruto(project, _all_projects)
     for mk in months:
@@ -4854,6 +5111,20 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
             fulf_by_month[mk] = float(get_fulfillment_by_period(project, pf, pt_))
         except Exception:
             fulf_by_month[mk] = 0.0
+        if _compute_retirada_cost is not None:
+            try:
+                _rc = _compute_retirada_cost(project, (pf, pt_))
+                retirada_envio_by_month[mk] = float(_rc.get("tarifa_envio", 0.0) or 0.0)
+                retirada_descarte_by_month[mk] = (
+                    float(_rc.get("tarifa_descarte", 0.0) or 0.0)
+                    + float(_rc.get("cogs_descarte", 0.0) or 0.0)
+                )
+            except Exception:
+                retirada_envio_by_month[mk] = 0.0
+                retirada_descarte_by_month[mk] = 0.0
+        else:
+            retirada_envio_by_month[mk] = 0.0
+            retirada_descarte_by_month[mk] = 0.0
         # DAS — по выбранному tax_regime. RBT12 считаем ПО КОМПАНИИ (сумма
         # bruto всех проектов с тем же company_cnpj) — именно так работает
         # Simples Nacional: одна компания → общий faixa.
@@ -4907,6 +5178,8 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
         m: rev_net.get(m, 0.0)
            - publi_by_month.get(m, 0.0)
            - armaz_by_month.get(m, 0.0)
+           - retirada_envio_by_month.get(m, 0.0)
+           - retirada_descarte_by_month.get(m, 0.0)
            - fulf_by_month.get(m, 0.0)
            - das_by_month.get(m, 0.0)
            - aluguel_by_month.get(m, 0.0)
@@ -5005,6 +5278,8 @@ def _build_monthly_pnl_matrix_impl(project: str) -> dict:
         _row("pnl_cogs", "EXPENSES", cogs_by_month, sign=-1, key="cogs"),
         _row("pnl_publicidade", "EXPENSES", publi_by_month, sign=-1, key="publicidade"),
         _row("pnl_armazenagem", "EXPENSES", armaz_by_month, sign=-1, key="armazenagem"),
+        _row("pnl_retirada_envio", "EXPENSES", retirada_envio_by_month, sign=-1, key="retirada_envio"),
+        _row("pnl_retirada_descarte", "EXPENSES", retirada_descarte_by_month, sign=-1, key="retirada_descarte"),
         _row("pnl_fulfillment", "EXPENSES", fulf_by_month, sign=-1, key="fulfillment"),
         {
             **_row("pnl_das", "EXPENSES", das_by_month, sign=-1, key="das"),

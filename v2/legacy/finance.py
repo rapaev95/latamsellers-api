@@ -25,6 +25,7 @@ from .reports import (
     get_approved_data,
     get_collection_mp_by_project,
     get_devolucoes_by_project,
+    get_retirada_by_period,
     load_stock_full,
 )  # get_collection_mp_by_project нужен для compute_cashflow
 
@@ -83,7 +84,9 @@ class PnLReport:
     operating_profit: float         # net - sum(opex), без COGS
     cogs: float = 0.0               # Σ(unit_cost_brl × qty) по проданным SKU
     net_profit: float = 0.0         # operating_profit - cogs
-    vendas_count: int = 0
+    vendas_count: int = 0  # delivered + returned строк в периоде
+    vendas_delivered_count: int = 0  # выкупленные (delivered)
+    vendas_returned_count: int = 0  # возвраты после доставки (returned)
     margin_pct: float = 0.0
     # COGS diagnostics — SKUs без unit_cost_brl в каталоге (призыв: загрузить
     # Dados Fiscais или заполнить на /finance/sku-mapping).
@@ -97,6 +100,11 @@ class PnLReport:
     # — faixa, aliquot effective, ICMS, method. Используется UI для бейджа рядом
     # со строкой DAS в operating_expenses.
     tax_info: dict | None = None
+    # Retirada de estoque Full breakdown (вывоз/утилизация). None если retirada
+    # данных нет; иначе breakdown по формам и SKU + warning о SKU без cost.
+    # См. compute_retirada_cost. Pydantic schema (PnLReportOut) должна
+    # явно объявить это поле, иначе extra="ignore" вырежет его в ответе.
+    retirada_summary: dict | None = None
 
 
 @dataclass
@@ -246,6 +254,172 @@ def get_project_start_date(project: str) -> date | None:
         except (ValueError, TypeError):
             pass
     return _parse_baseline_date(meta)
+
+
+# ─────────────────────────────────────────────
+# RETIRADA DE ESTOQUE (вывоз / утилизация)
+# ─────────────────────────────────────────────
+
+# Канонические значения колонки `Forma de retirada` в отчёте ML.
+RETIRADA_FORMA_ENVIO = "Envio para o endereço"
+RETIRADA_FORMA_DESCARTE = "Descarte"
+
+
+def _resolve_retirada_unit_cost(
+    sku: str,
+    sku_idx: dict | None,
+    sku_mlb_idx: dict | None,
+    sku_mlb_map: dict | None,
+    fallback_avg: float | None,
+) -> tuple[float | None, str]:
+    """Per-SKU cost lookup для Descarte-юнитов. Тот же 3-step pipeline что в
+    compute_pnl COGS-блоке (catalog → MLB fallback → legacy avg) — чтобы
+    Descarte-COGS и проданный COGS использовали идентичную логику.
+
+    Возвращает (cost, source) где source ∈ {"catalog", "avg", "missing"}.
+    """
+    from .sku_catalog import normalize_sku, _normalize_mlb
+    sku_idx = sku_idx or {}
+    sku_mlb_idx = sku_mlb_idx or {}
+    sku_mlb_map = sku_mlb_map or {}
+
+    key = normalize_sku(sku or "")
+    if key:
+        row = sku_idx.get(key)
+        if row and row.get("unit_cost_brl") is not None:
+            try:
+                c = float(row["unit_cost_brl"])
+                if c > 0:
+                    return c, "catalog"
+            except (TypeError, ValueError):
+                pass
+    # MLB fallback (закрывает кейс "sumka5-1 в vendas / HB50173 в Dados Fiscais")
+    mlb_norm = _normalize_mlb(sku_mlb_map.get(sku, ""))
+    if mlb_norm:
+        mrow = sku_mlb_idx.get(mlb_norm) or {}
+        try:
+            mc = float(mrow.get("unit_cost_brl") or 0.0)
+            if mc > 0:
+                return mc, "catalog"
+        except (TypeError, ValueError):
+            pass
+    if fallback_avg is not None and fallback_avg > 0:
+        return float(fallback_avg), "avg"
+    return None, "missing"
+
+
+def compute_retirada_cost(project: str, period: tuple[date, date]) -> dict:
+    """Считает финансовые последствия retirada de estoque Full за период.
+
+    Логика (см. memory feedback_returns_not_inventory_loss):
+    - `Envio para o endereço` (вывоз товара на склад продавца): расход = только
+      тариф `Valor do custo`. COGS НЕ списывается (товар у продавца, может быть
+      перепродан вне ML).
+    - `Descarte` (утилизация): расход = тариф `Valor do custo` + COGS вывезенных
+      юнитов (per-SKU из каталога с fallback на avg_cost_per_unit_brl).
+
+    Returns:
+        {
+          "tarifa_envio": float,        # сумма тарифа по Envio para o endereço
+          "tarifa_descarte": float,     # сумма тарифа по Descarte
+          "cogs_descarte": float,       # COGS утилизированных (только Descarte)
+          "tarifa_other": float,        # тариф по другим Forma de retirada
+          "units_envio": int,
+          "units_descarte": int,
+          "units_other": int,
+          "missing_cost_skus": [{sku, units, mlb, titulo}, ...],
+                                        # SKU из Descarte без cost ни в каталоге,
+                                        # ни в avg — UI должен предупредить
+          "fallback_avg_used": int,     # сколько Descarte-юнитов использовали avg
+          "by_sku": {sku: {forma, units, tarifa, cogs, cost_source, mlb, titulo}},
+          "rows_count": int,
+          "source_files": [str, ...],
+        }
+    """
+    from .sku_catalog import build_catalog_index, build_catalog_mlb_index
+
+    raw = get_retirada_by_period(project, period[0], period[1])
+    out: dict = {
+        "tarifa_envio": 0.0,
+        "tarifa_descarte": 0.0,
+        "cogs_descarte": 0.0,
+        "tarifa_other": 0.0,
+        "units_envio": 0,
+        "units_descarte": 0,
+        "units_other": 0,
+        "missing_cost_skus": [],
+        "fallback_avg_used": 0,
+        "by_sku": {},
+        "rows_count": int(raw.get("rows_count", 0) or 0),
+        "source_files": list(raw.get("source_files", []) or []),
+    }
+    by_forma = raw.get("by_forma") or {}
+    if not by_forma:
+        return out
+
+    proj_meta = get_project_meta(project)
+    avg = proj_meta.get("avg_cost_per_unit_brl")
+    try:
+        avg = float(avg) if avg not in (None, "") else None
+    except (TypeError, ValueError):
+        avg = None
+    sku_idx = build_catalog_index()
+    sku_mlb_idx = build_catalog_mlb_index()
+    # by_sku в raw уже содержит mlb для каждого SKU — собираем sku→mlb map.
+    sku_mlb_map: dict[str, str] = {}
+    for forma_data in by_forma.values():
+        for sku, sb in (forma_data.get("by_sku") or {}).items():
+            mlb = sb.get("mlb") or ""
+            if mlb and not sku_mlb_map.get(sku):
+                sku_mlb_map[sku] = mlb
+
+    for forma, bucket in by_forma.items():
+        tarifa = float(bucket.get("tarifa", 0.0) or 0.0)
+        units = int(bucket.get("units", 0) or 0)
+        sku_dict = bucket.get("by_sku") or {}
+
+        if forma == RETIRADA_FORMA_DESCARTE:
+            out["tarifa_descarte"] += tarifa
+            out["units_descarte"] += units
+            for sku, sb in sku_dict.items():
+                u = int(sb.get("units", 0) or 0)
+                t = float(sb.get("tarifa", 0.0) or 0.0)
+                cost, src = _resolve_retirada_unit_cost(
+                    sku, sku_idx, sku_mlb_idx, sku_mlb_map, avg,
+                )
+                cogs = u * cost if cost is not None else 0.0
+                if cost is None:
+                    out["missing_cost_skus"].append({
+                        "sku": sku, "units": u, "mlb": sb.get("mlb", ""),
+                        "titulo": sb.get("titulo", ""),
+                    })
+                elif src == "avg":
+                    out["fallback_avg_used"] += u
+                out["cogs_descarte"] += cogs
+                out["by_sku"][sku] = {
+                    "forma": forma, "units": u, "tarifa": t, "cogs": cogs,
+                    "cost_source": src, "mlb": sb.get("mlb", ""),
+                    "titulo": sb.get("titulo", ""),
+                }
+        elif forma == RETIRADA_FORMA_ENVIO:
+            out["tarifa_envio"] += tarifa
+            out["units_envio"] += units
+            for sku, sb in sku_dict.items():
+                u = int(sb.get("units", 0) or 0)
+                t = float(sb.get("tarifa", 0.0) or 0.0)
+                # COGS не списываем для Envio — товар у продавца.
+                out["by_sku"][sku] = {
+                    "forma": forma, "units": u, "tarifa": t, "cogs": 0.0,
+                    "cost_source": "n/a", "mlb": sb.get("mlb", ""),
+                    "titulo": sb.get("titulo", ""),
+                }
+        else:
+            # Защита от новых форм retirada от ML — учитываем тариф, COGS не
+            # трогаем (требует явного решения по политике для каждой формы).
+            out["tarifa_other"] += tarifa
+            out["units_other"] += units
+
+    return out
 
 
 # ─────────────────────────────────────────────
@@ -479,13 +653,57 @@ def compute_pnl(
     if fulfillment_val > 0 and vendas_count > 0:
         fulfillment_note = f"R$ {fulfillment_val/vendas_count:.2f}/продажа"
 
+    # Retirada de estoque Full (вывоз/утилизация). Считаем до построения opex,
+    # чтобы добавить условные строки в opex_items. См. compute_retirada_cost.
+    try:
+        retirada_data = compute_retirada_cost(project, period)
+    except Exception:
+        retirada_data = {}
+    retirada_envio_val = float(retirada_data.get("tarifa_envio", 0.0) or 0.0)
+    retirada_descarte_total = (
+        float(retirada_data.get("tarifa_descarte", 0.0) or 0.0)
+        + float(retirada_data.get("cogs_descarte", 0.0) or 0.0)
+    )
+    retirada_other_val = float(retirada_data.get("tarifa_other", 0.0) or 0.0)
+
     opex_items: list[tuple[str, float, str]] = [
         ("Publicidade (Mercado Ads)", publicidade_val, ""),
         (das_label, das_val, ""),
         ("Armazenagem Full", armazenagem_val, ""),
+    ]
+    # Retirada-строки добавляем только если есть данные — чтобы не загромождать
+    # P&L нулями для проектов/периодов где retirada не было вовсе.
+    if retirada_envio_val > 0:
+        envio_units = int(retirada_data.get("units_envio", 0) or 0)
+        opex_items.append((
+            "Retirada Full — вывоз (тариф)",
+            retirada_envio_val,
+            f"{envio_units} ед. вывезено на склад продавца, COGS не списан",
+        ))
+    if retirada_descarte_total > 0:
+        d_units = int(retirada_data.get("units_descarte", 0) or 0)
+        d_tarifa = float(retirada_data.get("tarifa_descarte", 0.0) or 0.0)
+        d_cogs = float(retirada_data.get("cogs_descarte", 0.0) or 0.0)
+        missing_count = len(retirada_data.get("missing_cost_skus") or [])
+        note_parts = [f"{d_units} ед. утилизировано: тариф {d_tarifa:.2f} + COGS {d_cogs:.2f}"]
+        if missing_count:
+            note_parts.append(f"{missing_count} SKU без cost (COGS не учтён, проверь каталог)")
+        opex_items.append((
+            "Retirada Full — descarte (тариф + COGS)",
+            retirada_descarte_total,
+            "; ".join(note_parts),
+        ))
+    if retirada_other_val > 0:
+        opex_items.append((
+            "Retirada Full — другие формы (тариф)",
+            retirada_other_val,
+            "Неизвестная Forma de retirada — проверь отчёт ML",
+        ))
+    opex_items.extend([
         ("Fulfillment (доставка до клиента)", fulfillment_val, fulfillment_note),
         ("Aluguel empresa (proрационально)", aluguel_val, ""),
-    ]
+    ])
+
     operating_expenses = [
         PnLLine(label=lbl, amount_brl=val, note=note)
         for lbl, val, note in opex_items
@@ -571,12 +789,19 @@ def compute_pnl(
         cogs=cogs_total,
         net_profit=net_profit,
         vendas_count=vendas_count,
+        vendas_delivered_count=d_count,
+        vendas_returned_count=r_count,
         margin_pct=margin,
         cogs_missing_skus=cogs_missing_skus,
         cogs_missing_units=cogs_missing_units,
         cogs_missing_sku_details=sorted(cogs_missing_details, key=lambda d: -d["units"]),
         unit_cost_per_sku=unit_cost_per_sku,
         tax_info=das_info,
+        retirada_summary=(
+            retirada_data
+            if retirada_data and retirada_data.get("rows_count", 0) > 0
+            else None
+        ),
     )
 
 

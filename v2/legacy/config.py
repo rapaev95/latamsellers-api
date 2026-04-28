@@ -594,6 +594,15 @@ DATA_SOURCES = {
         "export_from": "ML > Full > Custos por servico de armazenamento",
         "columns_key": "Tarifa por unidade",
     },
+    "retirada_full": {
+        "name": "Custos Retirada Full (вывоз/утилизация)",
+        "description": "Custo por retirada de estoque Full — Envio para o endereço (вывоз) e Descarte (утилизация). Tarifa por unidade + base para COGS списание.",
+        "file_pattern": "Relatorio_Tarifas_Full*.xlsx",
+        "frequency": "monthly",
+        "type": "ecom",
+        "export_from": "ML > Full > Tarifas Full > Custo por retirada de estoque",
+        "columns_key": "Forma de retirada",
+    },
     "stock_full": {
         "name": "Stock ML Full (по SKU)",
         "description": "Relatório geral de estoque ML Full — qtd unidades por SKU",
