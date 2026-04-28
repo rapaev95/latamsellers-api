@@ -709,13 +709,14 @@ def _build_keyboard(
     app_link = f"{app_base_url.rstrip('/')}/escalar/claims"
     ml_link = f"https://myaccount.mercadolivre.com.br/post-purchase/cases/{claim_id}"
 
-    # Detect stage from claim.returns
+    # Detect stage from claim.returns + claim.stage
     returns = (claim or {}).get("returns") if isinstance(claim, dict) else None
     head_return: dict[str, Any] = {}
     if isinstance(returns, list) and returns and isinstance(returns[0], dict):
         head_return = returns[0]
     return_status = (head_return.get("status") or "").lower()
     return_id = head_return.get("id")
+    claim_stage = ((claim or {}).get("stage") or "").lower() if isinstance(claim, dict) else ""
 
     # Stage 3: return delivered → return-review flow
     if return_status == "delivered" and return_id:
@@ -748,8 +749,21 @@ def _build_keyboard(
             ],
         }
 
-    # Stage 1: early — full action set (still useful for early-stage claims
-    # where ML hasn't built a return yet; ~3 of these closed today via API).
+    # Stage 2b: claim in dispute/mediation stage WITHOUT a return yet —
+    # ML mediator already engaged, public /expected-resolutions endpoint
+    # 400s with "Resource not available". Only the seller-hub UI can pick.
+    if claim_stage in ("dispute", "mediation"):
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "⚡ Atender no app", "url": app_link},
+                    {"text": "🔗 Ver no ML", "url": ml_link},
+                ],
+            ],
+        }
+
+    # Stage 1: early (stage='claim', no return yet) — full action set works.
+    # ~3 of these closed today via /expected-resolutions/{action}.
     return {
         "inline_keyboard": [
             [
