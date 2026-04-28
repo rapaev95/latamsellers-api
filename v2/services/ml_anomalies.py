@@ -56,32 +56,41 @@ POSITION_DROP_THRESHOLD = int(os.environ.get("ANOMALIES_POSITION_THRESHOLD", "30
 HISTORY_DAYS = 7  # baseline window
 
 
-CREATE_SQL = """
-CREATE TABLE IF NOT EXISTS escalar_anomalies (
-  id SERIAL PRIMARY KEY,
-  user_id INTEGER NOT NULL,
-  date DATE NOT NULL,
-  anomaly_type TEXT NOT NULL,         -- acos_spike | sales_drop | visits_drop
-  severity TEXT NOT NULL DEFAULT 'warn',
-  item_id TEXT,                       -- NULL for account-level
-  metric_value NUMERIC,
-  baseline_value NUMERIC,
-  delta_pct NUMERIC,
-  message TEXT,
-  tg_dispatched_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  UNIQUE(user_id, date, anomaly_type, COALESCE(item_id, ''))
-);
-CREATE INDEX IF NOT EXISTS idx_escalar_anomalies_user_date
-  ON escalar_anomalies(user_id, date DESC);
-CREATE INDEX IF NOT EXISTS idx_escalar_anomalies_pending
-  ON escalar_anomalies(user_id) WHERE tg_dispatched_at IS NULL;
-"""
+# Each statement runs separately so a single syntax error doesn't take
+# down the whole bootstrap. Postgres doesn't allow expressions like
+# COALESCE(item_id, '') inside a table-level UNIQUE constraint, so we
+# enforce the dedup key via a functional UNIQUE INDEX instead — which
+# the ON CONFLICT clause in upsert_for_user matches by inference.
+_CREATE_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS escalar_anomalies (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      date DATE NOT NULL,
+      anomaly_type TEXT NOT NULL,
+      severity TEXT NOT NULL DEFAULT 'warn',
+      item_id TEXT,
+      metric_value NUMERIC,
+      baseline_value NUMERIC,
+      delta_pct NUMERIC,
+      message TEXT,
+      tg_dispatched_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_escalar_anomalies_dedup
+      ON escalar_anomalies (user_id, date, anomaly_type, (COALESCE(item_id, '')))
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_escalar_anomalies_user_date ON escalar_anomalies(user_id, date DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_escalar_anomalies_pending ON escalar_anomalies(user_id) WHERE tg_dispatched_at IS NULL",
+]
 
 
 async def ensure_schema(pool: asyncpg.Pool) -> None:
-    async with pool.acquire() as conn:
-        await conn.execute(CREATE_SQL)
+    for stmt in _CREATE_STATEMENTS:
+        async with pool.acquire() as conn:
+            await conn.execute(stmt)
 
 
 # ── MarkdownV2 helpers (same pattern as ml_*_dispatch.py) ─────────────────────
