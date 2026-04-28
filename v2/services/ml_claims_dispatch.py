@@ -781,7 +781,26 @@ def _build_keyboard(
         return f"⭐ {base}" if recommended_action == action_key else base
 
     app_link = f"{app_base_url.rstrip('/')}/escalar/claims"
-    ml_link = f"https://myaccount.mercadolivre.com.br/post-purchase/cases/{claim_id}"
+    # ML's actual mediation URL pattern (per user-shared URL):
+    #   /vendas/novo/mensagens/{pack_id}/mediacao/{claim_id}
+    # pack_id is captured during enrichment from /orders/{resource_id}.
+    # Fall back to resource_id if pack lookup failed (single-order packs
+    # often have pack_id == order_id anyway).
+    pack_id_for_link = None
+    resource_id_for_link = None
+    if isinstance(claim, dict):
+        pack_id_for_link = claim.get("order_pack_id")
+        resource_id_for_link = claim.get("resource_id")
+    venda_id = pack_id_for_link or resource_id_for_link
+    if venda_id:
+        ml_link = (
+            f"https://www.mercadolivre.com.br/vendas/novo/mensagens/{venda_id}"
+            f"/mediacao/{claim_id}"
+        )
+    elif resource_id_for_link:
+        ml_link = f"https://www.mercadolivre.com.br/vendas/{resource_id_for_link}/detalhe"
+    else:
+        ml_link = "https://www.mercadolivre.com.br/vendas"
 
     # ML's source of truth — what seller can actually do on this claim.
     seller_actions = _seller_available_actions(claim)
@@ -795,16 +814,13 @@ def _build_keyboard(
 
     rows: list[list[dict[str, Any]]] = []
 
-    # Special-case: send_message_to_mediator. ML's public API doesn't expose
-    # an endpoint for this action (we probed exhaustively — all candidates
-    # 400/404). Show a single PROMINENT URL button to ML so the seller can
-    # respond in time (mandatory deadlines on dispute claims).
+    # Special-case: send_message_to_mediator. ML's public API has NO
+    # endpoint for this action — and our app uses the same public API,
+    # so "Atender no app" would also fail. Only route to ML where the
+    # seller-hub UI uses the internal API and the button actually works.
     if "send_message_to_mediator" in seller_actions:
         rows.append([
-            {"text": "⏰ Responder ao mediador (ML)", "url": ml_link},
-        ])
-        rows.append([
-            {"text": "⚡ Abrir no app", "url": app_link},
+            {"text": "⏰ Responder ao mediador no ML", "url": ml_link},
         ])
         return {"inline_keyboard": rows}
 

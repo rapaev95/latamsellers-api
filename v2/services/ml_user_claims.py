@@ -242,6 +242,10 @@ async def _enrich_one(http: httpx.AsyncClient, token: str, claim: dict) -> dict:
             if r.status_code == 200:
                 order_data = r.json() or {}
                 items = order_data.get("order_items") or []
+                # Capture pack_id — ML's mediation URL uses pack_id, not
+                # order_id: /vendas/novo/mensagens/{pack_id}/mediacao/{claim_id}.
+                # Single-order packs return null pack_id; fall back to order_id.
+                claim["order_pack_id"] = order_data.get("pack_id") or order_data.get("id")
                 if items and isinstance(items[0], dict):
                     item_inner = items[0].get("item") or {}
                     buyer = order_data.get("buyer") or {}
