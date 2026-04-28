@@ -20,6 +20,7 @@ from v2.services import (
     ml_notices as ml_notices_svc,
     ml_oauth as ml_oauth_svc,
     ml_quality as ml_quality_svc,
+    ml_scraper_chat as ml_scraper_chat_svc,
     listing_journey as listing_journey_svc,
     ml_user_claims as ml_user_claims_svc,
     ml_user_items as ml_user_items_svc,
@@ -1341,6 +1342,47 @@ async def returns_probe(
 # Probable endpoint pattern: /messages/packs/{pack_id}/sellers/{seller_id}.
 # To probe meaningfully we need an order_id the seller knows is the
 # unread one; user passes it in the query string.
+
+@router.get("/scraper/chat-read")
+async def scraper_chat_read(
+    pack_id: str = Query(..., description="Pack ID from ML — first part of the URL after /mensagens/"),
+    claim_id: Optional[str] = Query(None, description="Optional claim_id for mediation chat"),
+    user: CurrentUser = Depends(current_user),
+):
+    """Stage-1 test: drive Chromium against ML's chat URL with the stored
+    storage_state and return the visible message bubbles. If ML_SCRAPER_
+    STORAGE_STATE_B64 isn't set yet, returns storage_state_missing.
+    """
+    try:
+        result = await ml_scraper_chat_svc.read_chat(pack_id, claim_id)
+        return {"pack_id": pack_id, "claim_id": claim_id, "messages": result, "count": len(result)}
+    except ml_scraper_chat_svc.ScraperChatError as err:
+        return {"error": str(err)}
+    except Exception as err:  # noqa: BLE001
+        return {"error": "scraper_exception", "detail": str(err)}
+
+
+@router.post("/scraper/chat-send")
+async def scraper_chat_send(
+    user: CurrentUser = Depends(current_user),
+    body: dict[str, Any] = Body(...),
+):
+    """Stage-1 test: send a message via Playwright. body shape:
+      { pack_id: '...', claim_id: '...' (optional), text: '...' }
+    """
+    pack_id = (body or {}).get("pack_id")
+    claim_id = (body or {}).get("claim_id")
+    text = (body or {}).get("text") or ""
+    if not pack_id or not text:
+        return {"error": "pack_id_and_text_required"}
+    try:
+        result = await ml_scraper_chat_svc.send_chat(pack_id, text, claim_id)
+        return {"pack_id": pack_id, "claim_id": claim_id, **result}
+    except ml_scraper_chat_svc.ScraperChatError as err:
+        return {"error": str(err)}
+    except Exception as err:  # noqa: BLE001
+        return {"error": "scraper_exception", "detail": str(err)}
+
 
 @router.get("/messages-probe")
 async def messages_probe(

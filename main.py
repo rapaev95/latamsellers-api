@@ -69,6 +69,7 @@ from v2.services import ml_oauth as ml_oauth_svc  # noqa: E402
 from v2.services import ml_quality as ml_quality_svc  # noqa: E402
 from v2.services import ml_questions_dispatch as ml_questions_dispatch_svc  # noqa: E402
 from v2.services import ml_scraper  # noqa: E402
+from v2.services import ml_scraper_chat  # noqa: E402
 from v2.services import ml_user_claims as ml_user_claims_svc  # noqa: E402
 from v2.services import ml_user_items as ml_user_items_svc  # noqa: E402
 from v2.services import ml_user_promotions as ml_user_promotions_svc  # noqa: E402
@@ -510,6 +511,10 @@ async def _v2_startup() -> None:
         await ml_scraper.init()
     except Exception as err:  # noqa: BLE001
         _ml_log.exception("ml_scraper init failed: %s", err)
+    try:
+        await ml_scraper_chat.init()
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("ml_scraper_chat init failed: %s", err)
 
     # Start APScheduler for periodic token refresh.
     _ml_scheduler = AsyncIOScheduler()
@@ -660,6 +665,10 @@ async def _v2_shutdown() -> None:
         _ml_scheduler = None
     try:
         await ml_scraper.close()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await ml_scraper_chat.close()
     except Exception:  # noqa: BLE001
         pass
     await close_pool()
