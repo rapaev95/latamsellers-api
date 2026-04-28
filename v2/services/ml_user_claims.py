@@ -401,7 +401,13 @@ def _compute_needs_action(claim: dict[str, Any]) -> bool:
     Rules derived from ML's "Reclamações" view (where the seller sees only
     cards with the prominent "Atender reclamação" CTA):
 
-    1. If status != opened → no action needed (already resolved)
+    0. Last message in the thread is from the seller (`respondent`)
+       → ball is in the buyer's/mediator's court → NO ACTION. This rule
+       fires first because it's the most reliable "I already replied"
+       signal — without it, the inbox keeps showing claims where the
+       seller already answered via ML's UI but no return has been
+       triggered yet.
+    1. If status != opened → already resolved → NO ACTION
     2. If returns array is empty/missing → seller hasn't chosen a solution
        yet, ML is asking for one → ACTION
     3. If returns[0].status == 'delivered' → return parcel arrived back at
@@ -409,6 +415,27 @@ def _compute_needs_action(claim: dict[str, Any]) -> bool:
     4. Otherwise (label_generated / shipped / in_transit / etc.) → return
        in motion, no immediate action required → NO ACTION
     """
+    # Rule 0 — seller already replied in the thread.
+    messages = claim.get("messages")
+    if isinstance(messages, list) and messages:
+        # Pick the message with the latest date_created. Don't trust list
+        # ordering — ML returns oldest-first sometimes, newest-first others.
+        last_msg = None
+        last_dt = None
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            dt = _parse_dt(m.get("date_created") or m.get("date"))
+            if last_dt is None or (dt and dt > last_dt):
+                last_dt = dt
+                last_msg = m
+        if isinstance(last_msg, dict):
+            sender = last_msg.get("sender_role") or ""
+            if not sender and isinstance(last_msg.get("sender"), dict):
+                sender = last_msg["sender"].get("role") or ""
+            if sender == "respondent":
+                return False
+
     if (claim.get("status") or "").lower() != "opened":
         return False
     returns = claim.get("returns")
