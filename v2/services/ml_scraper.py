@@ -29,6 +29,8 @@ HREF is ground truth — ML churns class names. Any anchor with
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import os
 import random
@@ -37,7 +39,7 @@ import threading
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 from playwright.sync_api import (
@@ -78,6 +80,30 @@ _UA_POOL = [
 
 class PositionScraperError(RuntimeError):
     """Single token (optionally ':detail') surfaced to the caller."""
+
+
+# ── Logged-in storage state (optional) ───────────────────────────────────
+# Same env var as the chat scraper (ml_scraper_chat.py) so a single
+# manually-exported `state.json` covers both flows. Logged-in browsing
+# significantly reduces ML's bot-detection on search-result pages.
+
+def _storage_state() -> Optional[dict[str, Any]]:
+    """Decode ML_SCRAPER_STORAGE_STATE_B64 → dict.
+
+    Format: base64-encoded JSON of the file Playwright dumps via
+    `context.storage_state(path="state.json")`. Generated locally by a
+    seller, pasted into Railway env. Returns None when unset → scraper
+    runs anonymously (legacy behaviour).
+    """
+    raw = os.environ.get("ML_SCRAPER_STORAGE_STATE_B64", "").strip()
+    if not raw:
+        return None
+    try:
+        decoded = base64.b64decode(raw).decode("utf-8")
+        return json.loads(decoded)
+    except Exception as err:  # noqa: BLE001
+        log.warning("storage_state decode failed (continuing anonymous): %s", err)
+        return None
 
 
 # ── Thread-local Playwright (sync API is thread-bound) ────────────────────
@@ -370,14 +396,21 @@ def _scrape_sync(item_id: str, keyword: str, site_id: str, max_pages: int) -> Ra
         "height": random.choice([720, 800, 900]),
     }
     proxy_arg = _build_proxy_arg()
+    storage_state = _storage_state()
 
-    context = browser.new_context(
-        user_agent=ua,
-        viewport=viewport,
-        locale="pt-BR",
-        extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"},
-        proxy=proxy_arg,
-    )
+    ctx_kwargs: dict[str, Any] = {
+        "user_agent": ua,
+        "viewport": viewport,
+        "locale": "pt-BR",
+        "extra_http_headers": {"Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"},
+        "proxy": proxy_arg,
+    }
+    if storage_state is not None:
+        # Logged-in browsing — ML returns higher-quality pages and
+        # rarely shows the bot-wall to authenticated sellers.
+        ctx_kwargs["storage_state"] = storage_state
+
+    context = browser.new_context(**ctx_kwargs)
     try:
         organic_rank = 0
         ads_above_total = 0
