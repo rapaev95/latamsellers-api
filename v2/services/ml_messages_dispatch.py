@@ -243,7 +243,7 @@ def _build_keyboard(pack_id: Any, app_base_url: str) -> dict[str, Any]:
     pack = str(pack_id or "").strip()
     app_link = f"{app_base_url.rstrip('/')}/escalar"  # no dedicated /messages page yet
     ml_link = f"https://www.mercadolivre.com.br/mensagens/{pack}" if pack else (
-        "https://myaccount.mercadolivre.com.br/mensagens"
+        "https://www.mercadolivre.com.br/vendas/novo/mensagens"
     )
     return {
         "inline_keyboard": [
@@ -365,7 +365,7 @@ def _build_batched_keyboard(app_base_url: str, lang: str) -> dict[str, Any]:
     return {
         "inline_keyboard": [
             [
-                {"text": ml_label, "url": "https://myaccount.mercadolivre.com.br/mensagens"},
+                {"text": ml_label, "url": "https://www.mercadolivre.com.br/vendas/novo/mensagens"},
                 {"text": app_label, "url": f"{app_base_url.rstrip('/')}/escalar"},
             ],
         ],
