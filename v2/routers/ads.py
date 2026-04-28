@@ -123,6 +123,121 @@ def _safe_call_label(label: str, advertiser_id: int, user_id: int) -> str:
     return f"{label}(advertiser={advertiser_id}, user={user_id})"
 
 
+@router.get("/_schema-probe")
+async def schema_probe(
+    _user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Diagnostic — list ad_storage table columns so we can see whether
+    the product_id migration actually applied. The original migration
+    block had `EXCEPTION WHEN OTHERS THEN NULL` which silently swallowed
+    failures; this endpoint surfaces the live schema."""
+    if pool is None:
+        return {"error": "no_db"}
+    out: dict[str, Any] = {}
+    async with pool.acquire() as conn:
+        for tbl in ("ml_advertisers", "ml_ad_campaigns", "ml_ad_ads", "ml_ad_campaign_metrics_daily"):
+            cols = await conn.fetch(
+                """
+                SELECT column_name, data_type, is_nullable, column_default
+                  FROM information_schema.columns
+                 WHERE table_name = $1
+                 ORDER BY ordinal_position
+                """,
+                tbl,
+            )
+            out[tbl] = [dict(c) for c in cols] if cols else None
+    return out
+
+
+@router.post("/_migrate")
+async def migrate_ads_schema(
+    _user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Force-runs the ads schema migration in explicit steps, returning
+    success/failure of each step. Use when the boot-time ensure_schema
+    silently failed (the EXCEPTION WHEN OTHERS THEN NULL block in the
+    original migration would swallow real errors).
+
+    Steps:
+      1. ADD COLUMN product_id (nullable) if missing
+      2. UPDATE existing rows to 'PADS'
+      3. ALTER COLUMN SET DEFAULT 'PADS'
+      4. ALTER COLUMN SET NOT NULL
+      5. Add other later columns (start_date, end_date, raw, etc.)
+      6. Re-create PK if needed
+    """
+    if pool is None:
+        return {"error": "no_db"}
+
+    steps: list[dict[str, Any]] = []
+
+    async def _try(label: str, sql: str) -> bool:
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(sql)
+            steps.append({"label": label, "ok": True})
+            return True
+        except Exception as err:  # noqa: BLE001
+            steps.append({"label": label, "ok": False, "error": str(err)[:300]})
+            return False
+
+    # Each table: ml_advertisers, ml_ad_campaigns
+    for tbl in ("ml_advertisers", "ml_ad_campaigns"):
+        await _try(
+            f"{tbl}: add product_id nullable",
+            f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS product_id TEXT",
+        )
+        await _try(
+            f"{tbl}: backfill product_id=PADS",
+            f"UPDATE {tbl} SET product_id = 'PADS' WHERE product_id IS NULL",
+        )
+        await _try(
+            f"{tbl}: set default PADS",
+            f"ALTER TABLE {tbl} ALTER COLUMN product_id SET DEFAULT 'PADS'",
+        )
+        await _try(
+            f"{tbl}: set not null",
+            f"ALTER TABLE {tbl} ALTER COLUMN product_id SET NOT NULL",
+        )
+
+    # ml_ad_campaigns extra columns
+    extra_cols = {
+        "start_date": "TIMESTAMPTZ",
+        "end_date": "TIMESTAMPTZ",
+        "campaign_type": "TEXT",
+        "goal": "TEXT",
+        "site_id": "TEXT",
+        "headline": "TEXT",
+        "cpc": "NUMERIC",
+        "currency": "TEXT",
+        "official_store_id": "BIGINT",
+        "destination_id": "BIGINT",
+        "raw": "JSONB",
+    }
+    for col, ctype in extra_cols.items():
+        await _try(
+            f"ml_ad_campaigns: add {col}",
+            f"ALTER TABLE ml_ad_campaigns ADD COLUMN IF NOT EXISTS {col} {ctype}",
+        )
+
+    # Re-run normal ensure_schema after explicit fixes (idempotent CREATE/INDEX).
+    try:
+        await ads_storage.ensure_schema(pool)
+        steps.append({"label": "ensure_schema (final)", "ok": True})
+    except Exception as err:  # noqa: BLE001
+        steps.append({"label": "ensure_schema (final)", "ok": False, "error": str(err)[:300]})
+
+    failures = [s for s in steps if not s.get("ok")]
+    return {
+        "ok": len(failures) == 0,
+        "total_steps": len(steps),
+        "failures": len(failures),
+        "steps": steps,
+    }
+
+
 def _explain_unhandled(err: Exception, label: str) -> HTTPException:
     """Convert any unexpected exception into a structured 500.
 
