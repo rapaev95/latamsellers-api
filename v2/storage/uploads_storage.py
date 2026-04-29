@@ -11,11 +11,15 @@ inserts for the same file content. Re-uploading the same bytes updates the
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 import asyncpg
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -30,6 +34,45 @@ class StoredFile:
 
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+# ── parsed_meta column (lazy migration) ────────────────────────────────────
+#
+# `uploads.parsed_meta` (JSONB) holds the structured output of a one-shot
+# parser (DAS PDF, etc) so the UI can show extracted fields without re-parsing
+# on every list-view. Schema lives in main.py:init_db() — that file was
+# intentionally edited by the user, so we don't touch it. Instead we add the
+# column lazily here, idempotently, the first time a parser writes to it.
+#
+# Per memory `feedback_silent_migration_failures`: NO EXCEPTION wrapping.
+# `ADD COLUMN IF NOT EXISTS` is itself idempotent and safe to call repeatedly.
+
+_parsed_meta_column_ensured = False
+
+
+async def _ensure_parsed_meta_column(pool: asyncpg.Pool) -> None:
+    """Add `parsed_meta JSONB` to `uploads` if missing. One-shot per process."""
+    global _parsed_meta_column_ensured
+    if _parsed_meta_column_ensured:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "ALTER TABLE uploads ADD COLUMN IF NOT EXISTS parsed_meta JSONB"
+        )
+    _parsed_meta_column_ensured = True
+
+
+async def set_parsed_meta(pool: asyncpg.Pool, upload_id: int, meta: dict[str, Any]) -> None:
+    """Store the parser output for an upload row. Idempotent — overwrites any
+    previous parse so a re-run of the parser (after a fix) keeps the latest
+    interpretation visible."""
+    await _ensure_parsed_meta_column(pool)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE uploads SET parsed_meta = $1::jsonb WHERE id = $2",
+            json.dumps(meta, ensure_ascii=False, default=str),
+            upload_id,
+        )
 
 
 async def put_file(

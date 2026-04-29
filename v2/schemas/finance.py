@@ -384,6 +384,10 @@ class UploadSaveOut(BaseModel):
     # {created, updated_fields, cost_updated, skipped, synced_at, total_skus}
     # или {"error": "..."} при failure парсинга.
     dados_fiscais_sync: Optional[dict[str, Any]] = None
+    # Только для source_key="das_simples" — извлечённые поля DAS PDF (month, total,
+    # vencimento, irpj/csll/cofins/pis/inss/iss/icms). Persisted в
+    # uploads.parsed_meta JSONB; UI читает через /uploads listing.
+    das_parsed: Optional[dict[str, Any]] = None
 
 
 class SourceCatalogEntry(BaseModel):

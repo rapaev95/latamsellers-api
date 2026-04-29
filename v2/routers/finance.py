@@ -1501,6 +1501,19 @@ async def create_upload(
         except Exception as e:
             dados_fiscais_sync = {"error": f"{type(e).__name__}: {e}"}
 
+    # DAS Simples Nacional: parse PDF → store extracted {month, total, irpj/csll/...}
+    # in `uploads.parsed_meta` JSONB. UI shows the parsed values next to the file
+    # row instead of just "das_simples.pdf · uploaded 2 min ago".
+    das_parsed: Optional[dict[str, Any]] = None
+    if resolved_key == "das_simples":
+        try:
+            from v2.parsers.das_simples import parse_das_simples_bytes
+            das_parsed = parse_das_simples_bytes(file_bytes, filename)
+            if das_parsed:
+                await uploads_storage.set_parsed_meta(pool, upload_id, das_parsed)
+        except Exception as e:
+            das_parsed = {"error": f"{type(e).__name__}: {e}"}
+
     return {
         "id": upload_id,
         "filename": filename,
@@ -1510,6 +1523,7 @@ async def create_upload(
         "was_duplicate": was_duplicate,
         "unlocked": unlocked_pwd is not None,
         "dados_fiscais_sync": dados_fiscais_sync,
+        "das_parsed": das_parsed,
     }
 
 
@@ -1847,7 +1861,7 @@ async def get_bank_transactions_grouped(
         )
     _bind_user(user)
 
-    from v2.legacy.bank_tx import parse_bank_tx_bytes, looks_like_pdf, CATEGORY_OPTIONS
+    from v2.legacy.bank_tx import parse_bank_tx_bytes, looks_like_pdf, CATEGORY_OPTIONS, extract_pdf_summary
     from v2.legacy.db_storage import db_load
 
     files = await uploads_storage.fetch_files_by_source(pool, user.id, source_key)
@@ -1856,10 +1870,19 @@ async def get_bank_transactions_grouped(
     upload_ids: list[int] = []
     format_errors: list[dict] = []
     duplicates_removed = 0
+    # Per-file PDF summaries — currently only C6 USD has one. Aggregated below
+    # to drive the reconciliation banner in the Classification page.
+    pdf_summaries: list[dict[str, Any]] = []
 
     for f in files:
         upload_ids.append(f.id)
         is_pdf = looks_like_pdf(f.file_bytes)
+        if is_pdf:
+            s = extract_pdf_summary(source_key, f.file_bytes)
+            if s is not None:
+                s["upload_id"] = f.id
+                s["filename"] = f.filename
+                pdf_summaries.append(s)
         parsed = parse_bank_tx_bytes(source_key, f.file_bytes)
         if not parsed:
             format_errors.append({
@@ -1909,6 +1932,50 @@ async def get_bank_transactions_grouped(
     }
 
     projects = sorted((legacy_config.load_projects() or {}).keys())
+
+    # Aggregate PDF summaries across all uploads of this bank (one bank → many
+    # statement files). UI shows a single banner per bank, so we sum expected
+    # vs actual and AND the reconciliation flags. Currency is taken from the
+    # first non-null entry — every file for the same source_key carries the
+    # same currency by construction.
+    summary: Optional[dict[str, Any]] = None
+    if pdf_summaries:
+        def _opt_sum(key: str) -> Optional[float]:
+            vals = [s.get(key) for s in pdf_summaries if s.get(key) is not None]
+            return round(sum(vals), 2) if vals else None
+
+        def _opt_min(key: str) -> Optional[str]:
+            vals = [s.get(key) for s in pdf_summaries if s.get(key)]
+            return min(vals) if vals else None
+
+        def _opt_max(key: str) -> Optional[str]:
+            vals = [s.get(key) for s in pdf_summaries if s.get(key)]
+            return max(vals) if vals else None
+
+        summary = {
+            "currency": pdf_summaries[0].get("currency"),
+            "expected_entradas": _opt_sum("expected_entradas_usd"),
+            "expected_saidas": _opt_sum("expected_saidas_usd"),
+            "actual_entradas": round(sum(s.get("actual_entradas_usd") or 0 for s in pdf_summaries), 2),
+            "actual_saidas": round(sum(s.get("actual_saidas_usd") or 0 for s in pdf_summaries), 2),
+            # Saldo: take from the file with the latest period_to (most recent
+            # statement). Falls back to the last entry's saldo if dates missing.
+            "saldo_final": (
+                max(pdf_summaries, key=lambda s: s.get("period_to") or "").get("saldo_final_usd")
+            ),
+            "saldo_final_date": (
+                max(pdf_summaries, key=lambda s: s.get("period_to") or "").get("saldo_final_date")
+            ),
+            "period_from": _opt_min("period_from"),
+            "period_to": _opt_max("period_to"),
+            "reconciliation_ok": all(s.get("reconciliation_ok") for s in pdf_summaries),
+            "missing_count_estimate": sum(s.get("missing_count_estimate") or 0 for s in pdf_summaries),
+            "files": [
+                {"upload_id": s["upload_id"], "filename": s["filename"], "ok": s.get("reconciliation_ok", False)}
+                for s in pdf_summaries
+            ],
+        }
+
     return {
         "source_key": source_key,
         "bank_label": _BANK_LABELS.get(source_key, source_key),
@@ -1920,6 +1987,7 @@ async def get_bank_transactions_grouped(
         "format_errors": format_errors,
         "duplicates_removed": duplicates_removed,
         "counts": counts,
+        "summary": summary,
     }
 
 

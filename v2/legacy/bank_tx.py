@@ -100,18 +100,124 @@ def _ddmm_to_iso(date_ddmm: str, year: str) -> str:
     return date_ddmm
 
 
+# Unified amount capture — group 1 = optional `-` sign, group 2 = absolute number.
+# Used by every C6 USD pattern below so the row builder reads sign uniformly,
+# regardless of whether the row "type" is inherently debit/credit or ambiguous.
+_PAT_USD_AMOUNT = r"(-?)US\$\s*([\d.,]+)"
+
+
+# (regex, sign_hint, default_desc).
+# sign_hint: -1 (always debit), +1 (always credit), 0 (read literal sign from
+# captured `-` group — used for ambiguous types like Em processamento /
+# Transferência where the same label can be either direction depending on
+# the literal sign in the PDF text).
+_C6_USD_PATTERNS: list[tuple[Any, int, str]] = [
+    # Always-debit types
+    (re.compile(r"(\d{2}/\d{2})\s+Débito de cartão\b\s*(.*?)" + _PAT_USD_AMOUNT, re.IGNORECASE), -1, "Débito de cartão"),
+    (re.compile(r"(\d{2}/\d{2})\s+Compra\b\s*(.*?)" + _PAT_USD_AMOUNT, re.IGNORECASE), -1, "Compra"),
+    (re.compile(r"(\d{2}/\d{2})\s+Saque\b\s*(.*?)" + _PAT_USD_AMOUNT, re.IGNORECASE), -1, "Saque"),
+    (re.compile(r"(\d{2}/\d{2})\s+Tarifa\b\s*(.*?)" + _PAT_USD_AMOUNT, re.IGNORECASE), -1, "Tarifa"),
+    (re.compile(r"(\d{2}/\d{2})\s+Pagamento\b\s*(.*?)" + _PAT_USD_AMOUNT, re.IGNORECASE), -1, "Pagamento"),
+    (re.compile(r"(\d{2}/\d{2})\s+Pix enviado\b\s*(.*?)" + _PAT_USD_AMOUNT, re.IGNORECASE), -1, "Pix enviado"),
+    # Always-credit types
+    (re.compile(r"(\d{2}/\d{2})\s+Entrada\s+(.*?)" + _PAT_USD_AMOUNT, re.IGNORECASE), +1, "Entrada"),
+    (re.compile(r"(\d{2}/\d{2})\s+Estorno\b\s*(.*?)" + _PAT_USD_AMOUNT, re.IGNORECASE), +1, "Estorno"),
+    (re.compile(r"(\d{2}/\d{2})\s+Pix recebido\b\s*(.*?)" + _PAT_USD_AMOUNT, re.IGNORECASE), +1, "Pix recebido"),
+    # Ambiguous types — sign from captured literal `-` (real PDF triggering this
+    # fix had `28/04 Em processamento Ts/trafficstars.com ... Cartão 6602 -US$ 6.185,88`,
+    # which the original 6-pattern set silently dropped).
+    (re.compile(r"(\d{2}/\d{2})\s+Em processamento\b\s*(.*?)" + _PAT_USD_AMOUNT, re.IGNORECASE), 0, "Em processamento"),
+    (re.compile(r"(\d{2}/\d{2})\s+Transfer[êe]ncia\b\s*(.*?)" + _PAT_USD_AMOUNT, re.IGNORECASE), 0, "Transferência"),
+    (re.compile(r"(\d{2}/\d{2})\s+TED\b\s*(.*?)" + _PAT_USD_AMOUNT, re.IGNORECASE), 0, "TED"),
+    (re.compile(r"(\d{2}/\d{2})\s+DOC\b\s*(.*?)" + _PAT_USD_AMOUNT, re.IGNORECASE), 0, "DOC"),
+    (re.compile(r"(\d{2}/\d{2})\s+Sa[íi]da\b\s*(.*?)" + _PAT_USD_AMOUNT, re.IGNORECASE), 0, "Saída"),
+]
+
+
+def _parse_c6_usd_summary(all_lines: list[str]) -> dict[str, Any]:
+    """Extract reconciliation totals from the C6 USD PDF header.
+
+    The PDF carries an authoritative summary line right after the period:
+        «Resumo das movimentações Entradas • US$ 4.800,00 • Saidas • US$ 6.185,88»
+    plus a closing balance:
+        «Saldo do dia • 29 de abril de 2026 • US$ 35,14»
+
+    Returning these lets the UI verify that every line was actually captured
+    by the regex pool — if `expected_*` ≠ Σ(parsed rows) we surface a banner
+    and the user knows there's an unrecognised row type to report.
+
+    Returns keys (any may be None on parse failure):
+      expected_entradas_usd, expected_saidas_usd,
+      saldo_final_usd, saldo_final_date,
+      period_from, period_to (both ISO).
+    """
+    out: dict[str, Any] = {
+        "expected_entradas_usd": None,
+        "expected_saidas_usd": None,
+        "saldo_final_usd": None,
+        "saldo_final_date": None,
+        "period_from": None,
+        "period_to": None,
+    }
+    full_text = "\n".join(all_lines)
+
+    # «Entradas • US$ X • Saidas • US$ Y» — note ML uses both Saidas/Saídas
+    m_resumo = re.search(
+        r"Entradas\s*[•·]\s*US\$\s*([\d.,]+)\s*[•·]\s*Sa[ií]das\s*[•·]\s*US\$\s*([\d.,]+)",
+        full_text, re.IGNORECASE,
+    )
+    if m_resumo:
+        try:
+            out["expected_entradas_usd"] = float(m_resumo.group(1).replace(".", "").replace(",", "."))
+            out["expected_saidas_usd"] = float(m_resumo.group(2).replace(".", "").replace(",", "."))
+        except ValueError:
+            pass
+
+    # «Saldo do dia • 29 de abril de 2026 • US$ 35,14»
+    m_saldo = re.search(
+        r"Saldo do dia\s*[•·]\s*(\d{1,2})\s+de\s+(\w+)\s+de\s+(\d{4})\s*[•·]\s*US\$\s*([\d.,]+)",
+        full_text, re.IGNORECASE,
+    )
+    if m_saldo:
+        try:
+            out["saldo_final_usd"] = float(m_saldo.group(4).replace(".", "").replace(",", "."))
+            mm = _PT_MONTH_TO_NUM.get(m_saldo.group(2).lower())
+            if mm:
+                out["saldo_final_date"] = f"{m_saldo.group(3)}-{mm}-{m_saldo.group(1).zfill(2)}"
+        except ValueError:
+            pass
+
+    # «Período • 14 de abril de 2026 até 29 de abril de 2026»
+    m_per = re.search(
+        r"Per[ií]odo\s*[•·]\s*(\d{1,2})\s+de\s+(\w+)\s+de\s+(\d{4})\s+at[ée]\s+(\d{1,2})\s+de\s+(\w+)\s+de\s+(\d{4})",
+        full_text, re.IGNORECASE,
+    )
+    if m_per:
+        try:
+            mm_from = _PT_MONTH_TO_NUM.get(m_per.group(2).lower())
+            mm_to = _PT_MONTH_TO_NUM.get(m_per.group(5).lower())
+            if mm_from:
+                out["period_from"] = f"{m_per.group(3)}-{mm_from}-{m_per.group(1).zfill(2)}"
+            if mm_to:
+                out["period_to"] = f"{m_per.group(6)}-{mm_to}-{m_per.group(4).zfill(2)}"
+        except ValueError:
+            pass
+
+    return out
+
+
 def _parse_c6_usd_pdf(file_bytes: bytes) -> list[dict[str, Any]]:
     """Parse a C6 Conta Global USD PDF statement into transaction rows.
 
-    Patterns covered (extracted from real C6 USD exports):
-      «DD/MM Débito de cartão <merchant> -US$ X.XX»          → expense
-      «DD/MM Compra <merchant> -US$ X.XX»                    → expense
-      «DD/MM Entrada Transf C6 Conta Global Líquido US$ X.XX» → entry
-      «DD/MM Saque US$ X.XX»                                 → outflow
-      «DD/MM Tarifa <X> -US$ X.XX»                            → bank_fee
+    Pattern coverage in `_C6_USD_PATTERNS`: 14 row types — debit-only
+    (Débito de cartão / Compra / Saque / Tarifa / Pagamento / Pix enviado),
+    credit-only (Entrada / Estorno / Pix recebido), and ambiguous-sign
+    (Em processamento / Transferência / TED / DOC / Saída) where direction
+    is read from the literal `-` in the PDF text.
 
     Year is taken from the «Período» line in the PDF header.
-    Returns rows in the same shape as `parse_bank_tx_bytes` (no header dict).
+    Each row carries `currency: "USD"` so the UI can label `US$` (the legacy
+    `value_brl` field name is kept for response-shape compatibility).
     """
     try:
         import pdfplumber
@@ -133,31 +239,19 @@ def _parse_c6_usd_pdf(file_bytes: bytes) -> list[dict[str, Any]]:
     full_text = "\n".join(all_lines)
     year = _parse_period_year_from_pdf_text(full_text)
 
-    pat_amount = r"-?US\$\s*([\d.,]+)"
-
-    # Order matters — broader patterns last so specific labels win.
-    patterns = [
-        # (regex, sign, default_desc)
-        (re.compile(r"(\d{2}/\d{2})\s+Débito de cartão\b\s*(.*?)" + pat_amount, re.IGNORECASE), -1, "Débito de cartão"),
-        (re.compile(r"(\d{2}/\d{2})\s+Compra\b\s*(.*?)" + pat_amount, re.IGNORECASE), -1, "Compra"),
-        (re.compile(r"(\d{2}/\d{2})\s+Saque\b\s*(.*?)" + pat_amount, re.IGNORECASE), -1, "Saque"),
-        (re.compile(r"(\d{2}/\d{2})\s+Tarifa\b\s*(.*?)" + pat_amount, re.IGNORECASE), -1, "Tarifa"),
-        (re.compile(r"(\d{2}/\d{2})\s+Entrada\s+(.*?)" + pat_amount, re.IGNORECASE), +1, "Entrada"),
-        (re.compile(r"(\d{2}/\d{2})\s+Estorno\b\s*(.*?)" + pat_amount, re.IGNORECASE), +1, "Estorno"),
-    ]
-
     rows: list[dict[str, Any]] = []
     for i, raw_line in enumerate(all_lines):
         line = raw_line.strip()
         if not line:
             continue
-        for rgx, sign, default_desc in patterns:
+        for rgx, sign_hint, default_desc in _C6_USD_PATTERNS:
             m = rgx.search(line)
             if not m:
                 continue
             ddmm = m.group(1)
             mid = (m.group(2) or "").strip(" -·•")
-            amt_raw = m.group(3)
+            sign_literal = -1 if m.group(3) == "-" else +1
+            amt_raw = m.group(4)
             try:
                 amount = float(amt_raw.replace(".", "").replace(",", "."))
             except ValueError:
@@ -165,6 +259,8 @@ def _parse_c6_usd_pdf(file_bytes: bytes) -> list[dict[str, Any]]:
 
             if amount == 0:
                 break
+
+            sign = sign_hint if sign_hint != 0 else sign_literal
 
             # Pick a clean description: prefer captured merchant text, fall back to label
             desc = (mid or default_desc).strip()
@@ -182,7 +278,10 @@ def _parse_c6_usd_pdf(file_bytes: bytes) -> list[dict[str, Any]]:
                 "idx": len(rows),
                 "tx_hash": compute_tx_hash("extrato_c6_usd", iso_date, val, desc),
                 "date": iso_date,
-                "value_brl": val,        # USD here despite the field name; UI labels accordingly
+                # Field name kept for backwards-compat; `currency: "USD"` tells the
+                # UI to render with `US$` prefix, not `R$` (see classification page).
+                "value_brl": val,
+                "currency": "USD",
                 "description": desc[:200],
                 "category": cls["category"],
                 "project": cls.get("project") or "",
@@ -194,6 +293,69 @@ def _parse_c6_usd_pdf(file_bytes: bytes) -> list[dict[str, Any]]:
             break  # first matching pattern wins for this line
 
     return rows
+
+
+def extract_pdf_summary(source_key: str, file_bytes: bytes) -> Optional[dict[str, Any]]:
+    """Reconciliation summary for a bank-statement PDF.
+
+    For C6 USD: returns expected vs actual totals + saldo + period. UI uses
+    this to flag unrecognised rows ("expected Saidas US$ 6.185, parsed only
+    US$ 0 — N rows missing"). Returns None for non-PDF or unsupported banks.
+    """
+    if not looks_like_pdf(file_bytes):
+        return None
+    if source_key != "extrato_c6_usd":
+        return None
+    try:
+        import pdfplumber
+    except ImportError:
+        return None
+    try:
+        all_lines: list[str] = []
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                txt = page.extract_text() or ""
+                all_lines.extend(txt.split("\n"))
+    except Exception:
+        return None
+    if not all_lines:
+        return None
+
+    header = _parse_c6_usd_summary(all_lines)
+    rows = _parse_c6_usd_pdf(file_bytes)
+
+    actual_entradas = sum(r["value_brl"] for r in rows if r.get("value_brl", 0) > 0)
+    actual_saidas = sum(abs(r["value_brl"]) for r in rows if r.get("value_brl", 0) < 0)
+
+    exp_e = header.get("expected_entradas_usd")
+    exp_s = header.get("expected_saidas_usd")
+
+    # 2 cents tolerance — covers FX rounding artefacts on amounts < 50,000.
+    ok_e = exp_e is None or abs(actual_entradas - exp_e) < 0.02
+    ok_s = exp_s is None or abs(actual_saidas - exp_s) < 0.02
+    reconciliation_ok = ok_e and ok_s
+
+    # Rough estimate of how many rows are missing — useful for the UI banner.
+    missing = 0
+    if exp_e is not None and actual_entradas + 0.02 < exp_e:
+        missing += 1  # at least one entrada line wasn't captured
+    if exp_s is not None and actual_saidas + 0.02 < exp_s:
+        missing += 1  # at least one saída line wasn't captured
+
+    return {
+        "currency": "USD",
+        "expected_entradas_usd": exp_e,
+        "expected_saidas_usd": exp_s,
+        "actual_entradas_usd": round(actual_entradas, 2),
+        "actual_saidas_usd": round(actual_saidas, 2),
+        "saldo_final_usd": header.get("saldo_final_usd"),
+        "saldo_final_date": header.get("saldo_final_date"),
+        "period_from": header.get("period_from"),
+        "period_to": header.get("period_to"),
+        "reconciliation_ok": reconciliation_ok,
+        "missing_count_estimate": missing,
+        "rows_parsed": len(rows),
+    }
 
 
 def _read_bank_csv(source_key: str, file_bytes: bytes) -> Optional[pd.DataFrame]:
