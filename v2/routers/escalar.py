@@ -2622,6 +2622,47 @@ async def refresh_user_promotions(
 # isn't available from Telegram's webhook context.
 
 
+@router.post("/items/refresh-margins")
+async def refresh_item_margins_endpoint(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Manual trigger ml_item_margin_cache refresh для всех SKU юзера.
+
+    Без этого endpoint margin собирается только nightly cron'ом — после
+    добавления нового SKU или первой загрузки ждёшь до утра. Здесь
+    запускаем тот же refresh_user_item_margins синхронно (~5-10s для
+    ~200 SKU). Вызывать от UI кнопкой или через console fetch:
+
+      fetch('/api/v2-proxy/escalar/items/refresh-margins', {method:'POST'})
+        .then(r=>r.json()).then(console.log)
+
+    После 200 OK профит будет в orders_v2 TG-уведомлениях для следующих
+    продаж и в /escalar/products.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    legacy_db.set_current_user_id(user.id)
+    try:
+        from v2.services import ml_item_margin as _margin_svc
+        await _margin_svc.ensure_schema(pool)
+        result = await _margin_svc.refresh_user_item_margins(pool, user.id, period_months=3)
+        return {
+            "ok": True,
+            "user_id": user.id,
+            "computed": result.get("computed"),
+            "items_total": result.get("items_total"),
+            "projects": result.get("projects"),
+        }
+    except Exception as err:  # noqa: BLE001
+        import traceback as _tb
+        return {
+            "ok": False,
+            "error": str(err),
+            "trace": _tb.format_exc()[-500:],
+        }
+
+
 @router.get("/user-promotions/raw-debug")
 async def user_promotions_raw_debug(
     item_id: str = Query(..., min_length=1, description="MLB id"),
