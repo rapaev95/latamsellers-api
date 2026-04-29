@@ -1922,6 +1922,22 @@ async def get_bank_transactions_grouped(
             if ov.get("label"):
                 r["label"] = ov["label"]
 
+    # Câmbio enrichment — currently only relevant for C6 USD: pull paired
+    # BRL→USD conversions from C6 BRL, build a FIFO inventory of USD lots,
+    # consume saídas oldest-first to compute the *real* BRL cost of each
+    # USD outflow. Mutates `rows` in place (adds cambio_rate / fifo_brl_cost).
+    cambio_summary: Optional[dict[str, Any]] = None
+    if source_key == "extrato_c6_usd":
+        try:
+            from v2.services import cambio as cambio_svc
+            cambio_result = await cambio_svc.compute_for_user(pool, user.id, rows)
+            cambio_svc.enrich_rows(rows, cambio_result)
+            cambio_summary = cambio_result.summary
+        except Exception as err:  # noqa: BLE001
+            # Cambio is enrichment, not critical — log but never block the page.
+            import logging as _log_mod
+            _log_mod.getLogger("finance.cambio").warning("cambio compute failed: %s", err)
+
     # Sort newest first by date string (ISO-friendly when present, falls back
     # to lexicographic — file order is preserved for ties via Python sort stability)
     rows.sort(key=lambda r: (r.get("date") or ""), reverse=True)
@@ -1989,6 +2005,7 @@ async def get_bank_transactions_grouped(
         "duplicates_removed": duplicates_removed,
         "counts": counts,
         "summary": summary,
+        "cambio": cambio_summary,
     }
 
 
