@@ -13,12 +13,13 @@ import contextvars
 from datetime import date, datetime
 from typing import Any, Callable, Optional, TypeVar
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
 
 from v2.db import get_pool
 from v2.deps import CurrentUser, current_user
 from v2.legacy import db_storage as legacy_db
 from v2.legacy import config as legacy_config
+from v2.services import finance_cache
 from v2.schemas.finance import (
     ProjectsListOut, ReportsBundleOut,
     SkuMappingOut, SkuBulkSaveIn, SkuBulkSaveOut,
@@ -116,16 +117,23 @@ def _parse_iso(s: Optional[str]) -> Optional[date]:
 
 @router.get("/reports", response_model=ReportsBundleOut)
 def get_reports(
+    response: Response,
     project: str = Query(..., description="Project ID, e.g. 'GANZA'"),
     period_from: Optional[str] = Query(None, alias="from"),
     period_to: Optional[str] = Query(None, alias="to"),
     basis: str = Query("accrual", pattern="^(accrual|cash)$"),
+    fresh: bool = Query(False, description="Bypass cache and recompute from scratch"),
     user: CurrentUser = Depends(current_user),
 ) -> dict[str, Any]:
     """Compute ОПиУ + ДДС + Баланс for one project + period in a single call.
 
     Returns three sub-objects matching the Streamlit "Отчёты" page tabs.
     Errors from any single computation are reported per-tab, not as 500.
+
+    Wrapped in a durable read-through cache (`finance_compute_cache` table).
+    First call after upload / settings change recomputes from scratch and
+    stores the bundle; subsequent calls return cached JSONB in ~50ms.
+    Pass `?fresh=1` to force recomputation.
     """
     _bind_user(user)
     projects = legacy_config.load_projects()
@@ -138,64 +146,77 @@ def get_reports(
         # default: 30 days back
         pf = date.fromordinal(pt.toordinal() - 30)
 
-    # Lazy imports — only pay the cost when /reports is actually called
-    from v2.legacy.finance import compute_pnl, compute_cashflow, compute_balance
-    from v2.legacy.reports import load_vendas_ml_report, has_1yr_bank_statements
-
     out: dict[str, Any] = {
         "project": project,
         "period": {"from": pf.isoformat(), "to": pt.isoformat()},
         "basis": basis,
     }
 
-    # Pre-warm the vendas DataFrame cache in the request context so all three
-    # parallel compute tasks below find it hot. Without this the threads race
-    # to rebuild the 2208-row df simultaneously (DB + pd.read_csv + df.apply)
-    # and the wall time can exceed the shared timeout.
-    try:
-        load_vendas_ml_report()
-    except Exception:
-        pass  # individual computes will re-raise properly
+    def _compute_bundle() -> dict[str, Any]:
+        # Lazy imports — only pay the cost when we actually need to recompute.
+        from v2.legacy.finance import compute_pnl, compute_cashflow, compute_balance
+        from v2.legacy.reports import load_vendas_ml_report, has_1yr_bank_statements
 
-    # P&L фильтруется выбранным периодом — показывает доходы/расходы отрезка.
-    # ДДС и Баланс — всегда кумулятивно на сегодня: от даты запуска проекта
-    # (launch_date / report_period start) или от минимальной найденной даты
-    # продаж до today(). Иначе пользователь при узком периоде видит
-    # отрицательный «закрывающий остаток», что не имеет экономического смысла.
-    today = date.today()
-    proj_meta = projects.get(project, {}) or {}
-    cumul_start = _parse_iso((proj_meta.get("launch_date") or "").strip()[:10]) or pf
-    rp = proj_meta.get("report_period", "")
-    if rp and "/" in rp:
-        rp_start = _parse_iso(rp.split("/")[0].strip())
-        if rp_start and rp_start < (cumul_start or today):
-            cumul_start = rp_start
-    cumul_start = cumul_start or pf
+        # Pre-warm the vendas DataFrame cache in the request context so all three
+        # parallel compute tasks below find it hot. Without this the threads race
+        # to rebuild the 2208-row df simultaneously (DB + pd.read_csv + df.apply)
+        # and the wall time can exceed the shared timeout.
+        try:
+            load_vendas_ml_report()
+        except Exception:
+            pass  # individual computes will re-raise properly
 
-    # Проверяем, есть ли ≥12 мес. банк-выписок — это разрешает применить
-    # прогрессивный Simples Anexo I (RBT12). Иначе compute_das откатится
-    # на faixa 1 nominal. Флаг `ml_only_revenue` на проекте даёт такое же
-    # разрешение (см. legacy/tax_brazil.compute_das).
-    has_1yr = has_1yr_bank_statements()
+        # P&L фильтруется выбранным периодом — показывает доходы/расходы отрезка.
+        # ДДС и Баланс — всегда кумулятивно на сегодня: от даты запуска проекта
+        # (launch_date / report_period start) или от минимальной найденной даты
+        # продаж до today(). Иначе пользователь при узком периоде видит
+        # отрицательный «закрывающий остаток», что не имеет экономического смысла.
+        today = date.today()
+        proj_meta = projects.get(project, {}) or {}
+        cumul_start = _parse_iso((proj_meta.get("launch_date") or "").strip()[:10]) or pf
+        rp = proj_meta.get("report_period", "")
+        if rp and "/" in rp:
+            rp_start = _parse_iso(rp.split("/")[0].strip())
+            if rp_start and rp_start < (cumul_start or today):
+                cumul_start = rp_start
+        local_cumul_start = cumul_start or pf
 
-    results = _run_parallel_with_timeout({
-        "pnl": lambda: compute_pnl(project, (pf, pt), basis=basis, has_1yr_bank_data=has_1yr),
-        "cashflow": lambda: compute_cashflow(project, (cumul_start, today)),
-        "balance": lambda: compute_balance(project, today, basis=basis, has_1yr_bank_data=has_1yr),
-    })
+        # Проверяем, есть ли ≥12 мес. банк-выписок — это разрешает применить
+        # прогрессивный Simples Anexo I (RBT12). Иначе compute_das откатится
+        # на faixa 1 nominal. Флаг `ml_only_revenue` на проекте даёт такое же
+        # разрешение (см. legacy/tax_brazil.compute_das).
+        has_1yr = has_1yr_bank_statements()
 
-    pnl_res, pnl_err = results["pnl"]
-    if pnl_res is not None: out["pnl"] = _dataclass_to_dict(pnl_res)
-    if pnl_err: out["pnl_error"] = pnl_err
+        results = _run_parallel_with_timeout({
+            "pnl": lambda: compute_pnl(project, (pf, pt), basis=basis, has_1yr_bank_data=has_1yr),
+            "cashflow": lambda: compute_cashflow(project, (local_cumul_start, today)),
+            "balance": lambda: compute_balance(project, today, basis=basis, has_1yr_bank_data=has_1yr),
+        })
 
-    cf_res, cf_err = results["cashflow"]
-    if cf_res is not None: out["cashflow"] = _dataclass_to_dict(cf_res)
-    if cf_err: out["cashflow_error"] = cf_err
+        bundle: dict[str, Any] = {}
+        pnl_res, pnl_err = results["pnl"]
+        if pnl_res is not None: bundle["pnl"] = _dataclass_to_dict(pnl_res)
+        if pnl_err: bundle["pnl_error"] = pnl_err
 
-    bal_res, bal_err = results["balance"]
-    if bal_res is not None: out["balance"] = _dataclass_to_dict(bal_res)
-    if bal_err: out["balance_error"] = bal_err
+        cf_res, cf_err = results["cashflow"]
+        if cf_res is not None: bundle["cashflow"] = _dataclass_to_dict(cf_res)
+        if cf_err: bundle["cashflow_error"] = cf_err
 
+        bal_res, bal_err = results["balance"]
+        if bal_res is not None: bundle["balance"] = _dataclass_to_dict(bal_res)
+        if bal_err: bundle["balance_error"] = bal_err
+        return bundle
+
+    cache_key = f"reports:{project}:{pf.isoformat()}:{pt.isoformat()}:{basis}"
+    # Don't cache partial / errored bundles — half-computed results would
+    # be served indefinitely until next user input change.
+    bundle, status = finance_cache.cached_compute(
+        user.id, cache_key, _compute_bundle,
+        force=fresh,
+        should_cache=lambda b: not any(k.endswith("_error") for k in b),
+    )
+    out.update(bundle)
+    response.headers["X-Cache"] = status
     return out
 
 
@@ -499,6 +520,32 @@ def _build_sku_mapping(user_id: int, ml_sku_map: dict[str, dict[str, str]] | Non
         "project_ids": project_ids,
         "total": len(all_skus),
     }
+
+
+@router.get("/cache/stats")
+def get_cache_stats(
+    scope: str = Query("user", pattern="^(user|global)$"),
+    user: CurrentUser = Depends(current_user),
+):
+    """Diagnostic — what's currently in the finance compute cache.
+
+    `scope=user` (default) → only this user's entries with cache_key + age +
+    truncated fingerprint. `scope=global` → totals across all users (admin
+    debugging).
+    """
+    if scope == "global":
+        return finance_cache.stats_sync(user_id=None)
+    return finance_cache.stats_sync(user_id=user.id)
+
+
+@router.post("/cache/cleanup")
+def post_cache_cleanup(
+    max_age_days: int = Query(14, ge=1, le=365),
+    user: CurrentUser = Depends(current_user),  # noqa: ARG001 — auth gate
+):
+    """Manual cleanup of cache rows older than max_age_days. Cron-callable too."""
+    deleted = finance_cache.cleanup_stale_sync(max_age_days=max_age_days)
+    return {"deleted": deleted, "max_age_days": max_age_days}
 
 
 @router.get("/sku-mapping", response_model=SkuMappingOut)
@@ -1027,32 +1074,46 @@ async def debug_sku_mapping(
 
 @router.get("/pnl-matrix", response_model=PnlMatrixOut)
 def get_pnl_matrix(
+    response: Response,
     project: str = Query(..., description="Project ID, e.g. 'ARTHUR'"),
+    fresh: bool = Query(False, description="Bypass cache and recompute from scratch"),
     user: CurrentUser = Depends(current_user),
 ):
     """Monthly PnL matrix (rows × 12 months): revenue breakdown + expenses +
     summary (op_profit, margin, orders). Mirrors Streamlit `build_monthly_pnl_matrix`.
 
-    Wraps the legacy compute with the same 15s timeout/parallel safeguard used
-    by /reports. On timeout returns empty months/rows.
+    Wrapped in the same durable cache as /reports. Pass `?fresh=1` to force.
+    On compute timeout returns empty months/rows (and skips caching).
     """
     _bind_user(user)
-    from v2.legacy.reports import build_monthly_pnl_matrix
 
-    results = _run_parallel_with_timeout({
-        "matrix": lambda: build_monthly_pnl_matrix(project),
-    })
-    data, err = results["matrix"]
-    if data is None or err:
-        import sys
-        print(f"[pnl-matrix] project={project} err={err}", file=sys.stderr, flush=True)
-        return {"project": project, "months": [], "years": [], "rows": []}
-    return {
-        "project": project,
-        "months": data.get("months", []),
-        "years": data.get("years", []),
-        "rows": data.get("rows", []),
-    }
+    def _compute_matrix() -> dict[str, Any]:
+        from v2.legacy.reports import build_monthly_pnl_matrix
+        results = _run_parallel_with_timeout({
+            "matrix": lambda: build_monthly_pnl_matrix(project),
+        })
+        data, err = results["matrix"]
+        if data is None or err:
+            import sys
+            print(f"[pnl-matrix] project={project} err={err}", file=sys.stderr, flush=True)
+            return {"project": project, "months": [], "years": [], "rows": [], "_error": err or "no_data"}
+        return {
+            "project": project,
+            "months": data.get("months", []),
+            "years": data.get("years", []),
+            "rows": data.get("rows", []),
+        }
+
+    cache_key = f"matrix:{project}"
+    payload, status = finance_cache.cached_compute(
+        user.id, cache_key, _compute_matrix,
+        force=fresh,
+        should_cache=lambda p: not p.get("_error") and bool(p.get("months")),
+    )
+    response.headers["X-Cache"] = status
+    # Strip internal marker before returning to UI.
+    payload.pop("_error", None)
+    return payload
 
 
 @router.post("/sku-mapping/save", response_model=SkuBulkSaveOut)
