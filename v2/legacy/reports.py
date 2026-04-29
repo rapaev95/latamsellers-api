@@ -2456,7 +2456,7 @@ def load_sku_titles() -> dict:
     for month in MONTHS:
         for path in (DATA_DIR / month).glob("ranking_produtos*.csv") if (DATA_DIR / month).exists() else []:
             try:
-                with open(path, encoding="utf-8-sig") as f:
+                with open(path, encoding="utf-8-sig", newline="") as f:
                     rows = list(_csv.reader(f))
             except Exception:
                 continue
@@ -2476,7 +2476,7 @@ def load_sku_titles() -> dict:
             if any(skip in n for skip in ("after_collection", "anuncios", "armazenamento", "account_statement", "ranking")):
                 continue
             try:
-                with open(path, encoding="utf-8-sig", errors="ignore") as f:
+                with open(path, encoding="utf-8-sig", errors="ignore", newline="") as f:
                     reader = _csv.reader(f, delimiter=";")
                     rows = list(reader)
             except Exception:
@@ -2680,7 +2680,9 @@ def _rows_from_publicidade_bytes(filename: str, file_bytes: bytes) -> list | Non
                 continue
         if text is None:
             return None
-        return list(_csv.reader(io.StringIO(text), delimiter=";"))
+        # newline="" — ML CSV содержат embedded `\n` в quoted полях (titulo);
+        # без этого csv.reader валится с «new-line character seen in unquoted field».
+        return list(_csv.reader(io.StringIO(text, newline=""), delimiter=";"))
     except Exception:
         return None
 
@@ -2748,7 +2750,7 @@ def parse_publicidade_reports() -> list[dict]:
                     df = pd.read_excel(path, sheet_name=target_sheet, header=None)
                     rows = df.where(pd.notna(df), None).values.tolist()
                 else:
-                    with open(path, encoding="utf-8-sig") as f:
+                    with open(path, encoding="utf-8-sig", newline="") as f:
                         rows = list(_csv.reader(f, delimiter=";"))
             except Exception:
                 continue
@@ -3442,8 +3444,11 @@ def _parse_armazenagem_file(path) -> dict | None:
     Возвращает {by_sku: {sku: {MLB, anuncio, values: {date: float}}}, daily_cols: list[str]}.
     """
     import csv as _csv
+    # newline="" обязательно: ML-экспорты содержат embedded `\n`/`\r` в quoted
+    # полях (titulo с переносами), без этого csv.reader валится с
+    # «new-line character seen in unquoted field».
     try:
-        with open(path, encoding="utf-8-sig") as f:
+        with open(path, encoding="utf-8-sig", newline="") as f:
             rows = list(_csv.reader(f, delimiter=";"))
     except Exception:
         return None
@@ -3458,6 +3463,7 @@ def _parse_armazenagem_bytes_daily(file_bytes: bytes) -> dict | None:
     """
     import csv as _csv
     import io
+    import logging
     text: str | None = None
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
         try:
@@ -3467,7 +3473,13 @@ def _parse_armazenagem_bytes_daily(file_bytes: bytes) -> dict | None:
             continue
     if text is None:
         return None
-    rows = list(_csv.reader(io.StringIO(text), delimiter=";"))
+    # newline="" — см. _parse_armazenagem_file. Если файл всё-таки битый,
+    # глотаем ошибку с логом, чтобы один кривой armazenamento не валил весь PnL.
+    try:
+        rows = list(_csv.reader(io.StringIO(text, newline=""), delimiter=";"))
+    except Exception as err:  # noqa: BLE001
+        logging.getLogger(__name__).warning("armazenagem csv parse failed: %s", err)
+        return None
     return _parse_armazenagem_rows(rows)
 
 
@@ -4176,7 +4188,7 @@ def get_devolucoes_by_project() -> dict:
     for month in MONTHS:
         for path in (DATA_DIR / month).glob("devolucoes_ml*.csv") if (DATA_DIR / month).exists() else []:
             try:
-                with open(path, encoding="utf-8-sig") as f:
+                with open(path, encoding="utf-8-sig", newline="") as f:
                     reader = csv.reader(f, delimiter=";")
                     rows = list(reader)
             except Exception:

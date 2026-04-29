@@ -107,7 +107,10 @@ def parse_publicidade_bytes(file_bytes: bytes, filename: str = "") -> list[Publi
         # CSV — ML exports with ';' delimiter and UTF-8 BOM.
         try:
             text = file_bytes.decode("utf-8-sig", errors="replace")
-            rows = list(_csv.reader(io.StringIO(text), delimiter=";"))
+            # newline="" — ML-экспорт может содержать `\n`/`\r` в quoted полях
+            # (titulo с переносами); без этого csv.reader валится с
+            # «new-line character seen in unquoted field».
+            rows = list(_csv.reader(io.StringIO(text, newline=""), delimiter=";"))
         except Exception as err:  # noqa: BLE001
             log.warning("publicidade csv parse failed for %s: %s", filename, err)
             return []
