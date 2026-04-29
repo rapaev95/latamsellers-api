@@ -33,6 +33,7 @@ from v2.schemas.finance import (
     ClassificationSaveIn, ClassificationSaveOut,
     OnboardingState, ProjectCreateIn, ProjectCreateOut,
     ProjectUpdateIn, ProjectMutOut,
+    FixedCostsSaveIn,
     UploadPreviewOut,
     ManualCashflowEntryIn, ManualCashflowEntriesOut,
     PlannedPaymentIn, PlannedPaymentsOut, PlannedPaymentMutOut,
@@ -2287,6 +2288,76 @@ def update_project_endpoint(
     _invalidate_projects_cache()
     invalidate_vendas_cache(user.id)
     return {"project_id": pid, "updated": True, "exists": True}
+
+
+@router.get("/projects/{project_id}/fixed-costs")
+def get_project_fixed_costs(
+    project_id: str,
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Per-project monthly fixed costs (6 категорий + total). Используется для
+    конфигурации break-even tracker в TG sales notifications.
+
+    Если поле ещё не задано — возвращает все нули.
+    """
+    _bind_user(user)
+    from v2.legacy.config import load_projects, FIXED_COST_CATEGORIES
+
+    pid = project_id.strip().upper()
+    if not pid:
+        raise HTTPException(status_code=400, detail="project_id_required")
+    projects = load_projects() or {}
+    proj = projects.get(pid)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project_not_found")
+
+    saved = proj.get("fixed_costs_monthly") or {}
+    if not isinstance(saved, dict):
+        saved = {}
+    breakdown: dict[str, float] = {}
+    for cat in FIXED_COST_CATEGORIES:
+        try:
+            breakdown[cat] = round(max(0.0, float(saved.get(cat) or 0)), 2)
+        except (TypeError, ValueError):
+            breakdown[cat] = 0.0
+    return {
+        "project_id": pid,
+        "fixed_costs_monthly": breakdown,
+        "total_monthly": round(sum(breakdown.values()), 2),
+    }
+
+
+@router.put("/projects/{project_id}/fixed-costs")
+def save_project_fixed_costs(
+    project_id: str,
+    body: FixedCostsSaveIn,
+    user: CurrentUser = Depends(current_user),
+) -> dict[str, Any]:
+    """Save per-project monthly fixed costs. Replaces full breakdown (не merge)."""
+    _bind_user(user)
+    from v2.legacy.config import update_project, FIXED_COST_CATEGORIES, _invalidate_projects_cache
+
+    pid = project_id.strip().upper()
+    if not pid:
+        raise HTTPException(status_code=400, detail="project_id_required")
+
+    breakdown_in = body.fixed_costs_monthly.model_dump()
+    ok = update_project(pid, {"fixed_costs_monthly": breakdown_in})
+    if not ok:
+        raise HTTPException(status_code=404, detail="project_not_found")
+    _invalidate_projects_cache()
+    # Re-read для возврата canonical (после sanitize в update_project).
+    from v2.legacy.config import load_projects
+    proj = (load_projects() or {}).get(pid) or {}
+    saved = proj.get("fixed_costs_monthly") or {}
+    canonical: dict[str, float] = {
+        cat: float(saved.get(cat) or 0) for cat in FIXED_COST_CATEGORIES
+    }
+    return {
+        "project_id": pid,
+        "fixed_costs_monthly": canonical,
+        "total_monthly": round(sum(canonical.values()), 2),
+    }
 
 
 @router.delete("/projects/{project_id}", response_model=ProjectMutOut)

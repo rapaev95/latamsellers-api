@@ -516,6 +516,30 @@ class ProjectUpdateIn(BaseModel):
     rental_fields: Optional[dict[str, Any]] = None
 
 
+class FixedCostsBreakdown(BaseModel):
+    """Per-project monthly fixed costs — для break-even tracker per-sale TG.
+
+    6 канонических категорий. Sum считается на лету (не хранится).
+    Хранится в `projects[slug].fixed_costs_monthly` JSONB.
+    """
+    armazenagem: float = 0
+    aluguel: float = 0
+    salaries: float = 0
+    utilities: float = 0
+    software: float = 0
+    outros: float = 0
+
+
+class FixedCostsOut(BaseModel):
+    project_id: str
+    fixed_costs_monthly: FixedCostsBreakdown
+    total_monthly: float
+
+
+class FixedCostsSaveIn(BaseModel):
+    fixed_costs_monthly: FixedCostsBreakdown
+
+
 class ProjectMutOut(BaseModel):
     """Return for PUT / DELETE — confirms target + outcome."""
     project_id: str

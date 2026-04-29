@@ -204,7 +204,16 @@ _PROJECT_EDITABLE_KEYS = frozenset({
     "initial_equity_brl",            # float — стартовые вложения собственника
     "das_override_pct",              # float 0..100 | None — ручной процент DAS
     "ml_only_revenue",               # bool — продаёт только на ML (разрешает прогрессивный DAS по RBT12)
+    # Per-project monthly fixed costs (для break-even tracker per-sale TG):
+    # {armazenagem, aluguel, salaries, utilities, software, outros} → float >= 0
+    "fixed_costs_monthly",
 })
+
+# Канонические категории fixed_costs_monthly. Любые другие keys в input
+# отбрасываются. Negative values clamped to 0.
+FIXED_COST_CATEGORIES = (
+    "armazenagem", "aluguel", "salaries", "utilities", "software", "outros",
+)
 
 _VALID_TAX_REGIMES = frozenset({"", "simples_nacional", "lucro_presumido"})
 _VALID_SIMPLES_ANEXOS = frozenset({"", "I", "II", "III"})
@@ -298,6 +307,25 @@ def update_project(
             continue
         if key in ("publicidade_fill_avg", "armazenagem_fill_avg"):
             p[key] = bool(val)
+            continue
+        if key == "fixed_costs_monthly":
+            # Per-project monthly fixed costs. Канонизируем: keep only known
+            # categories (FIXED_COST_CATEGORIES), coerce to float >= 0.
+            # Sum_monthly считается на лету в API (не сохраняем — производное).
+            if val is None or val == "":
+                p[key] = None
+                continue
+            if not isinstance(val, dict):
+                continue
+            cleaned: dict[str, float] = {}
+            for cat in FIXED_COST_CATEGORIES:
+                raw = val.get(cat)
+                try:
+                    f = max(0.0, float(raw)) if raw is not None and raw != "" else 0.0
+                except (TypeError, ValueError):
+                    f = 0.0
+                cleaned[cat] = round(f, 2)
+            p[key] = cleaned
             continue
         p[key] = val
 
