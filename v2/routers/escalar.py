@@ -2635,32 +2635,37 @@ async def user_promotions_raw_debug(
     видно есть ли offer_id в текущем кэше и в свежем response от ML, чтобы
     понять надо ли менять _upsert_offer или нет.
     """
+    import traceback as _tb
     if pool is None:
         return {"error": "no_db"}
-    # NB: в escalar router нет _bind_user(); используем legacy_db
-    # set_current_user_id напрямую (как делают другие escalar endpoints).
-    legacy_db.set_current_user_id(user.id)
-    mlb = item_id.upper().strip()
+    try:
+        legacy_db.set_current_user_id(user.id)
+        mlb = item_id.upper().strip()
+    except Exception as err:  # noqa: BLE001
+        return {"error": "bind_failed", "detail": str(err), "trace": _tb.format_exc()[-500:]}
 
     # 1. Что у нас в БД.
     db_row = None
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT promotion_id, promotion_type, sub_type, status, offer_id,
-                   original_price, deal_price, discount_percentage,
-                   meli_percentage, seller_percentage, fetched_at,
-                   start_date, finish_date, accepted_at, dismissed_at
-              FROM ml_user_promotions
-             WHERE user_id = $1 AND item_id = $2 AND promotion_id = $3
-            """,
-            user.id, mlb, promotion_id.strip(),
-        )
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT promotion_id, promotion_type, sub_type, status, offer_id,
+                       original_price, deal_price, discount_percentage,
+                       meli_percentage, seller_percentage, fetched_at,
+                       start_date, finish_date, accepted_at, dismissed_at
+                  FROM ml_user_promotions
+                 WHERE user_id = $1 AND item_id = $2 AND promotion_id = $3
+                """,
+                user.id, mlb, promotion_id.strip(),
+            )
         if row:
             db_row = dict(row)
             for k, v in list(db_row.items()):
                 if hasattr(v, "isoformat"):
                     db_row[k] = v.isoformat()
+    except Exception as err:  # noqa: BLE001
+        return {"error": "db_query_failed", "detail": str(err), "trace": _tb.format_exc()[-500:]}
 
     # 2. Что ML отдаёт сейчас (raw, без обработки).
     fresh = None
@@ -2674,12 +2679,13 @@ async def user_promotions_raw_debug(
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=15.0,
             )
-        fresh = {
-            "status": r.status_code,
-            "body": r.json() if r.status_code == 200 else r.text[:500],
-        }
+        try:
+            body_value = r.json() if r.status_code == 200 else r.text[:500]
+        except Exception:  # noqa: BLE001
+            body_value = r.text[:500]
+        fresh = {"status": r.status_code, "body": body_value}
     except Exception as err:  # noqa: BLE001
-        fresh_err = str(err)
+        fresh_err = f"{type(err).__name__}: {err}"
 
     # 3. Подобрать matching offer из raw response по promotion_id.
     matching_offer: Optional[dict] = None
