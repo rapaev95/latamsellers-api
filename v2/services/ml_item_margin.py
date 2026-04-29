@@ -134,6 +134,9 @@ def apply_hypothetical_price(
         armaz_pu = float(unit_in.get("armaz_per_unit") or 0)
         das_rate = float(unit_in.get("das_rate") or 0.045)
         new_das_pu = new_price * das_rate
+        # Fixed overhead не scaled — это monthly cost / units, фиксирован
+        # независимо от per-sale price.
+        fixed_overhead_pu = float(unit_in.get("fixed_overhead_per_unit") or 0)
         if cogs_pu is not None:
             new_var_cost = (
                 new_ml_fee_pu + envios_pu + ful_pu + float(cogs_pu)
@@ -141,10 +144,26 @@ def apply_hypothetical_price(
             )
             new_unit_profit = new_price - new_var_cost
             new_unit_margin = round(new_unit_profit / new_price * 100, 1) if new_price else None
+            # ── True variable margin (Сессия B) ───────────────────────────
+            # Только реально variable per-sale: cogs + ml_fee + envios + das.
+            # Это «стоит ли продавать ЭТОТ товар по этой цене?».
+            new_true_variable = (
+                new_ml_fee_pu + envios_pu + float(cogs_pu) + new_das_pu
+            )
+            new_profit_variable = new_price - new_true_variable
+            new_margin_variable_pct = round(new_profit_variable / new_price * 100, 1) if new_price else None
+            # Net profit после fixed allocation (overhead не scaled).
+            new_profit_net_pu = new_profit_variable - fixed_overhead_pu
+            new_margin_net_pct = round(new_profit_net_pu / new_price * 100, 1) if new_price else None
         else:
             new_var_cost = None
             new_unit_profit = None
             new_unit_margin = None
+            new_true_variable = None
+            new_profit_variable = None
+            new_margin_variable_pct = None
+            new_profit_net_pu = None
+            new_margin_net_pct = None
         new_unit = dict(unit_in)
         new_unit.update({
             "current_price": round(new_price, 2),
@@ -154,6 +173,14 @@ def apply_hypothetical_price(
             "variable_cost": round(new_var_cost, 2) if new_var_cost is not None else None,
             "profit_per_unit": round(new_unit_profit, 2) if new_unit_profit is not None else None,
             "margin_pct": new_unit_margin,
+            # New fields (Сессия B) — recomputed at hypothetical_price.
+            "true_variable_per_sale": round(new_true_variable, 2) if new_true_variable is not None else None,
+            "profit_variable": round(new_profit_variable, 2) if new_profit_variable is not None else None,
+            "margin_variable_pct": new_margin_variable_pct,
+            "profit_net_per_unit": round(new_profit_net_pu, 2) if new_profit_net_pu is not None else None,
+            "margin_net_pct": new_margin_net_pct,
+            # fixed_overhead_per_unit и manual_fixed_total_monthly не меняются
+            # с ценой — keep cached values.
         })
 
     out = dict(cached)
@@ -418,6 +445,62 @@ def _build_item_payload(
     das_per_unit = price_basis * das_rate
     cogs_per_unit = float(unit_cost) if unit_cost is not None else None
 
+    # ── True variable cost per sale ─────────────────────────────────────────
+    # Только то что реально variable per-sale: cogs (за каждую единицу),
+    # ml_fee (% от цены), envios (Tarifa de envio per sale), das (% от bruto).
+    # NB: armazenagem/fulfillment/aluguel/publicidade — fixed monthly P&L lines,
+    # НЕ зависят от per-sale решения. Они аллоцируются отдельно как overhead.
+    if cogs_per_unit is not None:
+        true_variable_per_sale = (
+            ml_fee_per_unit + envios_per_sale + cogs_per_unit + das_per_unit
+        )
+        profit_variable = price_basis - true_variable_per_sale
+        margin_variable_pct = round(profit_variable / price_basis * 100, 1) if price_basis else None
+    else:
+        true_variable_per_sale = None
+        profit_variable = None
+        margin_variable_pct = None
+
+    # ── Fixed overhead allocated per unit ──────────────────────────────────
+    # Сумма всех fixed monthly расходов, allocated на total_units продаж.
+    # Это среднее «overhead-burden per sale» — для понимания что нужно
+    # покрывать каждой продажей чтобы P&L был положительным.
+    fixed_overhead_per_unit = (
+        publicidade_share + armazenagem_share + aluguel_share
+        + fulfillment_share
+        # NB: das_share здесь НЕ включён — DAS уже учтён как variable
+        # (das_per_unit зависит от конкретной цены продажи, не fixed monthly).
+    ) / max(units, 1)
+
+    # Pull manual fixed costs (salaries/utilities/software/outros) per project.
+    # Они НЕ в P&L opex (compute_pnl их не парсит), но формируют part of total
+    # fixed overhead для break-even tracker. Source: project.fixed_costs_monthly.
+    try:
+        from .config import load_projects as _lp_fixed
+        proj_meta_fixed = (_lp_fixed() or {}).get(str(project).upper(), {}) or {}
+        manual_fc = proj_meta_fixed.get("fixed_costs_monthly") or {}
+        if isinstance(manual_fc, dict):
+            manual_fc_total = sum(
+                max(0.0, float(manual_fc.get(k, 0) or 0))
+                for k in ("salaries", "utilities", "software", "outros")
+            )
+        else:
+            manual_fc_total = 0.0
+    except Exception:  # noqa: BLE001
+        manual_fc_total = 0.0
+    manual_fc_per_unit = manual_fc_total / max(total_units, 1)
+    fixed_overhead_per_unit = fixed_overhead_per_unit + manual_fc_per_unit
+
+    # ── Net unit profit (variable minus fixed allocation) ──────────────────
+    if profit_variable is not None:
+        profit_net_per_unit = profit_variable - fixed_overhead_per_unit
+        margin_net_pct = round(profit_net_per_unit / price_basis * 100, 1) if price_basis else None
+    else:
+        profit_net_per_unit = None
+        margin_net_pct = None
+
+    # Legacy fields (back-compat для existing callers): unit_variable_cost
+    # включает fulfillment+armaz из старой логики. Сохраняем для нерegrессии.
     if cogs_per_unit is not None:
         unit_variable_cost = (
             ml_fee_per_unit + envios_per_sale + fulfillment_per_sale
@@ -465,10 +548,24 @@ def _build_item_payload(
             "cogs_per_unit": round(cogs_per_unit, 2) if cogs_per_unit is not None else None,
             "das_per_unit": round(das_per_unit, 2),
             "armaz_per_unit": round(armaz_per_unit, 2),
+            # Legacy: смесь variable+fixed, оставляем для back-compat.
             "variable_cost": round(unit_variable_cost, 2) if unit_variable_cost is not None else None,
             "profit_per_unit": round(unit_profit, 2) if unit_profit is not None else None,
             "margin_pct": unit_margin_pct,
             "das_rate": round(das_rate, 4),
+            # ── Корректное разделение variable/fixed (Сессия B) ────────────
+            # true_variable_per_sale = только реально variable: cogs + ml_fee
+            # + envios + das. Это «стоит ли вообще продавать этот товар?»
+            "true_variable_per_sale": round(true_variable_per_sale, 2) if true_variable_per_sale is not None else None,
+            "profit_variable": round(profit_variable, 2) if profit_variable is not None else None,
+            "margin_variable_pct": margin_variable_pct,
+            # Fixed overhead (publicidade + armaz + aluguel + fulfillment +
+            # manual_4_categories) аллоцированный per unit. Это «сколько каждой
+            # продаже надо покрывать чтобы P&L был положительным».
+            "fixed_overhead_per_unit": round(fixed_overhead_per_unit, 2),
+            "manual_fixed_total_monthly": round(manual_fc_total, 2),
+            "profit_net_per_unit": round(profit_net_per_unit, 2) if profit_net_per_unit is not None else None,
+            "margin_net_pct": margin_net_pct,
         },
     }
 
