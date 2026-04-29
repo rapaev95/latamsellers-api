@@ -69,7 +69,9 @@ def detect_source_from_filename(filename: str) -> Optional[str]:
         return "fatura_ml"
 
     # Bank statements
-    if "extrato" in fname and "nubank" in fname:
+    # Nubank: real exports come as `Nubank_<date>.csv` — no "extrato" prefix.
+    # The word "nubank" is unique to this bank, so a single-word match is safe.
+    if "nubank" in fname:
         return "extrato_nubank"
     if "c6" in fname:
         if "usd" in fname or "conta_global_usd" in fname:
