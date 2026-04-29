@@ -1705,7 +1705,7 @@ async def get_transactions(
         raise HTTPException(status_code=503, detail="db_unavailable")
     _bind_user(user)
 
-    from v2.legacy.bank_tx import parse_bank_tx_bytes, CATEGORY_OPTIONS
+    from v2.legacy.bank_tx import parse_bank_tx_bytes, looks_like_pdf, CATEGORY_OPTIONS
     from v2.legacy.db_storage import db_load
 
     stored = await uploads_storage.get_file(pool, user.id, upload_id)
@@ -1718,7 +1718,16 @@ async def get_transactions(
                     "supported": sorted(_BANK_SOURCES)},
         )
 
-    rows = parse_bank_tx_bytes(stored.source_key, stored.file_bytes)
+    # #2: detect PDF early — return empty rows + explicit format_error so the UI
+    # can show "exporte como CSV" instead of a silent empty table.
+    format_error: Optional[str] = None
+    rows: list[dict[str, Any]] = []
+    if looks_like_pdf(stored.file_bytes):
+        format_error = "pdf_not_supported"
+    else:
+        rows = parse_bank_tx_bytes(stored.source_key, stored.file_bytes)
+        if not rows:
+            format_error = "empty_after_parse"
 
     # Merge saved overrides (keyed by upload_id, indexed by idx)
     overrides = db_load(_overrides_key(upload_id)) or {}
@@ -1745,6 +1754,7 @@ async def get_transactions(
         "categories": CATEGORY_OPTIONS,
         "projects": projects,
         "saved_overrides_count": len(overrides),
+        "format_error": format_error,
     }
 
 
@@ -1794,6 +1804,179 @@ async def save_transactions(
         saved += 1
 
     db_save(_overrides_key(upload_id), current)
+    return {"saved": saved, "total_overrides": len(current)}
+
+
+# ── Grouped (per-bank) transactions (#1) ────────────────────────────────────
+# Same data as /transactions/{upload_id} but merged across ALL uploads for
+# one source_key, deduplicated by stable hash, with overrides keyed by
+# tx_hash so re-uploading the same statement does not lose categorizations.
+
+_GROUPED_OVERRIDES_KEY_PREFIX = "f2_classifications_grouped_"
+
+_BANK_LABELS = {
+    "extrato_mp": "Mercado Pago",
+    "extrato_nubank": "Nubank",
+    "extrato_c6_brl": "C6 BRL",
+    "extrato_c6_usd": "C6 USD",
+}
+
+
+def _grouped_overrides_key(source_key: str) -> str:
+    return f"{_GROUPED_OVERRIDES_KEY_PREFIX}{source_key}"
+
+
+@router.get("/bank-transactions/grouped")
+async def get_bank_transactions_grouped(
+    source_key: str = Query(..., description="extrato_nubank | extrato_mp | extrato_c6_brl | extrato_c6_usd"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Merge transactions across every upload of one bank for the user.
+
+    Dedupe key: SHA1(source_key + date + value + normalized description).
+    Overrides are stored under one key per source_key (not per upload), so
+    classification persists across re-uploads of the same statement.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    if source_key not in _BANK_SOURCES:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "unsupported_source", "source_key": source_key,
+                    "supported": sorted(_BANK_SOURCES)},
+        )
+    _bind_user(user)
+
+    from v2.legacy.bank_tx import parse_bank_tx_bytes, looks_like_pdf, CATEGORY_OPTIONS
+    from v2.legacy.db_storage import db_load
+
+    files = await uploads_storage.fetch_files_by_source(pool, user.id, source_key)
+
+    rows_by_hash: dict[str, dict[str, Any]] = {}
+    upload_ids: list[int] = []
+    format_errors: list[dict] = []
+    duplicates_removed = 0
+
+    for f in files:
+        upload_ids.append(f.id)
+        if looks_like_pdf(f.file_bytes):
+            format_errors.append({"upload_id": f.id, "filename": f.filename,
+                                   "error": "pdf_not_supported"})
+            continue
+        parsed = parse_bank_tx_bytes(source_key, f.file_bytes)
+        if not parsed:
+            format_errors.append({"upload_id": f.id, "filename": f.filename,
+                                   "error": "empty_after_parse"})
+            continue
+        for r in parsed:
+            h = r.get("tx_hash")
+            if not h:
+                continue
+            if h in rows_by_hash:
+                duplicates_removed += 1
+                # Prefer earliest source upload's date in case of differing formatting
+                continue
+            r2 = dict(r)
+            r2["source_upload_id"] = f.id
+            r2["source_filename"] = f.filename
+            rows_by_hash[h] = r2
+
+    rows = list(rows_by_hash.values())
+
+    # Apply per-source overrides keyed by tx_hash
+    overrides = db_load(_grouped_overrides_key(source_key)) or {}
+    if not isinstance(overrides, dict):
+        overrides = {}
+    for r in rows:
+        ov = overrides.get(r["tx_hash"])
+        if isinstance(ov, dict):
+            if ov.get("category"):
+                r["category"] = ov["category"]
+                r["confidence"] = "manual"
+                r["auto"] = False
+            if ov.get("project") is not None:
+                r["project"] = ov["project"]
+            if ov.get("label"):
+                r["label"] = ov["label"]
+
+    # Sort newest first by date string (ISO-friendly when present, falls back
+    # to lexicographic — file order is preserved for ties via Python sort stability)
+    rows.sort(key=lambda r: (r.get("date") or ""), reverse=True)
+
+    counts = {
+        "external": sum(1 for r in rows if r.get("tx_class") == "external"),
+        "internal_ml": sum(1 for r in rows if r.get("tx_class") == "internal_ml"),
+        "unknown": sum(1 for r in rows if r.get("tx_class") == "unknown"),
+    }
+
+    projects = sorted((legacy_config.load_projects() or {}).keys())
+    return {
+        "source_key": source_key,
+        "bank_label": _BANK_LABELS.get(source_key, source_key),
+        "upload_ids": upload_ids,
+        "rows": rows,
+        "categories": CATEGORY_OPTIONS,
+        "projects": projects,
+        "saved_overrides_count": len(overrides),
+        "format_errors": format_errors,
+        "duplicates_removed": duplicates_removed,
+        "counts": counts,
+    }
+
+
+@router.post("/bank-transactions/grouped/save")
+async def save_bank_transactions_grouped(
+    body: dict[str, Any],
+    source_key: str = Query(...),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Persist tx_hash-keyed overrides for a whole bank.
+
+    Body: `{ overrides: [{tx_hash, category?, project?, label?}, ...] }`.
+    Empty (null/empty) values for all three clear the entry.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    if source_key not in _BANK_SOURCES:
+        raise HTTPException(status_code=400, detail="unsupported_source")
+    _bind_user(user)
+
+    from v2.legacy.db_storage import db_load, db_save
+
+    current = db_load(_grouped_overrides_key(source_key)) or {}
+    if not isinstance(current, dict):
+        current = {}
+
+    incoming = (body or {}).get("overrides") or []
+    saved = 0
+    for ov in incoming:
+        if not isinstance(ov, dict):
+            continue
+        h = ov.get("tx_hash")
+        if not h or not isinstance(h, str):
+            continue
+        cat = ov.get("category")
+        proj = ov.get("project")
+        lbl = ov.get("label")
+        has_content = any(v for v in (cat, proj, lbl))
+        if not has_content:
+            if h in current:
+                current.pop(h, None)
+                saved += 1
+            continue
+        entry = current.get(h, {}) if isinstance(current.get(h), dict) else {}
+        if cat is not None:
+            entry["category"] = cat
+        if proj is not None:
+            entry["project"] = proj
+        if lbl is not None:
+            entry["label"] = lbl
+        current[h] = entry
+        saved += 1
+
+    db_save(_grouped_overrides_key(source_key), current)
     return {"saved": saved, "total_overrides": len(current)}
 
 

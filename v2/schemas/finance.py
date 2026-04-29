@@ -419,6 +419,7 @@ class RulesSaveIn(BaseModel):
 
 class BankTxRow(BaseModel):
     idx: int                  # row index in the source DataFrame
+    tx_hash: str = ""         # stable hash for cross-upload dedupe (#1)
     date: str
     value_brl: float
     description: str
@@ -427,6 +428,7 @@ class BankTxRow(BaseModel):
     label: str = ""
     confidence: str = "none"  # "auto" | "none" | "manual"
     auto: bool = False
+    tx_class: str = "external"  # "internal_ml" | "external" | "unknown" (#4)
 
 
 class TransactionsOut(BaseModel):
@@ -437,13 +439,29 @@ class TransactionsOut(BaseModel):
     categories: list[str]     # enum for UI dropdown
     projects: list[str]       # user project slugs
     saved_overrides_count: int = 0
+    format_error: Optional[str] = None  # "pdf_not_supported" / "empty_after_parse" (#2)
 
 
 class TransactionOverride(BaseModel):
-    idx: int
+    idx: int = 0                # legacy per-upload key (kept for back-compat)
+    tx_hash: Optional[str] = None  # new stable key (preferred when present)
     category: Optional[str] = None
     project: Optional[str] = None
     label: Optional[str] = None
+
+
+class GroupedTxOut(BaseModel):
+    """#1 — merged transactions across all uploads of one bank."""
+    source_key: str
+    bank_label: str           # human-readable e.g. "Nubank", "Mercado Pago"
+    upload_ids: list[int]     # uploads that contributed
+    rows: list[BankTxRow]
+    categories: list[str]
+    projects: list[str]
+    saved_overrides_count: int = 0
+    format_errors: list[dict] = []  # [{upload_id, filename, error}]
+    duplicates_removed: int = 0
+    counts: dict = {}         # {"external": N, "internal_ml": M, "unknown": K}
 
 
 class ClassificationSaveIn(BaseModel):
