@@ -517,13 +517,13 @@ class ProjectUpdateIn(BaseModel):
 
 
 class FixedCostsBreakdown(BaseModel):
-    """Per-project monthly fixed costs — для break-even tracker per-sale TG.
+    """Per-project monthly MANUAL fixed costs — для break-even tracker per-sale TG.
 
-    6 канонических категорий. Sum считается на лету (не хранится).
-    Хранится в `projects[slug].fixed_costs_monthly` JSONB.
+    Только manual-input категории, которые НЕ парсятся автоматически.
+    Armazenagem (из uploaded reports) и aluguel (из project.aluguel_mensal)
+    учитываются break-even tracker'ом отдельно — по фактическим данным.
+    Сумма считается на лету.
     """
-    armazenagem: float = 0
-    aluguel: float = 0
     salaries: float = 0
     utilities: float = 0
     software: float = 0

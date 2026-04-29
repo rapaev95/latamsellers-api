@@ -211,8 +211,14 @@ _PROJECT_EDITABLE_KEYS = frozenset({
 
 # Канонические категории fixed_costs_monthly. Любые другие keys в input
 # отбрасываются. Negative values clamped to 0.
+#
+# ВАЖНО: armazenagem и aluguel НЕ ВКЛЮЧЕНЫ — они уже считаются автоматически
+# из uploaded reports / aluguel_mensal field проекта. Если бы мы их сюда
+# включили — было бы дублирование, и пользователь регулярно бы забывал
+# обновлять config когда ML не списал хранение или изменилась аренда.
+# Здесь только manual-input категории, которые backend не парсит автоматом.
 FIXED_COST_CATEGORIES = (
-    "armazenagem", "aluguel", "salaries", "utilities", "software", "outros",
+    "salaries", "utilities", "software", "outros",
 )
 
 _VALID_TAX_REGIMES = frozenset({"", "simples_nacional", "lucro_presumido"})
