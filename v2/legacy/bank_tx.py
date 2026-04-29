@@ -100,6 +100,54 @@ def _ddmm_to_iso(date_ddmm: str, year: str) -> str:
     return date_ddmm
 
 
+def _normalize_csv_date(raw: Any) -> str:
+    """Coerce a CSV date cell to ISO `YYYY-MM-DD`.
+
+    Real bank CSVs in BR market use a small zoo of formats:
+      Mercado Pago:   `01-03-2026`           (DD-MM-YYYY)
+      Nubank:         `2026-04-27`           (already ISO)
+      C6 BRL:         `2026-04-15 14:30:00`  (ISO with time)
+      Itaú/Bradesco:  `15/04/2026`           (DD/MM/YYYY)
+      Some legacy:    `15/04/2026 14:30`     (DD/MM/YYYY with time)
+
+    Without normalization the date string sorts lexicographically as garbage
+    (`'26-03-2026' > '20-04-2026'`), tx_hash dedup breaks across formats, and
+    the frontend's `new Date()` call returns "Invalid Date" for non-ISO inputs.
+
+    Bad input is returned as-is so we never lose the original — better to show
+    a weird date than to drop the row.
+    """
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s or s.lower() in ("nan", "none", "null"):
+        return ""
+
+    # Drop any time portion — split on space or T
+    head = s.replace("T", " ").split(" ", 1)[0].strip()
+    if not head:
+        return s
+
+    # Already ISO (YYYY-MM-DD) — fast path
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", head):
+        return head
+
+    # DD-MM-YYYY or DD/MM/YYYY → YYYY-MM-DD
+    m = re.fullmatch(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", head)
+    if m:
+        dd, mm, yyyy = m.groups()
+        return f"{yyyy}-{mm.zfill(2)}-{dd.zfill(2)}"
+
+    # YYYY/MM/DD → YYYY-MM-DD
+    m = re.fullmatch(r"(\d{4})/(\d{1,2})/(\d{1,2})", head)
+    if m:
+        yyyy, mm, dd = m.groups()
+        return f"{yyyy}-{mm.zfill(2)}-{dd.zfill(2)}"
+
+    # Unknown shape — return raw so caller can inspect / display
+    return s
+
+
 # Unified amount capture — group 1 = optional `-` sign, group 2 = absolute number.
 # Used by every C6 USD pattern below so the row builder reads sign uniformly,
 # regardless of whether the row "type" is inherently debit/credit or ambiguous.
@@ -555,7 +603,13 @@ def parse_bank_tx_bytes(source_key: str, file_bytes: bytes) -> list[dict[str, An
             if val > 0 or "liberação" in dl or "liberacao" in dl:
                 continue
 
-        date_val = str(row.get(cols["date"], "") or "") if cols["date"] else ""
+        # Normalize date to ISO YYYY-MM-DD so:
+        #   • lexicographic sort matches chronological order
+        #   • frontend `new Date(...)` works without "Invalid Date"
+        #   • tx_hash is stable across CSVs that emit the same row in different
+        #     date formats (e.g. user re-exports MP using a different locale)
+        raw_date = str(row.get(cols["date"], "") or "") if cols["date"] else ""
+        date_val = _normalize_csv_date(raw_date)
         cls = classify_transaction(desc, val)
         # #4: classify MP rows as internal vs external relative to the ML ecosystem.
         # For non-MP banks the field stays 'external' (real bank movements always
