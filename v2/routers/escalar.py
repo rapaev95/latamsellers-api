@@ -2637,7 +2637,9 @@ async def user_promotions_raw_debug(
     """
     if pool is None:
         return {"error": "no_db"}
-    _bind_user(user)
+    # NB: в escalar router нет _bind_user(); используем legacy_db
+    # set_current_user_id напрямую (как делают другие escalar endpoints).
+    legacy_db.set_current_user_id(user.id)
     mlb = item_id.upper().strip()
 
     # 1. Что у нас в БД.
