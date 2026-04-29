@@ -18,6 +18,7 @@ from v2.services import (
     ml_item_context as ml_item_context_svc,
     ml_normalize as ml_normalize_svc,
     ml_notices as ml_notices_svc,
+    goals as goals_svc,
     ml_anomalies as ml_anomalies_svc,
     ml_oauth as ml_oauth_svc,
     ml_orders as ml_orders_svc,
@@ -1519,6 +1520,86 @@ async def delete_photo_experiment(
         )
     deleted = result.endswith(" 1")
     return {"deleted": deleted, "experiment_id": experiment_id}
+
+
+# ── Goals (manual targets per user/quarter) ──────────────────────────────────
+
+
+@router.get("/goals")
+async def goals_list(
+    project: Optional[str] = Query(None),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Active goals for the current user. `project` filters to one
+    project (NULL = global goals)."""
+    if pool is None:
+        return {"goals": []}
+    await goals_svc.ensure_schema(pool)
+    project_filter = project if project else None
+    goals = await goals_svc.list_active(pool, user.id, project_name=project_filter)
+    return {"goals": goals, "total": len(goals)}
+
+
+@router.post("/goals")
+async def goals_create(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+    body: dict[str, Any] = Body(...),
+):
+    """Create or update a goal. Body keys:
+      id?            — update existing if set
+      project_name?  — null = global goal
+      kind           — 'lucro_liquido' | 'receita' | 'units' (default lucro)
+      target_amount  — required, positive number
+      period_type    — 'month' | 'quarter' | 'year' | 'custom' (default quarter)
+      period_start?  — ISO date, required when period_type=custom
+      period_end?    — ISO date, required when period_type=custom
+      currency       — default 'BRL'
+      notes?         — free text
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    await goals_svc.ensure_schema(pool)
+
+    target = (body or {}).get("target_amount")
+    try:
+        target_f = float(target)
+    except (TypeError, ValueError):
+        return {"error": "target_amount_required_positive_number"}
+    if target_f <= 0:
+        return {"error": "target_amount_must_be_positive"}
+
+    from datetime import date as _date
+    ps_str = (body or {}).get("period_start")
+    pe_str = (body or {}).get("period_end")
+    period_start = _date.fromisoformat(ps_str) if ps_str else None
+    period_end = _date.fromisoformat(pe_str) if pe_str else None
+
+    return await goals_svc.upsert_goal(
+        pool, user.id,
+        goal_id=body.get("id"),
+        project_name=body.get("project_name"),
+        kind=body.get("kind", "lucro_liquido"),
+        target_amount=target_f,
+        period_type=body.get("period_type", "quarter"),
+        period_start=period_start,
+        period_end=period_end,
+        currency=body.get("currency", "BRL"),
+        notes=body.get("notes"),
+    )
+
+
+@router.delete("/goals/{goal_id}")
+async def goals_delete(
+    goal_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Soft-delete (active=false)."""
+    if pool is None:
+        return {"error": "no_db"}
+    return await goals_svc.deactivate_goal(pool, user.id, goal_id)
 
 
 @router.post("/_admin/trigger-cron")

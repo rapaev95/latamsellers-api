@@ -626,6 +626,11 @@ async def _v2_startup() -> None:
             await ml_anomalies_svc.ensure_schema(pool)
         except Exception as err:  # noqa: BLE001
             _ml_log.exception("ml_anomalies schema bootstrap failed: %s", err)
+        try:
+            from v2.services import goals as _goals_svc
+            await _goals_svc.ensure_schema(pool)
+        except Exception as err:  # noqa: BLE001
+            _ml_log.exception("goals schema bootstrap failed: %s", err)
 
     # Spin up the headless Chromium used by /escalar/positions scraper.
     # Failure here is logged but non-fatal — the scraper self-heals on first use.
