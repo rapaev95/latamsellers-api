@@ -14,7 +14,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Optional
 
 import asyncpg
 import httpx
@@ -225,6 +225,7 @@ ON CONFLICT (user_id, notice_id) DO UPDATE SET
 
 async def _enrich_order_with_margin(
     conn: asyncpg.Connection, user_id: int, enriched: dict, period_months: int = 3,
+    pool: Optional[asyncpg.Pool] = None,
 ) -> None:
     """Injects `_margin` (apply_hypothetical_price от sale_price) в order payload.
 
@@ -232,8 +233,13 @@ async def _enrich_order_with_margin(
     нет item_id / unit_price — просто не инжектит, normalize-ветка покажет
     «Margem indisponível». Для SMART/auto-activated promotions accept этот
     block не нужен — это только для orders_v2 уведомлений.
+
+    Также инжектит `_breakeven` — state break-even tracker'а после этой
+    продажи (cumulative variable margin + target + breakeven_reached). Это
+    показывается в TG normalize как "📈 Прогресс месяца".
     """
     from . import ml_item_margin as ml_margin_svc
+    from . import ml_breakeven as breakeven_svc
 
     items_arr = enriched.get("order_items") or enriched.get("items") or []
     if not items_arr:
@@ -280,16 +286,66 @@ async def _enrich_order_with_margin(
         enriched["_margin"] = recomputed
     except Exception as err:  # noqa: BLE001
         log.debug("margin recompute failed for %s: %s", item_id, err)
+        return
+
+    # Break-even tracker: добавить эту продажу в cumulative проекта/месяца.
+    # Project определяется из margin payload (тот же что в /escalar/products).
+    project = recomputed.get("project") or payload.get("project")
+    if not project:
+        return
+    unit = recomputed.get("unit") or {}
+    profit_variable = unit.get("profit_variable")
+    qty = 1
+    try:
+        qty = int(first.get("quantity") or 1)
+    except (TypeError, ValueError):
+        qty = 1
+    if profit_variable is None:
+        return
+    try:
+        total_profit_var = float(profit_variable) * qty
+    except (TypeError, ValueError):
+        return
+
+    # parse sale date (BRT) для year_month identification.
+    from datetime import datetime as _dt
+    sale_dt: Optional[_dt] = None
+    raw_dt = enriched.get("date_created") or enriched.get("last_updated")
+    if raw_dt:
+        try:
+            sale_dt = _dt.fromisoformat(str(raw_dt).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            sale_dt = None
+
+    if pool is None:
+        return  # без pool не можем — graceful skip
+    try:
+        await breakeven_svc.ensure_schema(pool)
+        be_state = await breakeven_svc.add_sale_and_check_breakeven(
+            pool, user_id, str(project), total_profit_var, sale_dt,
+        )
+        if be_state:
+            enriched["_breakeven"] = be_state
+    except Exception as err:  # noqa: BLE001
+        log.debug("breakeven update failed for project=%s: %s", project, err)
 
 
-async def _upsert_batch(conn: asyncpg.Connection, user_id: int, items: list[tuple[str, str | None, dict]]) -> int:
+async def _upsert_batch(
+    conn: asyncpg.Connection,
+    user_id: int,
+    items: list[tuple[str, str | None, dict]],
+    pool: Optional[asyncpg.Pool] = None,
+) -> int:
     saved = 0
     for topic, resource, enriched in items:
         # For orders — pre-enrich with cached unit margin (apply_hypothetical_price
         # at sale_price) so normalize-ветка orders_v2 рисует profit/breakdown.
+        # `pool` нужен enricher'у для вторичного pool.acquire() в breakeven
+        # tracker'е (не можем reuse `conn` потому что он внутри transaction'а
+        # caller'а — `add_sale_and_check_breakeven` делает свой commit).
         if topic in ("orders_v2", "orders"):
             try:
-                await _enrich_order_with_margin(conn, user_id, enriched)
+                await _enrich_order_with_margin(conn, user_id, enriched, pool=pool)
             except Exception as err:  # noqa: BLE001
                 log.debug("enrich order margin failed: %s", err)
         try:
@@ -374,7 +430,7 @@ async def backfill_user(
     saved = 0
     if batch:
         async with pool.acquire() as conn:
-            saved = await _upsert_batch(conn, user_id, batch)
+            saved = await _upsert_batch(conn, user_id, batch, pool=pool)
 
     log.info("backfill user=%s days=%s fetched=%s saved=%s", user_id, days, fetched, saved)
     return {"user_id": user_id, "fetched": fetched, "saved": saved}

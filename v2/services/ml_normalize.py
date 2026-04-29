@@ -96,8 +96,19 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
         # Если нет — оставляем legacy формат (только Produto / Comprador / Pack).
         margin = enriched.get("_margin") or {}
         unit = (margin.get("unit") or {}) if isinstance(margin, dict) else {}
-        unit_profit = unit.get("profit_per_unit")
-        unit_margin_pct = unit.get("margin_pct")
+        # Сессия B/C: предпочитаем true variable margin вместо legacy net.
+        # profit_variable = price - (cogs + ml_fee + envios + das)
+        # margin_variable_pct — true per-sale economics («стоит ли продавать»).
+        # legacy profit_per_unit / margin_pct включают fulfillment+armaz —
+        # сохранены для back-compat но в TG показываем variable как primary.
+        profit_variable_pu = unit.get("profit_variable")
+        margin_variable_pct = unit.get("margin_variable_pct")
+        # Net (после fixed overhead allocation) — second-tier metric.
+        profit_net_pu = unit.get("profit_net_per_unit")
+        margin_net_pct = unit.get("margin_net_pct")
+        # Fallback на legacy если variable не доступен (старый cache).
+        unit_profit = profit_variable_pu if profit_variable_pu is not None else unit.get("profit_per_unit")
+        unit_margin_pct = margin_variable_pct if margin_variable_pct is not None else unit.get("margin_pct")
 
         desc_lines: list[str] = []
         if item_title:
@@ -111,16 +122,18 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
             desc_lines.append(f"Pack #{pack_id}")
 
         # Profit / margin block (когда _margin доступен из enricher).
+        # Показываем VARIABLE margin (true per-sale) как primary — это
+        # «стоит ли продавать ЭТУ единицу». Net margin (после overhead)
+        # отображается только в P&L reports, не в TG.
         if unit_profit is not None and qty > 0 and sale_price > 0:
-            total_profit = float(unit_profit) * qty
+            total_profit_var = float(unit_profit) * qty
             margin_str = f"{unit_margin_pct}%" if unit_margin_pct is not None else "—"
             desc_lines.append("")
-            desc_lines.append(f"📊 *Lucro líquido: {_money(total_profit)}* ({margin_str})")
+            desc_lines.append(f"📊 *Margem variável: {margin_str} ({_money(total_profit_var)})*")
+            # Per-unit breakdown — только variable costs (cogs+ml_fee+envios+das).
             cogs_pu = unit.get("cogs_per_unit")
             ml_fee_pu = unit.get("ml_fee_per_unit")
             envios_pu = unit.get("envios_per_sale")
-            ful_pu = unit.get("fulfillment_per_sale")
-            armaz_pu = unit.get("armaz_per_unit")
             das_pu = unit.get("das_per_unit")
             das_rate = unit.get("das_rate")
             cost_lines: list[str] = []
@@ -130,12 +143,7 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                 cost_lines.append(f"   • Tarifa ML: {_money(float(ml_fee_pu) * qty)}")
             if envios_pu is not None and float(envios_pu) > 0:
                 cost_lines.append(f"   • Envios: {_money(float(envios_pu) * qty)}")
-            if ful_pu is not None and float(ful_pu) > 0:
-                cost_lines.append(f"   • Fulfillment: {_money(float(ful_pu) * qty)}")
-            if armaz_pu is not None and float(armaz_pu) > 0:
-                cost_lines.append(f"   • Armazenagem: {_money(float(armaz_pu) * qty)}")
             if das_pu is not None and float(das_pu) > 0:
-                # das_rate в кэше — это уже EFFECTIVE ставка от compute_das.
                 if das_rate is not None and float(das_rate) > 0:
                     pct = float(das_rate) * 100
                     cost_lines.append(f"   • DAS ({pct:.2f}% efetivo): {_money(float(das_pu) * qty)}")
@@ -144,7 +152,66 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
             desc_lines.extend(cost_lines)
             if unit_margin_pct is not None and float(unit_margin_pct) < 0:
                 desc_lines.append("")
-                desc_lines.append("⚠ *Esta venda foi negativa* — preço abaixo do custo")
+                desc_lines.append("⚠ *Esta venda é negativa* — preço abaixo do custo variável")
+
+            # ── Break-even progress block (Сессия C) ────────────────────
+            # _breakeven инжектится ml_backfill._enrich_order_with_margin
+            # после увеличения cumulative variable margin за этот месяц.
+            # Показывает прогресс окупаемости fixed costs проекта.
+            be = enriched.get("_breakeven") or {}
+            if be:
+                target = float(be.get("target_total") or 0.0)
+                cumulative = float(be.get("cumulative") or 0.0)
+                sales_n = int(be.get("sales_count") or 0)
+                breakeven_at = be.get("breakeven_reached_at")
+                just_reached = bool(be.get("just_reached"))
+                net_after = float(be.get("net_profit_after_breakeven") or 0.0)
+                project_id_be = str(be.get("project_id") or "")
+
+                desc_lines.append("")
+                if breakeven_at and not just_reached:
+                    # Уже окупились ранее в этом месяце.
+                    desc_lines.append(
+                        f"🎉 *Já cobriu fixos do mês ({project_id_be})*: "
+                        f"R$ {net_after:,.2f} de lucro líquido em {sales_n} vendas"
+                        .replace(",", "X").replace(".", ",").replace("X", ".")
+                    )
+                elif just_reached:
+                    # Эта продажа достигла break-even.
+                    desc_lines.append(
+                        f"🎉 *Break-even alcançado!* Custos fixos R$ {target:,.2f} cobertos."
+                        .replace(",", "X").replace(".", ",").replace("X", ".")
+                    )
+                    if net_after > 0:
+                        desc_lines.append(
+                            f"💎 Excedente: R$ {net_after:,.2f} (lucro líquido depois de cobrir fixos)"
+                            .replace(",", "X").replace(".", ",").replace("X", ".")
+                        )
+                elif target > 0:
+                    # До break-even ещё далеко.
+                    pct = (cumulative / target * 100) if target > 0 else 0
+                    pct = max(0.0, min(100.0, pct))
+                    # ASCII progress bar 10 chars.
+                    filled = int(round(pct / 10))
+                    bar = "█" * filled + "░" * (10 - filled)
+                    remaining = max(0.0, target - cumulative)
+                    avg_per_sale = cumulative / sales_n if sales_n > 0 else 0.0
+                    # Estimate sales_to_breakeven based on running average.
+                    if avg_per_sale > 0 and remaining > 0:
+                        sales_left_est = max(1, int(round(remaining / avg_per_sale)))
+                        eta_str = f" · ≈{sales_left_est} vendas"
+                    else:
+                        eta_str = ""
+                    desc_lines.append(
+                        f"⚙️ *Break-even {project_id_be}* {bar} {pct:.0f}%"
+                    )
+                    desc_lines.append(
+                        (
+                            f"   Cobertos R$ {cumulative:,.2f} / R$ {target:,.2f} · "
+                            f"faltam R$ {remaining:,.2f}{eta_str}"
+                        ).replace(",", "X").replace(".", ",").replace("X", ".")
+                    )
+                # Если target=0 — нет fixed costs, не показываем progress.
         elif sale_price > 0 and item_id:
             # Margin не подсчитан. Причины: либо unit_cost_brl пуст в каталоге
             # (тогда заполнить через sku-mapping), либо ml_item_margin_cache
