@@ -329,25 +329,25 @@ async def refresh_for_period(
     log.info("orders refresh user=%s seller=%s window=[%s..%s] pages=%s fetched=%s saved=%s",
              user_id, seller_id, start_dt.date(), end_date_brt, pages, fetched, saved)
 
-    # Hook: после refresh — пробуем разослать TG-уведомления для свежих
-    # заказов которых ещё не было в БД (notified_at IS NULL). Backfill orders
-    # уже помечены NOW() в _upsert_order, так что в выборку не попадут.
-    try:
-        notify_stats = await dispatch_pending_sales(pool, user_id)
-    except Exception as err:  # noqa: BLE001
-        log.warning("dispatch_pending_sales user=%s failed: %s", user_id, err)
-        notify_stats = {"error": str(err)}
+    # NB: ранее тут был hook на dispatch_pending_sales (отдельный topic='sales'
+    # уведомления). Удалён в пользу обогащения existing topic='orders_v2' ветки
+    # в ml_normalize — backfill / webhook уже шлют TG-уведомление с
+    # «Nova venda», задача — добавить туда profit/breakdown/buttons, а не
+    # дублировать ещё одно уведомление.
 
     return {
         "fetched": fetched, "saved": saved, "pages": pages,
         "window_from": start_dt.isoformat(), "window_to": end_dt.isoformat(),
-        "notify": notify_stats,
     }
 
 
-# ── Per-sale TG dispatch ──────────────────────────────────────────────────────
+# ── Per-sale TG dispatch (DELETED) ────────────────────────────────────────────
+# Раньше тут был dispatch_pending_sales — отдельный канал TG-уведомлений по
+# topic='sales'. Удалено в пользу обогащения existing topic='orders_v2' (см.
+# ml_normalize.normalize_event и ml_backfill._upsert_batch). Один канал →
+# нет дублирования.
 
-async def dispatch_pending_sales(
+async def _DELETED_dispatch_pending_sales(
     pool: asyncpg.Pool,
     user_id: int,
     *,

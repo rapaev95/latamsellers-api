@@ -223,9 +223,75 @@ ON CONFLICT (user_id, notice_id) DO UPDATE SET
 """
 
 
+async def _enrich_order_with_margin(
+    conn: asyncpg.Connection, user_id: int, enriched: dict, period_months: int = 3,
+) -> None:
+    """Injects `_margin` (apply_hypothetical_price от sale_price) в order payload.
+
+    Mutates `enriched` in-place. Без модификации БД. Если cache empty или
+    нет item_id / unit_price — просто не инжектит, normalize-ветка покажет
+    «Margem indisponível». Для SMART/auto-activated promotions accept этот
+    block не нужен — это только для orders_v2 уведомлений.
+    """
+    from . import ml_item_margin as ml_margin_svc
+
+    items_arr = enriched.get("order_items") or enriched.get("items") or []
+    if not items_arr:
+        return
+    first = items_arr[0] if isinstance(items_arr[0], dict) else None
+    if not first:
+        return
+    inner = first.get("item") if isinstance(first.get("item"), dict) else first
+    item_id = ""
+    if isinstance(inner, dict):
+        item_id = str(inner.get("id") or inner.get("mlb") or "").strip().upper()
+    if not item_id:
+        item_id = str(first.get("mlb") or "").strip().upper()
+    try:
+        sale_price = float(first.get("unit_price") or 0.0)
+    except (TypeError, ValueError):
+        sale_price = 0.0
+    if not item_id or sale_price <= 0:
+        return
+
+    # Inline-query (тот же что в get_cached_margin), потому что у нас уже
+    # есть conn. Это копия нескольких строк ради избегания двойного pool-acquire.
+    row = await conn.fetchrow(
+        """
+        SELECT payload, computed_at
+          FROM ml_item_margin_cache
+         WHERE user_id = $1 AND item_id = $2 AND period_months = $3
+        """,
+        user_id, item_id, period_months,
+    )
+    if not row:
+        return
+    payload = row["payload"]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:  # noqa: BLE001
+            return
+    if not isinstance(payload, dict):
+        return
+    payload["computed_at"] = row["computed_at"].isoformat() if row["computed_at"] else None
+    try:
+        recomputed = ml_margin_svc.apply_hypothetical_price(payload, sale_price)
+        enriched["_margin"] = recomputed
+    except Exception as err:  # noqa: BLE001
+        log.debug("margin recompute failed for %s: %s", item_id, err)
+
+
 async def _upsert_batch(conn: asyncpg.Connection, user_id: int, items: list[tuple[str, str | None, dict]]) -> int:
     saved = 0
     for topic, resource, enriched in items:
+        # For orders — pre-enrich with cached unit margin (apply_hypothetical_price
+        # at sale_price) so normalize-ветка orders_v2 рисует profit/breakdown.
+        if topic in ("orders_v2", "orders"):
+            try:
+                await _enrich_order_with_margin(conn, user_id, enriched)
+            except Exception as err:  # noqa: BLE001
+                log.debug("enrich order margin failed: %s", err)
         try:
             notice = ml_normalize.normalize_event(topic, resource, enriched)
         except Exception as err:  # noqa: BLE001
