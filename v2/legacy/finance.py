@@ -669,10 +669,13 @@ def compute_pnl(
     except Exception:
         retirada_data = {}
     retirada_envio_val = float(retirada_data.get("tarifa_envio", 0.0) or 0.0)
-    retirada_descarte_total = (
-        float(retirada_data.get("tarifa_descarte", 0.0) or 0.0)
-        + float(retirada_data.get("cogs_descarte", 0.0) or 0.0)
-    )
+    retirada_descarte_tarifa = float(retirada_data.get("tarifa_descarte", 0.0) or 0.0)
+    # COGS-descarte = списание инвентаря. Кэш ушёл когда покупали у поставщика —
+    # сама ретирада движения денег НЕ создаёт. Поэтому в operating_expenses
+    # (которые идут в op_profit и далее в cashflow.closing_balance) COGS-списания
+    # быть НЕ должно. Переносим его ниже черты: учитывается в net_profit вместе
+    # с обычным COGS проданных юнитов, но НЕ влияет на closing_balance.
+    retirada_descarte_cogs = float(retirada_data.get("cogs_descarte", 0.0) or 0.0)
     retirada_other_val = float(retirada_data.get("tarifa_other", 0.0) or 0.0)
 
     opex_items: list[tuple[str, float, str]] = [
@@ -689,20 +692,17 @@ def compute_pnl(
             retirada_envio_val,
             f"{envio_units} ед. вывезено на склад продавца, COGS не списан",
         ))
-    if retirada_descarte_total > 0:
+    if retirada_descarte_tarifa > 0:
         d_units = int(retirada_data.get("units_descarte", 0) or 0)
-        d_tarifa = float(retirada_data.get("tarifa_descarte", 0.0) or 0.0)
-        d_cogs = float(retirada_data.get("cogs_descarte", 0.0) or 0.0)
-        missing_count = len(retirada_data.get("missing_cost_skus") or [])
         ovr = int(retirada_data.get("overrides_applied", 0) or 0)
-        note_parts = [f"{d_units} ед. списано: тариф {d_tarifa:.2f} + COGS {d_cogs:.2f}"]
+        note_parts = [
+            f"{d_units} ед. списано — тариф ML за списание (cash event)",
+        ]
         if ovr:
             note_parts.append(f"{ovr} строк переопределены вручную")
-        if missing_count:
-            note_parts.append(f"{missing_count} SKU без cost (COGS не учтён, проверь каталог)")
         opex_items.append((
-            "Списание товара (тариф + COGS)",
-            retirada_descarte_total,
+            "Списание Full — тариф",
+            retirada_descarte_tarifa,
             "; ".join(note_parts),
         ))
     if retirada_other_val > 0:
@@ -785,7 +785,11 @@ def compute_pnl(
                 "mlb": sku_mlbs.get(sku, "") or "",
                 "units": int(qty),
             })
-    cogs_total = round(cogs_total, 2)
+    # Прибавляем COGS списанного инвентаря (descarte) к общему COGS — это
+    # реальная потеря для бухгалтерии (товар списан), но НЕ кэш-событие,
+    # поэтому в op_profit (= cashflow.op_profit_cash) это уже не входит.
+    # Включается только в net_profit и Balance.accumulated_profit.
+    cogs_total = round(cogs_total + retirada_descarte_cogs, 2)
     net_profit = round(operating_profit - cogs_total, 2)
 
     margin = (net_profit / revenue_net * 100) if revenue_net else 0.0
