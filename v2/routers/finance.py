@@ -20,6 +20,7 @@ from v2.deps import CurrentUser, current_user
 from v2.legacy import db_storage as legacy_db
 from v2.legacy import config as legacy_config
 from v2.services import finance_cache
+from v2.services import bank_balances as bank_balances_svc
 from v2.schemas.finance import (
     ProjectsListOut, ReportsBundleOut,
     SkuMappingOut, SkuBulkSaveIn, SkuBulkSaveOut,
@@ -1975,6 +1976,125 @@ async def save_bank_transactions_grouped(
 
     db_save(_grouped_overrides_key(source_key), current)
     return {"saved": saved, "total_overrides": len(current)}
+
+
+# ── Bank balance anchors (manual + reconciliation) ──────────────────────────
+
+
+@router.get("/bank-balances")
+async def get_bank_balance(
+    source_key: str = Query(..., description="extrato_nubank | extrato_mp | extrato_c6_brl | extrato_c6_usd"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Active balance anchor for one bank + reconciliation against parsed
+    statements. Returns:
+      anchor: {balance, currency, balance_date, notes, ...} | null
+      reconciliation: {expected_balance, txn_sum_after, txn_count_after, ...} | null
+      history: [...]
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    if source_key not in _BANK_SOURCES:
+        raise HTTPException(status_code=400, detail="unsupported_source")
+    _bind_user(user)
+    await bank_balances_svc.ensure_schema(pool)
+
+    anchor = await bank_balances_svc.get_active(pool, user.id, source_key)
+    history = await bank_balances_svc.list_history(pool, user.id, source_key, limit=10)
+
+    reconciliation: Optional[dict[str, Any]] = None
+    if anchor:
+        # Re-parse all uploads for this bank and reconcile against the anchor
+        from v2.legacy.bank_tx import parse_bank_tx_bytes
+
+        files = await uploads_storage.fetch_files_by_source(pool, user.id, source_key)
+        merged: list[dict[str, Any]] = []
+        seen_hashes: set[str] = set()
+        for f in files:
+            for r in parse_bank_tx_bytes(source_key, f.file_bytes):
+                h = r.get("tx_hash") or ""
+                if h and h in seen_hashes:
+                    continue
+                if h:
+                    seen_hashes.add(h)
+                merged.append(r)
+
+        try:
+            recorded_date = date.fromisoformat(anchor["balance_date"])
+        except (TypeError, ValueError):
+            recorded_date = None
+        if recorded_date:
+            reconciliation = bank_balances_svc.reconcile(
+                recorded_balance=anchor["balance"],
+                recorded_date=recorded_date,
+                rows=merged,
+            )
+
+    return {
+        "source_key": source_key,
+        "currency": bank_balances_svc.CURRENCY_BY_BANK.get(source_key, "BRL"),
+        "anchor": anchor,
+        "reconciliation": reconciliation,
+        "history": history,
+    }
+
+
+@router.post("/bank-balances")
+async def post_bank_balance(
+    body: dict[str, Any],
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Set a new anchor balance for a bank.
+
+    Body: { source_key, balance: number, balance_date: 'YYYY-MM-DD', notes?: str }
+    The previous active anchor is superseded (history kept).
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    _bind_user(user)
+    await bank_balances_svc.ensure_schema(pool)
+
+    source_key = (body or {}).get("source_key")
+    if source_key not in _BANK_SOURCES:
+        return {"error": "unsupported_source", "source_key": source_key}
+
+    raw_balance = (body or {}).get("balance")
+    try:
+        balance = float(raw_balance)
+    except (TypeError, ValueError):
+        return {"error": "balance_required_number"}
+
+    raw_date = (body or {}).get("balance_date")
+    try:
+        balance_date = date.fromisoformat(str(raw_date))
+    except (TypeError, ValueError):
+        return {"error": "balance_date_required_iso"}
+
+    return await bank_balances_svc.upsert_balance(
+        pool, user.id,
+        source_key=source_key,
+        balance=balance,
+        balance_date=balance_date,
+        currency=(body or {}).get("currency"),
+        notes=(body or {}).get("notes"),
+    )
+
+
+@router.delete("/bank-balances")
+async def delete_bank_balance(
+    source_key: str = Query(...),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Clear the active anchor — leaves history intact."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    if source_key not in _BANK_SOURCES:
+        raise HTTPException(status_code=400, detail="unsupported_source")
+    _bind_user(user)
+    return await bank_balances_svc.delete_balance(pool, user.id, source_key)
 
 
 # ── Onboarding Wizard (Phase 6) ─────────────────────────────────────────────
