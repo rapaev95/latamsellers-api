@@ -25,10 +25,16 @@ def detect_source(filename: str, file_bytes: bytes = b"") -> Optional[str]:
 
 
 def detect_source_from_filename(filename: str) -> Optional[str]:
-    """Return the matching `source_key` for a given filename, or None if unknown."""
+    """Return the matching `source_key` for a given filename, or None if unknown.
+
+    Brazilian ML downloads come in two shapes — with spaces (`Relatorio Tarifas
+    Full Abril.xlsx`, the default in the web UI) and with underscores (the
+    same file after a rename / API export). Lowercased name is normalised
+    so checks like `"tarifas_full" in fname` match both.
+    """
     if not filename:
         return None
-    fname = filename.lower()
+    fname = filename.lower().replace(" ", "_")
 
     # Vendas / order-feed reports (check before "mercado" so Account Statement doesn't win)
     if ("vendas" in fname or "ventas" in fname) and ("mercado" in fname or "mercado_li" in fname):
