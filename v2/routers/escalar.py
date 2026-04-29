@@ -2644,7 +2644,8 @@ async def user_promotions_raw_debug(
     except Exception as err:  # noqa: BLE001
         return {"error": "bind_failed", "detail": str(err), "trace": _tb.format_exc()[-500:]}
 
-    # 1. Что у нас в БД.
+    # 1. Что у нас в БД (только реально существующие колонки —
+    # meli/seller_percentage не сохраняются в schema, они в raw JSON).
     db_row = None
     try:
         async with pool.acquire() as conn:
@@ -2652,8 +2653,8 @@ async def user_promotions_raw_debug(
                 """
                 SELECT promotion_id, promotion_type, sub_type, status, offer_id,
                        original_price, deal_price, discount_percentage,
-                       meli_percentage, seller_percentage, fetched_at,
-                       start_date, finish_date, accepted_at, dismissed_at
+                       fetched_at, start_date, finish_date,
+                       accepted_at, dismissed_at, raw
                   FROM ml_user_promotions
                  WHERE user_id = $1 AND item_id = $2 AND promotion_id = $3
                 """,
@@ -2664,6 +2665,12 @@ async def user_promotions_raw_debug(
             for k, v in list(db_row.items()):
                 if hasattr(v, "isoformat"):
                     db_row[k] = v.isoformat()
+            # raw — это JSONB, может прийти как str или dict.
+            if isinstance(db_row.get("raw"), str):
+                try:
+                    db_row["raw"] = json.loads(db_row["raw"])
+                except Exception:  # noqa: BLE001
+                    pass
     except Exception as err:  # noqa: BLE001
         return {"error": "db_query_failed", "detail": str(err), "trace": _tb.format_exc()[-500:]}
 
