@@ -48,6 +48,22 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
     if topic in ("orders_v2", "orders"):
         total = enriched.get("total_amount") or enriched.get("paid_amount") or enriched.get("transaction_amount")
         status = str(enriched.get("status") or "unknown")
+        # Skip cancelled/invalid — это не реальная продажа, бесполезный TG-noise.
+        # ml_notices хранит запись для аналитики, но label/description короткий
+        # без кнопок (telegram_notify не отправит keyboard если sale_price = 0).
+        if status.lower() in ("cancelled", "invalid"):
+            permalink_x = (
+                f"https://www.mercadolivre.com.br/vendas/{enriched.get('id')}/detalhe"
+                if enriched.get("id") else ""
+            )
+            return {
+                **base,
+                "label": f"Pedido cancelado {_brl(total)}",
+                "description": "Status: cancelado / inválido — não conta como venda.",
+                "from_date": enriched.get("date_created") or enriched.get("last_updated"),
+                "tags": ["ORDERS", "CANCELLED"],
+                "actions": [{"label": "Ver pedido", "url": permalink_x}] if permalink_x else [],
+            }
         order_items = enriched.get("order_items") or enriched.get("items") or []
         first = (order_items[0] or {}) if order_items else {}
         # Поддерживаем оба shape: ml_backfill использует {item: {...}, quantity, unit_price};
@@ -130,9 +146,15 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                 desc_lines.append("")
                 desc_lines.append("⚠ *Esta venda foi negativa* — preço abaixo do custo")
         elif sale_price > 0 and item_id:
-            # Margin не подсчитан — намек заполнить cost.
+            # Margin не подсчитан. Причины: либо unit_cost_brl пуст в каталоге
+            # (тогда заполнить через sku-mapping), либо ml_item_margin_cache
+            # пуст для этого item (refresh runs nightly — новые SKU могут
+            # ждать до следующего refresh).
             desc_lines.append("")
-            desc_lines.append("📊 Margem indisponível — preencha custo do produto em /finance/sku-mapping")
+            desc_lines.append(
+                f"📊 Margem indisponível ({item_id}) — preencha custo "
+                f"em /finance/sku-mapping ou aguarde refresh noturno"
+            )
 
         permalink = (
             f"https://www.mercadolivre.com.br/vendas/{enriched.get('id')}/detalhe"

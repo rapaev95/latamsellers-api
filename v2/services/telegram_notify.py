@@ -298,6 +298,13 @@ async def send_notice(
         log.warning("TELEGRAM_BOT_TOKEN not set — cannot send notice %s", notice.get("notice_id"))
         return False
 
+    # Filter cancelled/invalid orders — TG-noise. Запись в ml_notices остаётся
+    # для аналитики, но в Telegram не отправляется.
+    tags = notice.get("tags") or []
+    if isinstance(tags, list) and "CANCELLED" in tags:
+        log.info("send_notice skipping cancelled %s", notice.get("notice_id"))
+        return False
+
     label = notice.get("label") or ""
     description = notice.get("description") or ""
 
