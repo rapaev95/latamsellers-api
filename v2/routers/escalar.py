@@ -2621,6 +2621,89 @@ async def refresh_user_promotions(
 # Auth is by INTERNAL_API_TOKEN (env, shared with Next.js) since cookie auth
 # isn't available from Telegram's webhook context.
 
+
+@router.get("/user-promotions/raw-debug")
+async def user_promotions_raw_debug(
+    item_id: str = Query(..., min_length=1, description="MLB id"),
+    promotion_id: str = Query(..., min_length=1, description="Promotion id"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Diagnostic: показывает что в БД для этой promo + что ML отдаёт сейчас.
+
+    Используется когда accept падает с `Offer id is required` или похожим —
+    видно есть ли offer_id в текущем кэше и в свежем response от ML, чтобы
+    понять надо ли менять _upsert_offer или нет.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    _bind_user(user)
+    mlb = item_id.upper().strip()
+
+    # 1. Что у нас в БД.
+    db_row = None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT promotion_id, promotion_type, sub_type, status, offer_id,
+                   original_price, deal_price, discount_percentage,
+                   meli_percentage, seller_percentage, fetched_at,
+                   start_date, finish_date, accepted_at, dismissed_at
+              FROM ml_user_promotions
+             WHERE user_id = $1 AND item_id = $2 AND promotion_id = $3
+            """,
+            user.id, mlb, promotion_id.strip(),
+        )
+        if row:
+            db_row = dict(row)
+            for k, v in list(db_row.items()):
+                if hasattr(v, "isoformat"):
+                    db_row[k] = v.isoformat()
+
+    # 2. Что ML отдаёт сейчас (raw, без обработки).
+    fresh = None
+    fresh_err = None
+    try:
+        token, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+        url = f"https://api.mercadolibre.com/seller-promotions/items/{mlb}?app_version=v2"
+        async with httpx.AsyncClient() as http:
+            r = await http.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15.0,
+            )
+        fresh = {
+            "status": r.status_code,
+            "body": r.json() if r.status_code == 200 else r.text[:500],
+        }
+    except Exception as err:  # noqa: BLE001
+        fresh_err = str(err)
+
+    # 3. Подобрать matching offer из raw response по promotion_id.
+    matching_offer: Optional[dict] = None
+    if isinstance(fresh, dict) and isinstance(fresh.get("body"), list):
+        for o in fresh["body"]:
+            if isinstance(o, dict) and str(o.get("id") or o.get("promotion_id") or "") == promotion_id.strip():
+                matching_offer = o
+                break
+
+    return {
+        "user_id": user.id,
+        "item_id": mlb,
+        "promotion_id": promotion_id.strip(),
+        "db": db_row,
+        "ml_fresh": fresh,
+        "ml_fresh_error": fresh_err,
+        "matching_offer_in_fresh": matching_offer,
+        "hint": (
+            "Проверь поле 'offer_id' в db и в matching_offer_in_fresh. "
+            "Если в БД None но в fresh есть — нужно re-upsert. "
+            "Если в fresh тоже None для этого type — ML формирует offer_id "
+            "только при отдельном request, нужен другой flow accept."
+        ),
+    }
+
+
 class _ItemPriceShiftIn(__import__("pydantic").BaseModel):
     """Сдвиг цены листинга на ±X% — для per-sale TG-кнопок «Поднять/Опустить»."""
     user_id: int
