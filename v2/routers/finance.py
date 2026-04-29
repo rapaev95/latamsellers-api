@@ -13,7 +13,7 @@ import contextvars
 from datetime import date, datetime
 from typing import Any, Callable, Optional, TypeVar
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, Response, UploadFile
 
 from v2.db import get_pool
 from v2.deps import CurrentUser, current_user
@@ -2082,6 +2082,144 @@ async def save_bank_transactions_grouped(
 
     db_save(_grouped_overrides_key(source_key), current)
     return {"saved": saved, "total_overrides": len(current)}
+
+
+# ── Upload source-key diagnostic + re-detect ────────────────────────────────
+# Filename auto-detect rules evolved over time (e.g. fix(uploads): handle
+# spaces in ML export names); old uploads stayed in the DB with their
+# original — sometimes wrong — source_key, so loaders silently skipped them.
+# These endpoints let the user see the mismatch and fix it without
+# re-uploading the file.
+
+
+@router.get("/uploads/source-debug")
+async def uploads_source_debug(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """List every uploaded file with its stored source_key and what the
+    current detector would assign now. Mismatches surface as `would_be`
+    being different from `current`.
+
+    Returns:
+      {
+        "uploads": [{id, filename, current, would_be, mismatch}, ...],
+        "summary_by_source": {<source_key>: count, ...},
+        "mismatches": <int>,
+      }
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    from v2.legacy.source_detection import detect_source_from_filename
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, filename, source_key, content_sha256,
+                   to_char(created_at AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+              FROM uploads
+             WHERE user_id = $1 AND file_bytes IS NOT NULL
+             ORDER BY created_at DESC
+            """,
+            user.id,
+        )
+
+    out: list[dict[str, Any]] = []
+    summary: dict[str, int] = {}
+    mismatches = 0
+    for r in rows:
+        current = r["source_key"] or ""
+        detected = detect_source_from_filename(r["filename"]) or ""
+        is_mismatch = bool(detected and detected != current)
+        if is_mismatch:
+            mismatches += 1
+        summary[current or "(empty)"] = summary.get(current or "(empty)", 0) + 1
+        out.append({
+            "id": r["id"],
+            "filename": r["filename"],
+            "current": current,
+            "would_be": detected,
+            "mismatch": is_mismatch,
+            "created_at": r["created_at"],
+        })
+
+    return {
+        "uploads": out,
+        "summary_by_source": summary,
+        "total_uploads": len(out),
+        "mismatches": mismatches,
+    }
+
+
+@router.post("/uploads/source-fix")
+async def uploads_source_fix(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+    body: dict[str, Any] = Body(default={}),
+) -> dict[str, Any]:
+    """Re-run filename auto-detect for every upload owned by the user and
+    update `source_key` where the new detector returns a different value.
+
+    Body (optional):
+      ids: list[int]  — only fix these specific uploads (default: all)
+      dry_run: bool   — return planned changes without writing (default false)
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    from v2.legacy.source_detection import detect_source_from_filename
+
+    only_ids = (body or {}).get("ids")
+    dry_run = bool((body or {}).get("dry_run"))
+
+    async with pool.acquire() as conn:
+        if only_ids and isinstance(only_ids, list):
+            rows = await conn.fetch(
+                """
+                SELECT id, filename, source_key
+                  FROM uploads
+                 WHERE user_id = $1 AND id = ANY($2::int[])
+                """,
+                user.id, [int(x) for x in only_ids if isinstance(x, (int, str)) and str(x).isdigit()],
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT id, filename, source_key
+                  FROM uploads
+                 WHERE user_id = $1 AND file_bytes IS NOT NULL
+                """,
+                user.id,
+            )
+
+        plan: list[dict[str, Any]] = []
+        for r in rows:
+            old = r["source_key"] or ""
+            new = detect_source_from_filename(r["filename"]) or ""
+            if not new or new == old:
+                continue
+            plan.append({
+                "id": r["id"],
+                "filename": r["filename"],
+                "old": old,
+                "new": new,
+            })
+
+        if not dry_run and plan:
+            async with conn.transaction():
+                for entry in plan:
+                    await conn.execute(
+                        "UPDATE uploads SET source_key = $1 WHERE id = $2 AND user_id = $3",
+                        entry["new"], entry["id"], user.id,
+                    )
+
+    return {
+        "dry_run": dry_run,
+        "scanned": len(rows),
+        "fixed_count": 0 if dry_run else len(plan),
+        "would_fix_count": len(plan) if dry_run else 0,
+        "changes": plan,
+    }
 
 
 # ── Bank balance anchors (manual + reconciliation) ──────────────────────────
