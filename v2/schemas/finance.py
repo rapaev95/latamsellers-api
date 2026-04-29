@@ -872,3 +872,40 @@ class APListOut(BaseModel):
     as_of: str                               # ISO YYYY-MM-DD
     items: list[PlannedPayment] = []
     total_brl: float = 0
+
+
+# ── Manual external USD inflows (Phase 3 câmbio) ─────────────────────────────
+#
+# User-entered records of BRL→USD conversions that don't go through C6 (Bybit
+# USDT cash-out, CALIZA-Nubank, custom transfers, etc). Fed into the same FIFO
+# inventory as paired C6 entradas — see `v2/services/cambio.py:compute_for_user`.
+
+class ManualInflowIn(BaseModel):
+    """Body for POST/PUT /finance/manual-usd-inflows[/id]."""
+    date: str                                # ISO YYYY-MM-DD
+    usd_received: float = Field(..., gt=0)
+    brl_paid: float = Field(..., gt=0)
+    source: str = "Manual"
+    note: str = ""
+
+
+class ManualInflowOut(BaseModel):
+    id: int
+    date: str                                # ISO
+    usd_received: float
+    brl_paid: float
+    rate: float                              # computed: brl_paid / usd_received
+    source: str
+    note: str
+    created_at: str                          # ISO datetime
+    updated_at: str
+
+
+class ManualInflowsListOut(BaseModel):
+    items: list[ManualInflowOut] = []
+    # Allowed dropdown values — keeps UI in sync with backend constants.
+    source_options: list[str] = []
+    # Roll-up totals across the user's full inflow history.
+    total_usd: float = 0
+    total_brl: float = 0
+    avg_rate: Optional[float] = None

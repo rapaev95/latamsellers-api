@@ -33,6 +33,7 @@ import asyncpg
 
 from v2.legacy.bank_tx import parse_bank_tx_bytes
 from v2.legacy.db_storage import db_load
+from v2.storage import manual_usd_inflows as manual_inflows_svc
 from v2.storage import uploads_storage
 
 log = logging.getLogger(__name__)
@@ -366,6 +367,38 @@ def build_summary(
 
 # ── Public entry-point ──────────────────────────────────────────────────────
 
+async def _load_manual_inflows_as_pairs(pool: asyncpg.Pool, user_id: int) -> list[CambioPair]:
+    """Pull user-entered manual inflows (Bybit / CALIZA-Nubank / custom)
+    and project them onto the same CambioPair shape so the FIFO engine
+    treats C6-paired entradas and manual inflows uniformly.
+
+    Note: manual inflows have no separate BRL-row to pair with — the user
+    supplied both `usd_received` and `brl_paid` in one record. We synthesize
+    a tx_hash per inflow so `enrich_rows` can later link a row back to its
+    source manual entry if we ever surface that. C6 USD rows themselves
+    aren't paired against these — manual inflows just enlarge the FIFO
+    inventory pool, and saídas consume from oldest lot regardless of source.
+    """
+    rows = await manual_inflows_svc.list_for_user(pool, user_id)
+    pairs: list[CambioPair] = []
+    for r in rows:
+        if r.usd_received <= 0 or r.brl_paid <= 0:
+            continue
+        d_iso = r.date.isoformat()
+        pairs.append(CambioPair(
+            date_brl=d_iso,
+            date_usd=d_iso,
+            brl_paid=r.brl_paid,
+            usd_received=r.usd_received,
+            rate=r.brl_paid / r.usd_received,
+            source="manual",
+            note=f"{r.source}: {r.note}".strip(": "),
+            brl_tx_hash=f"manual:{r.id}",
+            usd_tx_hash=f"manual:{r.id}",
+        ))
+    return pairs
+
+
 async def compute_for_user(
     pool: asyncpg.Pool,
     user_id: int,
@@ -373,14 +406,24 @@ async def compute_for_user(
 ) -> CambioResult:
     """Build the full câmbio picture for one user.
 
-    Caller passes the C6 USD rows it already parsed (they're already in the
-    grouped-view response); we re-load only the C6 BRL side here. Phase 3 will
-    extend this to also pull manual external USD inflows from a new table and
-    feed them into the same `pairs` list.
+    Combines two sources of USD inflow into a single FIFO inventory:
+      1. C6 BRL fx-debits paired with C6 USD entradas (auto-detected pairs)
+      2. Manual external inflows from `manual_usd_inflows` table — Bybit USDT
+         cash-outs, CALIZA-Nubank direct transfers, custom câmbio events that
+         never touched C6.
+
+    Pairs are sorted chronologically before being pushed into the FIFO so the
+    "oldest first" consumption order spans both sources correctly.
     """
     brl_fx = await _load_c6_brl_fx_debits(pool, user_id)
     usd_entradas = _load_c6_usd_entradas(c6_usd_rows)
-    pairs, unm_brl, unm_usd = pair_brl_usd(brl_fx, usd_entradas)
+    c6_pairs, unm_brl, unm_usd = pair_brl_usd(brl_fx, usd_entradas)
+    manual_pairs = await _load_manual_inflows_as_pairs(pool, user_id)
+
+    # Combined inventory: C6 + manual, sorted by date so FIFO order is
+    # chronological across sources (a Bybit cash-out from March is older than
+    # a C6 entrada from April — should be consumed first).
+    pairs = sorted(c6_pairs + manual_pairs, key=lambda p: p.date_usd)
 
     # Saídas = absolute value of every C6 USD row with value < 0.
     saidas = [

@@ -46,8 +46,10 @@ from v2.schemas.finance import (
     LoanIn, LoanOut, LoansListOut, LoanMutOut,
     DividendIn, DividendOut, DividendsListOut, DividendMutOut,
     APListOut,
+    ManualInflowIn, ManualInflowOut, ManualInflowsListOut,
 )
 from v2.storage import uploads_storage
+from v2.storage import manual_usd_inflows as manual_inflows_svc
 
 router = APIRouter(prefix="/finance", tags=["finance"])
 
@@ -118,7 +120,7 @@ def _parse_iso(s: Optional[str]) -> Optional[date]:
 
 
 @router.get("/reports", response_model=ReportsBundleOut)
-def get_reports(
+async def get_reports(
     response: Response,
     project: str = Query(..., description="Project ID, e.g. 'GANZA'"),
     period_from: Optional[str] = Query(None, alias="from"),
@@ -126,6 +128,7 @@ def get_reports(
     basis: str = Query("accrual", pattern="^(accrual|cash)$"),
     fresh: bool = Query(False, description="Bypass cache and recompute from scratch"),
     user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
 ) -> dict[str, Any]:
     """Compute ОПиУ + ДДС + Баланс for one project + period in a single call.
 
@@ -208,6 +211,23 @@ def get_reports(
         if bal_res is not None: bundle["balance"] = _dataclass_to_dict(bal_res)
         if bal_err: bundle["balance_error"] = bal_err
         return bundle
+
+    # Pre-fetch every bank statement, parse it, apply user overrides
+    # (per-bank `f2_classifications_grouped_*` and per-upload
+    # `f2_classifications_*`), and stuff the merged list into a contextvar
+    # so the sync `aggregate_classified_by_project` inside compute_*
+    # can read it without touching the disk. This is the only way the
+    # production app sees user classifications — the disk path stayed
+    # broken on Railway because the FS is ephemeral.
+    if pool is not None:
+        try:
+            from v2.services import bank_classifications as _bank_cls
+            prefetched = await _bank_cls.prefetch_for_user(pool, user.id)
+            _bank_cls.set_prefetched(prefetched)
+        except Exception:  # noqa: BLE001
+            # Don't block the report on a prefetch failure — fall back to
+            # legacy disk path (which simply returns empty in production)
+            pass
 
     cache_key = f"reports:{project}:{pf.isoformat()}:{pt.isoformat()}:{basis}"
     # Don't cache partial / errored bundles — half-computed results would
@@ -2181,6 +2201,154 @@ async def delete_bank_balance(
         raise HTTPException(status_code=400, detail="unsupported_source")
     _bind_user(user)
     return await bank_balances_svc.delete_balance(pool, user.id, source_key)
+
+
+# ── Manual external USD inflows (Phase 3 câmbio) ─────────────────────────────
+# CRUD over the user's hand-entered BRL→USD conversion records (Bybit USDT,
+# CALIZA-Nubank direct, custom transfers — anything that doesn't go through
+# C6). Read by `v2/services/cambio.py:compute_for_user` and merged with
+# C6-paired entradas into a single FIFO inventory.
+
+# Same band as cambio.pair_brl_usd — out-of-range entries are usually a
+# unit mistake (R$ vs US$ swapped, missing decimal, etc.) and would distort
+# the FIFO costs. Reject loudly so the user notices.
+_MANUAL_INFLOW_RATE_MIN = 3.5
+_MANUAL_INFLOW_RATE_MAX = 8.0
+
+
+def _validate_inflow_payload(body: ManualInflowIn) -> tuple[date, float, float, str, str]:
+    """Parse + range-check a POST/PUT body. Raises HTTPException on invalid input.
+
+    Pulled out into a helper because the same checks apply to create and update,
+    and the error shapes need to be consistent so the UI can surface field-level
+    feedback.
+    """
+    try:
+        d = _parse_iso(body.date)
+    except Exception:  # noqa: BLE001
+        d = None
+    if d is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_date", "field": "date", "got": body.date},
+        )
+    # gt=0 already enforced at Pydantic level; rate range is the cross-field check.
+    rate = body.brl_paid / body.usd_received
+    if rate < _MANUAL_INFLOW_RATE_MIN or rate > _MANUAL_INFLOW_RATE_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "rate_out_of_range",
+                "rate": round(rate, 4),
+                "expected_range": [_MANUAL_INFLOW_RATE_MIN, _MANUAL_INFLOW_RATE_MAX],
+                "hint": "проверьте суммы — возможно перепутаны R$ и US$",
+            },
+        )
+    source = (body.source or "Manual").strip() or "Manual"
+    note = (body.note or "").strip()
+    return d, body.usd_received, body.brl_paid, source, note
+
+
+def _inflow_to_out(row: manual_inflows_svc.ManualInflow) -> dict[str, Any]:
+    """Dataclass → dict shaped for ManualInflowOut. Computes `rate` here so
+    the UI doesn't have to re-divide every render."""
+    return {
+        "id": row.id,
+        "date": row.date.isoformat(),
+        "usd_received": row.usd_received,
+        "brl_paid": row.brl_paid,
+        "rate": round(row.brl_paid / row.usd_received, 4),
+        "source": row.source,
+        "note": row.note,
+        "created_at": row.created_at.isoformat() if row.created_at else "",
+        "updated_at": row.updated_at.isoformat() if row.updated_at else "",
+    }
+
+
+@router.get("/manual-usd-inflows", response_model=ManualInflowsListOut)
+async def list_manual_inflows(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """List every manual inflow + roll-up totals + dropdown options."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    rows = await manual_inflows_svc.list_for_user(pool, user.id)
+    items = [_inflow_to_out(r) for r in rows]
+    total_usd = round(sum(r.usd_received for r in rows), 2)
+    total_brl = round(sum(r.brl_paid for r in rows), 2)
+    avg_rate = round(total_brl / total_usd, 4) if total_usd > 0 else None
+    return {
+        "items": items,
+        "source_options": list(manual_inflows_svc.SOURCE_OPTIONS),
+        "total_usd": total_usd,
+        "total_brl": total_brl,
+        "avg_rate": avg_rate,
+    }
+
+
+@router.post("/manual-usd-inflows", response_model=ManualInflowOut)
+async def create_manual_inflow(
+    body: ManualInflowIn,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Insert a new inflow. Validation: date parseable, amounts > 0, rate in
+    sane range. The Câmbio FIFO will pick it up on next /bank-transactions/grouped."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    d, usd, brl, source, note = _validate_inflow_payload(body)
+    row = await manual_inflows_svc.create(
+        pool,
+        user_id=user.id,
+        date=d,
+        usd_received=usd,
+        brl_paid=brl,
+        source=source,
+        note=note,
+    )
+    return _inflow_to_out(row)
+
+
+@router.put("/manual-usd-inflows/{inflow_id}", response_model=ManualInflowOut)
+async def update_manual_inflow(
+    inflow_id: int,
+    body: ManualInflowIn,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Replace all fields of an existing inflow owned by the caller."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    d, usd, brl, source, note = _validate_inflow_payload(body)
+    row = await manual_inflows_svc.update(
+        pool,
+        inflow_id=inflow_id,
+        user_id=user.id,
+        date=d,
+        usd_received=usd,
+        brl_paid=brl,
+        source=source,
+        note=note,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="inflow_not_found")
+    return _inflow_to_out(row)
+
+
+@router.delete("/manual-usd-inflows/{inflow_id}")
+async def delete_manual_inflow(
+    inflow_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Delete a manual inflow by id (caller must own it)."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    ok = await manual_inflows_svc.delete(pool, inflow_id=inflow_id, user_id=user.id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="inflow_not_found")
+    return {"deleted": True, "id": inflow_id}
 
 
 # ── Onboarding Wizard (Phase 6) ─────────────────────────────────────────────
