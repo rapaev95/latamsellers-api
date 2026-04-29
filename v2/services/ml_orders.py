@@ -71,12 +71,25 @@ CREATE TABLE IF NOT EXISTS ml_user_orders (
   tags JSONB,
   raw JSONB,                  -- full payload for debugging / future fields
   fetched_at TIMESTAMPTZ DEFAULT NOW(),
+  -- Per-sale TG notification tracking. NULL = ещё не нотифицирован, dispatcher
+  -- отправит. Чтобы при первой массовой загрузке истории НЕ спамить TG старыми
+  -- ордерами — refresh-функция marks all backfilled orders как уже
+  -- notified_at=fetched_at. Только реально новые сделки (date_created в окне
+  -- последних 24ч) проходят отдельный mark и попадают в очередь.
+  notified_at TIMESTAMPTZ,
   UNIQUE(user_id, order_id)
 );
 CREATE INDEX IF NOT EXISTS idx_ml_user_orders_user_date
   ON ml_user_orders(user_id, date_created DESC);
 CREATE INDEX IF NOT EXISTS idx_ml_user_orders_user_status
   ON ml_user_orders(user_id, status);
+-- Pending-dispatch index: pickup новых orders для TG (status passes filter).
+CREATE INDEX IF NOT EXISTS idx_ml_user_orders_pending_notify
+  ON ml_user_orders(user_id, date_created DESC)
+  WHERE notified_at IS NULL;
+
+-- Idempotent migration для existing deploy.
+ALTER TABLE ml_user_orders ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ;
 """
 
 
@@ -175,19 +188,38 @@ def _slim_items(order: dict) -> list[dict]:
 
 
 async def _upsert_order(conn: asyncpg.Connection, user_id: int, order: dict) -> None:
+    """Upsert ml_user_orders row.
+
+    Notify-tracking: только реально свежие orders (date_created в окне последних
+    24ч от now) идут с `notified_at = NULL` — они потом подхватятся диспатчером.
+    Старые orders (история, бэкфилл) сразу marked notified_at=NOW(), чтобы
+    при первой массовой загрузке за неделю/месяц TG-чат не получил 100+
+    устаревших уведомлений. Если order уже existed — оставляем notified_at
+    как было (не сбрасываем).
+    """
     order_id = order.get("id")
     if order_id is None:
         return
     items = _slim_items(order)
     buyer = order.get("buyer") or {}
+    date_created = _parse_dt(order.get("date_created"))
+    # Защита от спама: backfill orders помечаем как уже notified.
+    is_recent = False
+    if date_created is not None:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            is_recent = (now_utc - date_created.astimezone(timezone.utc)).total_seconds() < 86400
+        except Exception:  # noqa: BLE001
+            is_recent = False
+    initial_notified_at = None if is_recent else datetime.now(timezone.utc)
     await conn.execute(
         """
         INSERT INTO ml_user_orders
           (user_id, order_id, pack_id, date_created, date_closed,
            status, status_detail, total_amount, currency, buyer_id,
-           items, tags, raw, fetched_at)
+           items, tags, raw, fetched_at, notified_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11::jsonb, $12::jsonb, $13::jsonb, NOW())
+                $11::jsonb, $12::jsonb, $13::jsonb, NOW(), $14)
         ON CONFLICT (user_id, order_id) DO UPDATE SET
           pack_id = EXCLUDED.pack_id,
           date_created = EXCLUDED.date_created,
@@ -201,11 +233,12 @@ async def _upsert_order(conn: asyncpg.Connection, user_id: int, order: dict) -> 
           tags = EXCLUDED.tags,
           raw = EXCLUDED.raw,
           fetched_at = NOW()
+          -- ВАЖНО: notified_at НЕ обновляем — сохраняем существующее значение
         """,
         user_id,
         int(order_id),
         int(order["pack_id"]) if order.get("pack_id") else None,
-        _parse_dt(order.get("date_created")),
+        date_created,
         _parse_dt(order.get("date_closed")),
         order.get("status"),
         order.get("status_detail"),
@@ -215,6 +248,7 @@ async def _upsert_order(conn: asyncpg.Connection, user_id: int, order: dict) -> 
         json.dumps(items, default=str),
         json.dumps(order.get("tags") or [], default=str),
         json.dumps(order, default=str),
+        initial_notified_at,
     )
 
 
@@ -287,8 +321,170 @@ async def refresh_for_period(
 
     log.info("orders refresh user=%s seller=%s window=[%s..%s] pages=%s fetched=%s saved=%s",
              user_id, seller_id, start_dt.date(), end_date_brt, pages, fetched, saved)
-    return {"fetched": fetched, "saved": saved, "pages": pages,
-            "window_from": start_dt.isoformat(), "window_to": end_dt.isoformat()}
+
+    # Hook: после refresh — пробуем разослать TG-уведомления для свежих
+    # заказов которых ещё не было в БД (notified_at IS NULL). Backfill orders
+    # уже помечены NOW() в _upsert_order, так что в выборку не попадут.
+    try:
+        notify_stats = await dispatch_pending_sales(pool, user_id)
+    except Exception as err:  # noqa: BLE001
+        log.warning("dispatch_pending_sales user=%s failed: %s", user_id, err)
+        notify_stats = {"error": str(err)}
+
+    return {
+        "fetched": fetched, "saved": saved, "pages": pages,
+        "window_from": start_dt.isoformat(), "window_to": end_dt.isoformat(),
+        "notify": notify_stats,
+    }
+
+
+# ── Per-sale TG dispatch ──────────────────────────────────────────────────────
+
+async def dispatch_pending_sales(
+    pool: asyncpg.Pool,
+    user_id: int,
+    *,
+    max_per_run: int = 20,
+) -> dict[str, int]:
+    """Push TG notification for orders с notified_at IS NULL.
+
+    Backfill-защита: сами refresh уже помечают «старые» orders
+    notified_at=NOW() (см. _upsert_order is_recent). В выборке остаются
+    только реально свежие сделки последних 24ч которых не было в БД до
+    последнего refresh.
+
+    Per-sale render: revenue/profit/налоги через
+    `ml_item_margin.apply_hypothetical_price(cached, sale_price)` —
+    переиспользует ту же формулу что показывает promotions notifications
+    (DAS, ML fees, frete, fulfillment, COGS, armazenagem).
+
+    Status filter: пропускаем `cancelled`/`invalid` orders — они
+    помечаются notified_at=NOW() чтобы не попасть в следующий retry.
+
+    Возвращает {sent, skipped_cancelled, skipped_no_item, marked}.
+    """
+    from . import ml_normalize as ml_norm
+    from . import ml_notices as ml_notices_svc
+    from . import ml_item_margin as ml_margin_svc
+
+    sent = 0
+    skipped_cancelled = 0
+    skipped_no_item = 0
+    marked = 0
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT order_id, status, total_amount, currency, items, date_created
+              FROM ml_user_orders
+             WHERE user_id = $1
+               AND notified_at IS NULL
+             ORDER BY date_created DESC
+             LIMIT $2
+            """,
+            user_id, max_per_run,
+        )
+
+    for row in rows:
+        order_id = int(row["order_id"])
+        status = (row["status"] or "").lower()
+        if status in EXCLUDED_STATUSES:
+            # Cancel/invalid — не нотифицируем и помечаем чтобы не проверять снова.
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE ml_user_orders SET notified_at = NOW() "
+                    " WHERE user_id = $1 AND order_id = $2",
+                    user_id, order_id,
+                )
+            skipped_cancelled += 1
+            marked += 1
+            continue
+
+        # Берём первый item (самый частый кейс — один item per order). Multi-item
+        # orders редкие и сложные в TG — для них пока показываем только первый.
+        items = row["items"] or []
+        if isinstance(items, str):
+            try:
+                items = json.loads(items)
+            except json.JSONDecodeError:
+                items = []
+        if not items:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE ml_user_orders SET notified_at = NOW() "
+                    " WHERE user_id = $1 AND order_id = $2",
+                    user_id, order_id,
+                )
+            skipped_no_item += 1
+            marked += 1
+            continue
+
+        first = items[0]
+        item_id = str(first.get("mlb") or "").upper()
+        title = str(first.get("title") or "")
+        qty = int(first.get("quantity") or 1)
+        try:
+            sale_price = float(first.get("unit_price") or 0)
+        except (TypeError, ValueError):
+            sale_price = 0.0
+        try:
+            ml_fee = float(first.get("sale_fee") or 0)
+        except (TypeError, ValueError):
+            ml_fee = 0.0
+
+        # Pull cached unit margin (3-month average) and re-derive at sale_price.
+        cached = None
+        try:
+            cached = await ml_margin_svc.get_cached_margin(pool, user_id, item_id)
+        except Exception as err:  # noqa: BLE001
+            log.debug("margin load %s failed: %s", item_id, err)
+        margin_re: dict | None = None
+        if cached and sale_price > 0:
+            try:
+                margin_re = ml_margin_svc.apply_hypothetical_price(cached, sale_price)
+            except Exception as err:  # noqa: BLE001
+                log.debug("margin recompute %s failed: %s", item_id, err)
+
+        permalink = f"https://www.mercadolivre.com.br/vendas/{order_id}/detalhe"
+        enriched = {
+            "order_id": order_id,
+            "item_id": item_id,
+            "title": title,
+            "qty": qty,
+            "sale_price": sale_price,
+            "ml_fee": ml_fee,
+            "currency": row["currency"] or "BRL",
+            "total_amount": float(row["total_amount"] or 0),
+            "date_created": row["date_created"].isoformat() if row["date_created"] else None,
+            "_margin": margin_re,
+            "_permalink": permalink,
+        }
+        notice = ml_norm.normalize_event(
+            "sales", str(order_id), enriched,
+        )
+        try:
+            await ml_notices_svc.upsert_normalized(pool, user_id, notice)
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE ml_user_orders SET notified_at = NOW() "
+                    " WHERE user_id = $1 AND order_id = $2",
+                    user_id, order_id,
+                )
+            sent += 1
+            marked += 1
+        except Exception as err:  # noqa: BLE001
+            log.warning("dispatch sale order=%s failed: %s", order_id, err)
+
+    log.info(
+        "dispatch_pending_sales user=%s sent=%s cancelled=%s no_item=%s",
+        user_id, sent, skipped_cancelled, skipped_no_item,
+    )
+    return {
+        "sent": sent,
+        "skipped_cancelled": skipped_cancelled,
+        "skipped_no_item": skipped_no_item,
+        "marked": marked,
+    }
 
 
 # ── Public getters ─────────────────────────────────────────────────────────────

@@ -539,6 +539,116 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
             ),
         }
 
+    if topic == "sales":
+        # Per-sale TG-уведомление (см. ml_orders.dispatch_pending_sales).
+        # enriched: {order_id, item_id, title, qty, sale_price, ml_fee,
+        #            currency, total_amount, _margin (apply_hypothetical_price
+        #            output), _permalink}
+        order_id = str(enriched.get("order_id") or rid).strip()
+        item_id = str(enriched.get("item_id") or "").upper()
+        title = str(enriched.get("title") or "")
+        qty = int(enriched.get("qty") or 1)
+        try:
+            sale_price = float(enriched.get("sale_price") or 0.0)
+        except (TypeError, ValueError):
+            sale_price = 0.0
+        try:
+            ml_fee = float(enriched.get("ml_fee") or 0.0)
+        except (TypeError, ValueError):
+            ml_fee = 0.0
+        try:
+            total_amount = float(enriched.get("total_amount") or 0.0)
+        except (TypeError, ValueError):
+            total_amount = sale_price * qty
+        permalink = str(enriched.get("_permalink") or "")
+
+        def _money(v: Any) -> str:
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return "—"
+            return f"R$ {f:.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+        revenue = sale_price * qty if sale_price > 0 else total_amount
+
+        # Margin block — берём re-derived от sale_price.
+        margin = enriched.get("_margin") or {}
+        unit = (margin.get("unit") or {}) if isinstance(margin, dict) else {}
+        unit_profit = unit.get("profit_per_unit")
+        unit_margin_pct = unit.get("margin_pct")
+        cogs_pu = unit.get("cogs_per_unit")
+        ml_fee_pu = unit.get("ml_fee_per_unit")
+        envios_pu = unit.get("envios_per_sale")
+        ful_pu = unit.get("fulfillment_per_sale")
+        das_pu = unit.get("das_per_unit")
+        armaz_pu = unit.get("armaz_per_unit")
+
+        desc_lines: list[str] = []
+        if title:
+            t = title if len(title) <= 90 else title[:87] + "..."
+            desc_lines.append(f"📦 {t}")
+        if item_id:
+            desc_lines.append(f"🆔 {item_id}")
+        desc_lines.append(f"🧾 Pedido: {order_id}")
+        desc_lines.append("")
+
+        # Revenue line.
+        if qty > 1:
+            desc_lines.append(f"💵 Receita: {_money(revenue)}  ({qty} un. × {_money(sale_price)})")
+        else:
+            desc_lines.append(f"💵 Receita: {_money(revenue)}")
+
+        # Profit block.
+        if unit_profit is not None and qty > 0:
+            total_profit = float(unit_profit) * qty
+            margin_str = f"{unit_margin_pct}%" if unit_margin_pct is not None else "—"
+            desc_lines.append("")
+            desc_lines.append(f"📊 *Lucro líquido: {_money(total_profit)}* ({margin_str})")
+            # Per-unit breakdown — показывает откуда пришёл profit.
+            cost_lines: list[str] = []
+            if cogs_pu is not None:
+                cost_lines.append(f"   • Custo produto: {_money(float(cogs_pu) * qty)}")
+            if ml_fee_pu is not None:
+                cost_lines.append(f"   • Tarifa ML: {_money(float(ml_fee_pu) * qty)}")
+            elif ml_fee > 0:
+                cost_lines.append(f"   • Tarifa ML: {_money(ml_fee)}")
+            if envios_pu is not None and float(envios_pu) > 0:
+                cost_lines.append(f"   • Envios: {_money(float(envios_pu) * qty)}")
+            if ful_pu is not None and float(ful_pu) > 0:
+                cost_lines.append(f"   • Fulfillment: {_money(float(ful_pu) * qty)}")
+            if armaz_pu is not None and float(armaz_pu) > 0:
+                cost_lines.append(f"   • Armazenagem: {_money(float(armaz_pu) * qty)}")
+            if das_pu is not None and float(das_pu) > 0:
+                cost_lines.append(f"   • DAS: {_money(float(das_pu) * qty)}")
+            desc_lines.extend(cost_lines)
+        else:
+            desc_lines.append("")
+            desc_lines.append("📊 Margem indisponível — preencha custo do produto em /finance/sku-mapping")
+
+        if unit_margin_pct is not None and float(unit_margin_pct) < 0:
+            desc_lines.append("")
+            desc_lines.append("⚠ *Esta venda foi negativa* — produto vendido abaixo do custo")
+
+        actions: list[dict] = []
+        if permalink:
+            actions.append({"label": "Ver pedido", "url": permalink})
+
+        if sale_price > 0:
+            label = f"Nova venda: {_money(revenue)}"
+            if unit_margin_pct is not None:
+                label += f" ({unit_margin_pct}% margem)"
+        else:
+            label = f"Nova venda: pedido {order_id}"
+
+        return {
+            **base,
+            "label": label,
+            "description": "\n".join(desc_lines),
+            "from_date": enriched.get("date_created"),
+            "tags": [t for t in ["SALES", item_id] if t],
+            "actions": actions,
+        }
+
     if topic == "messages":
         text = str(enriched.get("text") or enriched.get("message") or "")
         from_user = (enriched.get("from") or {}).get("user_id") or enriched.get("from_user_id") or ""

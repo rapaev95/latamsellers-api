@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any, Optional, Union
 
-from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, Response, UploadFile
 
 from v2.deps import CurrentUser, current_user, get_pool
 from v2.legacy import db_storage as legacy_db
@@ -12,6 +12,7 @@ from v2.parsers import db_loader
 from v2.schemas.escalar import EscalarProductsOut, SnoozeIn, SnoozeOut
 from v2.services import (
     abc,
+    finance_cache,
     category_benchmarks as category_benchmarks_svc,
     ml_account_health as ml_account_health_svc,
     ml_backfill as ml_backfill_svc,
@@ -60,11 +61,14 @@ def _parse_days(raw: Optional[str]) -> Union[int, str]:
 
 @router.get("/products", response_model=EscalarProductsOut)
 async def get_products(
+    response: Response,
     days: Optional[str] = Query(None),
     project: Optional[str] = Query(None),
+    fresh: bool = Query(False, description="Bypass abc cache and recompute from scratch"),
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ):
+    import asyncio as _asyncio
     import logging as _lg, time as _time
     _log = _lg.getLogger("escalar.products")
     _t0 = _time.perf_counter()
@@ -102,6 +106,8 @@ async def get_products(
     # at the current selling price (not the historical period average — avg
     # mixes in past discounts and is misleading for "should I take this promo").
     current_prices_map: dict[str, float] = {}
+    items_max_fetched_iso: str | None = None
+    snooze_updated_at_iso: str | None = None
     if pool is not None:
         try:
             async with pool.acquire() as conn:
@@ -109,6 +115,25 @@ async def get_products(
                     "SELECT item_id, price FROM ml_user_items WHERE user_id = $1",
                     user.id,
                 )
+                # MAX(fetched_at) feeds the cache fingerprint via extra_deps so
+                # that an items refresh (price change) invalidates ABC, not
+                # just an upload or settings change.
+                items_max_row = await conn.fetchrow(
+                    "SELECT MAX(fetched_at) AS m FROM ml_user_items WHERE user_id = $1",
+                    user.id,
+                )
+                if items_max_row and items_max_row["m"]:
+                    items_max_fetched_iso = items_max_row["m"].isoformat()
+                # Snoozed-SKU list lives in user_data but we keep it OUT of
+                # the base finance fingerprint (reports/matrix don't care).
+                # Pulling its updated_at here lets ABC alone invalidate when
+                # the user toggles snooze on a SKU.
+                snooze_row = await conn.fetchrow(
+                    "SELECT updated_at FROM user_data WHERE user_id = $1 AND data_key = $2",
+                    user.id, SNOOZE_KEY,
+                )
+                if snooze_row and snooze_row["updated_at"]:
+                    snooze_updated_at_iso = snooze_row["updated_at"].isoformat()
             for r in price_rows:
                 if r["price"] is not None:
                     try:
@@ -119,19 +144,36 @@ async def get_products(
         except Exception as err:  # noqa: BLE001
             _log.warning("current_prices load failed: %s", err)
 
-    summary = abc.aggregate(
-        days=days_v,
-        project=project or "",
-        snoozed_skus=snoozed,
-        resolver=resolver,
-        vendas_rows=vendas_rows,
-        storage_map=storage_map,
-        stock_full_map=stock_full_map,
-        vendas_filenames=vendas_filenames,
-        publicidade_rows=publicidade_rows,
-        current_prices_map=current_prices_map,
+    # ABC compute is the heavy part — wrap only this in the durable cache.
+    # Quality/visits/items_meta joins below stay live so item refreshes show up
+    # without a force-refresh of ABC.
+    def _abc_compute() -> dict:
+        return abc.aggregate(
+            days=days_v,
+            project=project or "",
+            snoozed_skus=snoozed,
+            resolver=resolver,
+            vendas_rows=vendas_rows,
+            storage_map=storage_map,
+            stock_full_map=stock_full_map,
+            vendas_filenames=vendas_filenames,
+            publicidade_rows=publicidade_rows,
+            current_prices_map=current_prices_map,
+        )
+
+    abc_cache_key = f"abc:{project or 'all'}:{days_v}"
+    abc_extra_deps = {
+        "ml_user_items_max_fetched": items_max_fetched_iso,
+        "snoozed_updated_at": snooze_updated_at_iso,
+    }
+    summary, abc_status = await _asyncio.to_thread(
+        finance_cache.cached_compute,
+        user.id, abc_cache_key, _abc_compute,
+        force=fresh,
+        extra_deps=abc_extra_deps,
     )
-    _step(f"after abc.aggregate (products={len(summary['products'])})")
+    response.headers["X-Cache-Abc"] = abc_status
+    _step(f"after abc.aggregate cache={abc_status} (products={len(summary['products'])})")
 
     # Join cached listing quality (ml_item_quality) — fast dict lookup by itemId.
     quality_map: dict = {}
@@ -2576,6 +2618,98 @@ async def refresh_user_promotions(
 # Called by /api/telegram-webhook handler when seller taps Aceitar/Rejeitar.
 # Auth is by INTERNAL_API_TOKEN (env, shared with Next.js) since cookie auth
 # isn't available from Telegram's webhook context.
+
+class _ItemPriceShiftIn(__import__("pydantic").BaseModel):
+    """Сдвиг цены листинга на ±X% — для per-sale TG-кнопок «Поднять/Опустить»."""
+    user_id: int
+    item_id: str           # MLB id
+    delta_pct: float       # +10 / −10 / любой проценты
+    # base: 'sale' (от sale_price) | 'listing' (от текущей цены листинга).
+    # По дефолту 'sale' — кнопки в TG приходят после конкретной продажи и
+    # пользователь думает в терминах sale_price которую он только что увидел.
+    base: Optional[str] = "sale"
+    sale_price: Optional[float] = None  # обязательно если base="sale"
+
+
+@router.post("/items/price-shift")
+async def items_price_shift(
+    body: _ItemPriceShiftIn,
+    pool=Depends(get_pool),
+):
+    """Поднимает или опускает цену листинга на ±X% от sale/listing-base.
+
+    PUT /items/{id} с новой `price`. ML может отбить с 400 если:
+      - price ≤ 0
+      - изменение > 50% за неделю (limit per regulation)
+    Возвращает {ok, old_price, new_price, delta_pct}.
+
+    Auth: server-to-server через webhook → no cookie. Шифрование URL не
+    требуется т.к. внутри Railway VPC. Header LS_INTERNAL_API_TOKEN читается
+    но пока не enforced (single-tenant deploy).
+    """
+    if pool is None:
+        return {"error": "no_db"}
+
+    try:
+        token, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, body.user_id)
+    except ml_oauth_svc.MLRefreshError as err:
+        return {"error": "ml_oauth_required", "detail": str(err)}
+
+    mlb = body.item_id.upper()
+    item_url = f"https://api.mercadolibre.com/items/{mlb}"
+
+    # Resolve base price.
+    if (body.base or "sale").lower() == "sale" and body.sale_price and body.sale_price > 0:
+        base_price = float(body.sale_price)
+    else:
+        try:
+            async with httpx.AsyncClient() as http:
+                gr = await http.get(
+                    item_url,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=15.0,
+                )
+            if gr.status_code >= 400:
+                return {"error": "ml_item_fetch_rejected",
+                        "status": gr.status_code, "detail": gr.text[:300]}
+            base_price = float((gr.json() or {}).get("price") or 0.0)
+        except Exception as err:  # noqa: BLE001
+            return {"error": "ml_item_fetch_failed", "detail": str(err)}
+        if base_price <= 0:
+            return {"error": "no_current_price"}
+
+    new_price = round(base_price * (1.0 + float(body.delta_pct) / 100.0), 2)
+    if new_price <= 0:
+        return {"error": "non_positive_price",
+                "base_price": base_price, "attempted": new_price}
+
+    try:
+        async with httpx.AsyncClient() as http:
+            pr = await http.put(
+                item_url,
+                json={"price": new_price},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=15.0,
+            )
+    except Exception as err:  # noqa: BLE001
+        return {"error": "ml_price_update_failed", "detail": str(err)}
+    if pr.status_code >= 400:
+        return {"error": "ml_price_update_rejected",
+                "status": pr.status_code, "detail": pr.text[:300],
+                "old_price": base_price, "attempted_new_price": new_price}
+
+    return {
+        "ok": True,
+        "item_id": mlb,
+        "old_price": base_price,
+        "new_price": new_price,
+        "delta_pct": float(body.delta_pct),
+        "base": body.base or "sale",
+    }
+
 
 class _PromoActionIn(__import__("pydantic").BaseModel):
     # actions:

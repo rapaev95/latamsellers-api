@@ -485,6 +485,52 @@ async def send_notice(
                     "inline_keyboard": [row_accept_reject, row_raise_exact, details_row],
                 }
 
+    if topic == "sales":
+        # Per-sale keyboard: ±10% от sale_price + ссылка на заказ.
+        # callback_data prefixes:
+        #   sup:{item_id}:{sale_price}  → +10% от sale_price (PUT /items)
+        #   sdn:{item_id}:{sale_price}  → −10% от sale_price (PUT /items)
+        sale_item_id = str(raw_block.get("item_id") or "").strip().upper()
+        try:
+            sale_price = float(raw_block.get("sale_price") or 0.0)
+        except (TypeError, ValueError):
+            sale_price = 0.0
+        if sale_item_id and sale_price > 0:
+            up_label = {
+                "ru": f"📈 Поднять цену +10%",
+                "en": f"📈 Raise price +10%",
+                "pt": f"📈 Subir preço +10%",
+            }.get(language, "📈 Subir preço +10%")
+            dn_label = {
+                "ru": f"📉 Опустить цену -10%",
+                "en": f"📉 Lower price -10%",
+                "pt": f"📉 Baixar preço -10%",
+            }.get(language, "📉 Baixar preço -10%")
+            view_label = {
+                "ru": "🔍 Посмотреть заказ",
+                "en": "🔍 View order",
+                "pt": "🔍 Ver pedido",
+            }.get(language, "🔍 Ver pedido")
+            # callback_data ≤ 64 bytes. sale_price округляем до целого центавоса
+            # чтобы не съедать байты — handler пересчитает с GET текущей цены.
+            sp_str = f"{sale_price:.2f}"
+            buttons_row1 = [
+                {"text": up_label, "callback_data": f"sup:{sale_item_id}:{sp_str}"},
+                {"text": dn_label, "callback_data": f"sdn:{sale_item_id}:{sp_str}"},
+            ]
+            payload_keyboard: list[list[dict]] = [buttons_row1]
+            # «Посмотреть заказ» — URL из actions (если был permalink).
+            permalink = None
+            for a in actions_block:
+                if isinstance(a, dict):
+                    u = a.get("url") or a.get("link")
+                    if u:
+                        permalink = u
+                        break
+            if permalink:
+                payload_keyboard.append([{"text": view_label, "url": permalink}])
+            payload["reply_markup"] = {"inline_keyboard": payload_keyboard}
+
     if topic == "items":
         item_id = ""
         # Notice_id is "items:MLB6155302096" — extract the MLB part.
