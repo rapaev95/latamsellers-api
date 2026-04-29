@@ -69,9 +69,12 @@ def detect_source_from_filename(filename: str) -> Optional[str]:
         return "fatura_ml"
 
     # Bank statements
-    # Nubank: real exports come as `Nubank_<date>.csv` — no "extrato" prefix.
-    # The word "nubank" is unique to this bank, so a single-word match is safe.
-    if "nubank" in fname:
+    # Nubank credit-card export: `Nubank_<YYYY-MM-DD>.csv`.
+    # Nubank conta corrente export: `NU_<account>_<period>.csv` (e.g.
+    # `NU_621252515_31MAR2026_29ABR2026.csv`) — no "nubank" word in name.
+    # Both share extrato_nubank source_key.
+    import re as _re
+    if "nubank" in fname or _re.match(r"^nu_\d+_", fname):
         return "extrato_nubank"
     if "c6" in fname:
         if "usd" in fname or "conta_global_usd" in fname:
@@ -110,12 +113,21 @@ def detect_source_from_columns(filename: str, file_bytes: bytes) -> Optional[str
         # Try semicolon first (ML / MP Brazilian exports), then comma. Sniff
         # multiple skiprows because different ML exports start the header at
         # different rows.
+        # `engine="python", on_bad_lines="skip"` is critical: MP Mercado Pago
+        # statements have TWO sections with different column counts (4-col
+        # summary header on row 1, then 5-col transaction header mid-file).
+        # The default C engine reads chunks ahead and raises ParserError on
+        # the column-count mismatch even with nrows=2; the Python engine
+        # respects nrows strictly and skips mismatched lines silently, so the
+        # first-section sniff (`initial_balance + final_balance`) actually
+        # gets a chance to match.
         for sep in (";", ","):
             for skip in (5, 0, 1, 4, 6):
                 try:
                     df = pd.read_csv(
                         io.BytesIO(file_bytes), sep=sep, skiprows=skip, nrows=2,
-                        encoding="utf-8-sig", low_memory=False,
+                        encoding="utf-8-sig",
+                        engine="python", on_bad_lines="skip",
                     )
                 except Exception:
                     continue
