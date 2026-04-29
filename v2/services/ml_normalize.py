@@ -619,7 +619,16 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
             if armaz_pu is not None and float(armaz_pu) > 0:
                 cost_lines.append(f"   • Armazenagem: {_money(float(armaz_pu) * qty)}")
             if das_pu is not None and float(das_pu) > 0:
-                cost_lines.append(f"   • DAS: {_money(float(das_pu) * qty)}")
+                # das_rate в кэше — это уже EFFECTIVE ставка от compute_das
+                # (учитывает RBT12 / faixa / Anexo), не номинальная 4.5%.
+                # Показываем процент в подписи чтобы пользователь видел реальную
+                # налоговую нагрузку Simples Nacional, а не «как-будто 4.5%».
+                das_rate = unit.get("das_rate")
+                if das_rate is not None and float(das_rate) > 0:
+                    pct = float(das_rate) * 100
+                    cost_lines.append(f"   • DAS ({pct:.2f}% efetivo): {_money(float(das_pu) * qty)}")
+                else:
+                    cost_lines.append(f"   • DAS: {_money(float(das_pu) * qty)}")
             desc_lines.extend(cost_lines)
         else:
             desc_lines.append("")

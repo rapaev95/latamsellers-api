@@ -639,14 +639,17 @@ def compute_pnl(
 
     # NB: envios_dif и returned_loss НЕ добавляем в opex — они уже в taxas_ml
     # (то есть уже вычтены при revenue_net = bruto - taxas).
-    # DAS-строка теперь использует регим-aware label («DAS» / «DAS Simples Anexo
-    # I» / «DAS Lucro Presumido»). UI рендерит бейдж через tax_info.
-    das_label = "DAS (Simples 4,5% × bruto)"
+    # DAS-строка теперь использует регим-aware label («DAS Simples» / «DAS
+    # Lucro»). Если есть effective_pct — добавляем его в подпись прозрачно.
+    # UI рендерит бейдж через tax_info, label в opex — secondary.
+    eff_pct = das_info.get("effective_pct")
+    eff_str = f"{float(eff_pct):.2f}%" if eff_pct is not None else "ставка не определена"
+    das_label = f"DAS ({eff_str} efetivo × bruto)"
     _regime = das_info.get("regime")
     if _regime == "simples_nacional":
-        das_label = f"DAS Simples Nacional (Anexo {das_info.get('anexo', 'I')})"
+        das_label = f"DAS Simples Nacional Anexo {das_info.get('anexo', 'I')} ({eff_str} efetivo)"
     elif _regime == "lucro_presumido":
-        das_label = "DAS Lucro Presumido + ICMS"
+        das_label = f"DAS Lucro Presumido + ICMS ({eff_str} efetivo)"
 
     # Fulfillment — manual_expenses[fulfillment] + bank_tx[fulfillment] за период.
     # Note: "R$ X/продажа" если есть продажи (пользователь просил раскладку на шт).
