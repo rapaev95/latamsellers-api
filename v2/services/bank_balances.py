@@ -29,6 +29,23 @@ CURRENCY_BY_BANK = {
     "extrato_c6_usd": "USD",
 }
 
+# Mapping from the bank `id` used in legacy onboarding (`projects[*].bank_accounts`)
+# to our normalized `source_key`. Several banks reuse extrato_nubank as the
+# storage source — see `_admin/onboarding.py:BANK_LIST`.
+LEGACY_BANK_TO_SOURCE = {
+    "nubank":       "extrato_nubank",
+    "itau":         "extrato_nubank",
+    "bradesco":     "extrato_nubank",
+    "bb":           "extrato_nubank",
+    "caixa":        "extrato_nubank",
+    "santander":    "extrato_nubank",
+    "c6":           "extrato_c6_brl",
+    "c6_brl":       "extrato_c6_brl",
+    "c6_usd":       "extrato_c6_usd",
+    "mercado_pago": "extrato_mp",
+    "mp":           "extrato_mp",
+}
+
 
 _CREATE_STATEMENTS = [
     """
@@ -56,9 +73,70 @@ async def ensure_schema(pool: asyncpg.Pool) -> None:
             await conn.execute(stmt)
 
 
+def _legacy_anchor_from_user_data(user_id: int, source_key: str) -> Optional[dict[str, Any]]:
+    """Mine `user_data.projects[*].bank_accounts` for an onboarding-saved
+    balance that maps to this `source_key`. Returns the entry with the most
+    recent balance_date, or None if nothing matches.
+
+    The legacy onboarding (Streamlit step 9) duplicates the same bank_accounts
+    list across every project — we just deduplicate by (bank_id, balance_date,
+    balance) before picking the latest.
+    """
+    try:
+        from v2.legacy import db_storage as _legacy_db
+        # Try f2_-prefixed key first (current convention), fall back to legacy
+        projects = _legacy_db.db_load("f2_projects", user_id=user_id)
+        if not projects:
+            projects = _legacy_db.db_load("projects", user_id=user_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(projects, dict):
+        return None
+
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple] = set()
+    for pdata in projects.values():
+        if not isinstance(pdata, dict):
+            continue
+        for entry in (pdata.get("bank_accounts") or []):
+            if not isinstance(entry, dict):
+                continue
+            mapped = LEGACY_BANK_TO_SOURCE.get(str(entry.get("bank") or "").lower())
+            if mapped != source_key:
+                continue
+            try:
+                bal = float(entry.get("balance"))
+            except (TypeError, ValueError):
+                continue
+            bdate = str(entry.get("balance_date") or "")[:10]
+            key = (bdate, round(bal, 2))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({"balance": bal, "balance_date": bdate})
+
+    if not candidates:
+        return None
+    # Latest balance_date wins; ISO strings sort correctly
+    candidates.sort(key=lambda x: x["balance_date"] or "", reverse=True)
+    pick = candidates[0]
+    return {
+        "balance": pick["balance"],
+        "balance_date": pick["balance_date"],
+        "currency": CURRENCY_BY_BANK.get(source_key, "BRL"),
+    }
+
+
 async def get_active(
     pool: asyncpg.Pool, user_id: int, source_key: str,
 ) -> Optional[dict[str, Any]]:
+    """Return the active anchor for one bank.
+
+    Looks in `escalar_bank_balances` first; if empty, tries to migrate any
+    onboarding-saved balance from `user_data.projects[*].bank_accounts`.
+    The migration is idempotent (one-shot upsert) so subsequent reads hit
+    the table directly.
+    """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -73,8 +151,29 @@ async def get_active(
             """,
             user_id, source_key,
         )
+
     if not row:
+        # Migrate from legacy onboarding storage on first access
+        legacy = _legacy_anchor_from_user_data(user_id, source_key)
+        if legacy and legacy.get("balance_date"):
+            try:
+                bdate = date.fromisoformat(legacy["balance_date"])
+                migrated = await upsert_balance(
+                    pool, user_id,
+                    source_key=source_key,
+                    balance=legacy["balance"],
+                    balance_date=bdate,
+                    currency=legacy["currency"],
+                    notes="Importado do onboarding",
+                )
+                migrated["migrated_from_legacy"] = True
+                log.info("bank_balances: migrated legacy onboarding anchor user=%s source=%s balance=%s date=%s",
+                         user_id, source_key, legacy["balance"], legacy["balance_date"])
+                return migrated
+            except Exception as err:  # noqa: BLE001
+                log.warning("bank_balances legacy migration failed: %s", err)
         return None
+
     return {
         "id": row["id"],
         "source_key": row["source_key"],
