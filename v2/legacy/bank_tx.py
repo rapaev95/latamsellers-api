@@ -58,9 +58,142 @@ CATEGORY_OPTIONS = [
 
 
 def looks_like_pdf(file_bytes: bytes) -> bool:
-    """Detect PDF by magic bytes. PDF parsing is not supported yet — caller
-    should return a friendly error instead of silently producing empty rows."""
+    """Detect PDF by magic bytes."""
     return file_bytes[:5] == b"%PDF-" if file_bytes else False
+
+
+# ── PDF parsers (per-bank, pdfplumber-based) ────────────────────────────────
+
+
+_PT_MONTH_TO_NUM = {
+    "jan": "01", "janeiro": "01",
+    "fev": "02", "fevereiro": "02",
+    "mar": "03", "março": "03", "marco": "03",
+    "abr": "04", "abril": "04",
+    "mai": "05", "maio": "05",
+    "jun": "06", "junho": "06",
+    "jul": "07", "julho": "07",
+    "ago": "08", "agosto": "08",
+    "set": "09", "setembro": "09",
+    "out": "10", "outubro": "10",
+    "nov": "11", "novembro": "11",
+    "dez": "12", "dezembro": "12",
+}
+
+
+def _parse_period_year_from_pdf_text(text: str, default_year: str = "2026") -> str:
+    """Pull the statement year from the «Período» header line."""
+    import re as _re
+    m = _re.search(r"per[ií]odo[^\n]*?(20\d{2})", text, _re.IGNORECASE)
+    if m:
+        return m.group(1)
+    years = _re.findall(r"20\d{2}", text)
+    return years[-1] if years else default_year
+
+
+def _ddmm_to_iso(date_ddmm: str, year: str) -> str:
+    """'14/04' + '2026' → '2026-04-14'. Bad input → original string."""
+    parts = date_ddmm.split("/")
+    if len(parts) == 2 and len(year) == 4:
+        dd, mm = parts
+        return f"{year}-{mm.zfill(2)}-{dd.zfill(2)}"
+    return date_ddmm
+
+
+def _parse_c6_usd_pdf(file_bytes: bytes) -> list[dict[str, Any]]:
+    """Parse a C6 Conta Global USD PDF statement into transaction rows.
+
+    Patterns covered (extracted from real C6 USD exports):
+      «DD/MM Débito de cartão <merchant> -US$ X.XX»          → expense
+      «DD/MM Compra <merchant> -US$ X.XX»                    → expense
+      «DD/MM Entrada Transf C6 Conta Global Líquido US$ X.XX» → entry
+      «DD/MM Saque US$ X.XX»                                 → outflow
+      «DD/MM Tarifa <X> -US$ X.XX»                            → bank_fee
+
+    Year is taken from the «Período» line in the PDF header.
+    Returns rows in the same shape as `parse_bank_tx_bytes` (no header dict).
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        return []
+
+    try:
+        all_lines: list[str] = []
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                txt = page.extract_text() or ""
+                all_lines.extend(txt.split("\n"))
+    except Exception:
+        return []
+
+    if not all_lines:
+        return []
+
+    full_text = "\n".join(all_lines)
+    year = _parse_period_year_from_pdf_text(full_text)
+
+    pat_amount = r"-?US\$\s*([\d.,]+)"
+
+    # Order matters — broader patterns last so specific labels win.
+    patterns = [
+        # (regex, sign, default_desc)
+        (re.compile(r"(\d{2}/\d{2})\s+Débito de cartão\b\s*(.*?)" + pat_amount, re.IGNORECASE), -1, "Débito de cartão"),
+        (re.compile(r"(\d{2}/\d{2})\s+Compra\b\s*(.*?)" + pat_amount, re.IGNORECASE), -1, "Compra"),
+        (re.compile(r"(\d{2}/\d{2})\s+Saque\b\s*(.*?)" + pat_amount, re.IGNORECASE), -1, "Saque"),
+        (re.compile(r"(\d{2}/\d{2})\s+Tarifa\b\s*(.*?)" + pat_amount, re.IGNORECASE), -1, "Tarifa"),
+        (re.compile(r"(\d{2}/\d{2})\s+Entrada\s+(.*?)" + pat_amount, re.IGNORECASE), +1, "Entrada"),
+        (re.compile(r"(\d{2}/\d{2})\s+Estorno\b\s*(.*?)" + pat_amount, re.IGNORECASE), +1, "Estorno"),
+    ]
+
+    rows: list[dict[str, Any]] = []
+    for i, raw_line in enumerate(all_lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        for rgx, sign, default_desc in patterns:
+            m = rgx.search(line)
+            if not m:
+                continue
+            ddmm = m.group(1)
+            mid = (m.group(2) or "").strip(" -·•")
+            amt_raw = m.group(3)
+            try:
+                amount = float(amt_raw.replace(".", "").replace(",", "."))
+            except ValueError:
+                break
+
+            if amount == 0:
+                break
+
+            # Pick a clean description: prefer captured merchant text, fall back to label
+            desc = (mid or default_desc).strip()
+            # Some PDFs split the merchant name onto the next line; if the
+            # captured text is empty/short, peek 1 line ahead for context.
+            if (not desc or len(desc) < 4) and i + 1 < len(all_lines):
+                nxt = all_lines[i + 1].strip()
+                if nxt and not re.search(r"\d{2}/\d{2}", nxt):
+                    desc = (default_desc + " · " + nxt).strip()
+
+            iso_date = _ddmm_to_iso(ddmm, year)
+            val = sign * amount
+            cls = classify_transaction(desc, val)
+            rows.append({
+                "idx": len(rows),
+                "tx_hash": compute_tx_hash("extrato_c6_usd", iso_date, val, desc),
+                "date": iso_date,
+                "value_brl": val,        # USD here despite the field name; UI labels accordingly
+                "description": desc[:200],
+                "category": cls["category"],
+                "project": cls.get("project") or "",
+                "label": cls["label"],
+                "confidence": cls.get("confidence", "none"),
+                "auto": cls.get("confidence") == "auto",
+                "tx_class": "external",  # all bank-statement movements are external by definition
+            })
+            break  # first matching pattern wins for this line
+
+    return rows
 
 
 def _read_bank_csv(source_key: str, file_bytes: bytes) -> Optional[pd.DataFrame]:
@@ -197,10 +330,14 @@ def parse_bank_tx_bytes(source_key: str, file_bytes: bytes) -> list[dict[str, An
     MP income/liberação rows are intentionally skipped here — they belong
     in the sales pipeline, not the bank-classification flow.
 
-    Returns [] for unparseable input (incl. PDF — caller should detect
-    upstream via `looks_like_pdf()` and surface a friendlier error).
+    Returns [] for unparseable input (incl. PDFs from banks where the layout
+    isn't yet handled). Caller can still detect "is the file a PDF?" via
+    `looks_like_pdf()` to surface a friendlier error.
     """
     if looks_like_pdf(file_bytes):
+        # Per-bank PDF parsers (extend as more layouts get covered)
+        if source_key == "extrato_c6_usd":
+            return _parse_c6_usd_pdf(file_bytes)
         return []
     df = _read_bank_csv(source_key, file_bytes)
     if df is None or df.empty:

@@ -11,4 +11,5 @@ apscheduler>=3.10.4
 playwright>=1.45.0
 playwright-stealth>=1.0.6
 PyPDF2>=3.0.0
+pdfplumber>=0.11.0
 msoffcrypto-tool>=5.4.0

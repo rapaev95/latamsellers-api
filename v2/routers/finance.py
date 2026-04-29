@@ -1718,16 +1718,14 @@ async def get_transactions(
                     "supported": sorted(_BANK_SOURCES)},
         )
 
-    # #2: detect PDF early — return empty rows + explicit format_error so the UI
-    # can show "exporte como CSV" instead of a silent empty table.
+    # #2: PDFs are handled per-bank inside parse_bank_tx_bytes (currently:
+    # extrato_c6_usd via pdfplumber). For other banks the PDF path returns
+    # [] and we surface "pdf_not_supported" so the UI shows a clear hint.
+    is_pdf = looks_like_pdf(stored.file_bytes)
+    rows = parse_bank_tx_bytes(stored.source_key, stored.file_bytes)
     format_error: Optional[str] = None
-    rows: list[dict[str, Any]] = []
-    if looks_like_pdf(stored.file_bytes):
-        format_error = "pdf_not_supported"
-    else:
-        rows = parse_bank_tx_bytes(stored.source_key, stored.file_bytes)
-        if not rows:
-            format_error = "empty_after_parse"
+    if not rows:
+        format_error = "pdf_not_supported" if is_pdf else "empty_after_parse"
 
     # Merge saved overrides (keyed by upload_id, indexed by idx)
     overrides = db_load(_overrides_key(upload_id)) or {}
@@ -1860,14 +1858,13 @@ async def get_bank_transactions_grouped(
 
     for f in files:
         upload_ids.append(f.id)
-        if looks_like_pdf(f.file_bytes):
-            format_errors.append({"upload_id": f.id, "filename": f.filename,
-                                   "error": "pdf_not_supported"})
-            continue
+        is_pdf = looks_like_pdf(f.file_bytes)
         parsed = parse_bank_tx_bytes(source_key, f.file_bytes)
         if not parsed:
-            format_errors.append({"upload_id": f.id, "filename": f.filename,
-                                   "error": "empty_after_parse"})
+            format_errors.append({
+                "upload_id": f.id, "filename": f.filename,
+                "error": "pdf_not_supported" if is_pdf else "empty_after_parse",
+            })
             continue
         for r in parsed:
             h = r.get("tx_hash")
