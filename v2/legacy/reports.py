@@ -1280,9 +1280,17 @@ def parse_nfse_pdf(file_path: Path, original_filename: str | None = None) -> dic
 
 
 def aggregate_classified_by_project(project: str, after_date: str | None = None) -> dict:
-    """
-    Aggregate classified bank transactions for a project.
-    Reads all classifications JSONs from _data/.
+    """Aggregate classified bank transactions for a project.
+
+    Source order:
+      1. **DB pre-fetch** (production path) — when the router has prefetched
+         every bank statement and applied user overrides via
+         `v2/services/bank_classifications.py`, we read from a contextvar
+         that carries the merged list across thread boundaries. This is the
+         only path that works on Railway (ephemeral FS).
+      2. **Local JSON files** (legacy / Streamlit dev path) — read
+         `_data/{month}/{src}_classifications.json`. Kept so manual local
+         dev still works; harmless in prod where these files don't exist.
 
     Args:
         project: project ID (ARTUR, GANZA, etc.)
@@ -1290,6 +1298,16 @@ def aggregate_classified_by_project(project: str, after_date: str | None = None)
 
     Returns dict with categorized totals.
     """
+    # 1) DB-backed prefetch (production)
+    try:
+        from v2.services.bank_classifications import aggregate_for_project as _db_agg
+        db_result = _db_agg(project, after_date=after_date)
+    except Exception:  # noqa: BLE001 — keep falling back if anything explodes
+        db_result = None
+    if db_result is not None:
+        return db_result
+
+    # 2) Legacy disk path (local dev fallback)
     import json as json_mod_agg
 
     result = {
