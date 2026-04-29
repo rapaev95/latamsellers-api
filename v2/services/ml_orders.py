@@ -83,13 +83,20 @@ CREATE INDEX IF NOT EXISTS idx_ml_user_orders_user_date
   ON ml_user_orders(user_id, date_created DESC);
 CREATE INDEX IF NOT EXISTS idx_ml_user_orders_user_status
   ON ml_user_orders(user_id, status);
--- Pending-dispatch index: pickup новых orders для TG (status passes filter).
-CREATE INDEX IF NOT EXISTS idx_ml_user_orders_pending_notify
-  ON ml_user_orders(user_id, date_created DESC)
-  WHERE notified_at IS NULL;
 
--- Idempotent migration для existing deploy.
+-- Idempotent migration для existing deploy: добавление колонки — metadata-only
+-- в Postgres 11+, мгновенное даже на больших таблицах.
 ALTER TABLE ml_user_orders ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ;
+
+-- ВАЖНО: partial index на notified_at IS NULL вынесен из этого блока
+-- специально. CREATE INDEX без CONCURRENTLY блокирует таблицу при сборке;
+-- на существующей продуктивной ml_user_orders это занимает >20s и
+-- Railway healthcheck падает по timeout. Если таблица станет очень большой
+-- и dispatch_pending_sales начнёт тормозить — добавить отдельной миграцией:
+--   CREATE INDEX CONCURRENTLY idx_ml_user_orders_pending_notify
+--     ON ml_user_orders(user_id, date_created DESC)
+--     WHERE notified_at IS NULL;
+-- (CONCURRENTLY нельзя в transaction, поэтому отдельным execute, не здесь.)
 """
 
 
