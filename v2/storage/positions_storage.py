@@ -52,8 +52,17 @@ async def add_tracked(
     keyword: str,
     site_id: str = "MLB",
     category_id: Optional[str] = None,
-) -> int:
-    """Upsert a tracked (item_id, keyword) pair for the user. Returns row id."""
+) -> tuple[int, bool]:
+    """Upsert a tracked (item_id, keyword) pair for the user.
+
+    Returns (row_id, was_inserted). `was_inserted` is True when this
+    call created a new row, False when the (user, item, keyword, site)
+    already existed (touched on conflict).
+
+    Postgres `xmax=0` is true for tuples that came out of the INSERT
+    branch and false for those that came out of DO UPDATE — cheap way
+    to differentiate without an extra SELECT.
+    """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -61,11 +70,11 @@ async def add_tracked(
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (user_id, item_id, keyword, site_id)
             DO UPDATE SET category_id = EXCLUDED.category_id
-            RETURNING id
+            RETURNING id, (xmax = 0) AS inserted
             """,
             user_id, item_id, keyword, site_id, category_id,
         )
-    return int(row["id"])
+    return int(row["id"]), bool(row["inserted"])
 
 
 async def delete_tracked(pool: asyncpg.Pool, user_id: int, tracked_id: int) -> bool:

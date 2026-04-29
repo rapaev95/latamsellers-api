@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 
 from v2.deps import CurrentUser, current_user, get_pool
 from v2.schemas.escalar import (
@@ -194,6 +194,142 @@ async def check(
     )
 
 
+@router.post("/import")
+async def import_keywords(
+    file: UploadFile = File(..., description="JoomPulse XLSX or CSV (Posição / Palavras-chave / Anúncios)"),
+    item_id: str = Query(..., min_length=3, description="MLB to associate keywords with"),
+    site_id: str = Query("MLB"),
+    limit: int = Query(30, ge=1, le=200, description="Top N keywords by rank to import"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Bulk import keywords from a JoomPulse export.
+
+    Format expected (Sheet1):
+      - row 0: header (Posição na categoria | Palavras-chave | Anúncios)
+      - row 1+: rank | keyword | listings_count
+
+    For each row up to `limit`, calls positions_storage.add_tracked
+    which is idempotent on (user, item_id, keyword, site_id) — already-
+    tracked keywords return existing id without duplication.
+
+    Accepts .xlsx (parsed via openpyxl) and .csv (parsed via stdlib csv).
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="no_db")
+    fname = (file.filename or "").lower()
+    if not (fname.endswith(".xlsx") or fname.endswith(".csv")):
+        raise HTTPException(status_code=400, detail="file_must_be_xlsx_or_csv")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty_file")
+
+    keywords: list[tuple[int | None, str, int | None]] = []  # (rank, keyword, listings)
+
+    if fname.endswith(".xlsx"):
+        try:
+            from io import BytesIO
+            from openpyxl import load_workbook
+            wb = load_workbook(BytesIO(raw), read_only=True, data_only=True)
+            ws = wb[wb.sheetnames[0]]
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i == 0:
+                    continue  # skip header
+                if not row:
+                    continue
+                rank = None
+                keyword: str = ""
+                listings = None
+                if len(row) >= 1 and row[0] is not None:
+                    try:
+                        rank = int(float(str(row[0]).strip()))
+                    except (ValueError, TypeError):
+                        rank = None
+                if len(row) >= 2 and row[1] is not None:
+                    keyword = str(row[1]).strip()
+                if len(row) >= 3 and row[2] is not None:
+                    try:
+                        listings = int(float(str(row[2]).replace(',', '').replace('.', '').strip()))
+                    except (ValueError, TypeError):
+                        listings = None
+                if keyword and len(keyword) >= 2:
+                    keywords.append((rank, keyword, listings))
+        except Exception as err:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=f"xlsx_parse_error: {err}")
+    else:
+        try:
+            import csv
+            from io import StringIO
+            text = raw.decode("utf-8", errors="replace")
+            # Sniff separator: ML Brazil exports often use ; — JoomPulse default is ,
+            sep = ";" if text.count(";") > text.count(",") else ","
+            reader = csv.reader(StringIO(text, newline=""), delimiter=sep)
+            for i, row in enumerate(reader):
+                if i == 0:
+                    continue
+                if not row:
+                    continue
+                cols = [c.strip().strip('"') for c in row]
+                rank = None
+                if cols and cols[0]:
+                    try:
+                        rank = int(float(cols[0]))
+                    except (ValueError, TypeError):
+                        rank = None
+                keyword = cols[1].strip() if len(cols) > 1 else ""
+                listings = None
+                if len(cols) > 2 and cols[2]:
+                    try:
+                        listings = int(float(cols[2].replace(',', '').replace('.', '')))
+                    except (ValueError, TypeError):
+                        listings = None
+                if keyword and len(keyword) >= 2:
+                    keywords.append((rank, keyword, listings))
+        except Exception as err:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=f"csv_parse_error: {err}")
+
+    if not keywords:
+        return {"parsed": 0, "added": 0, "skipped_duplicates": 0, "samples": []}
+
+    # Sort by rank ascending (rank=None goes last); cap to limit
+    keywords.sort(key=lambda x: (x[0] if x[0] is not None else 99999))
+    keywords = keywords[:limit]
+
+    # Bulk-insert; positions_storage.add_tracked returns (id, was_inserted)
+    # so we count net-new vs already-tracked correctly.
+    added = 0
+    duplicates = 0
+    samples: list[dict[str, Any]] = []
+    for rank, keyword, listings in keywords:
+        try:
+            _id, was_inserted = await positions_storage.add_tracked(
+                pool,
+                user_id=user.id,
+                item_id=item_id,
+                keyword=keyword,
+                site_id=site_id,
+                category_id=None,
+            )
+            if was_inserted:
+                added += 1
+            else:
+                duplicates += 1
+            if len(samples) < 5:
+                samples.append({"rank": rank, "keyword": keyword, "listings": listings})
+        except Exception as err:  # noqa: BLE001
+            # Log + continue — one bad row shouldn't kill the import
+            samples.append({"rank": rank, "keyword": keyword, "error": str(err)[:100]})
+
+    return {
+        "parsed": len(keywords),
+        "added": added,
+        "skipped_duplicates": duplicates,
+        "item_id": item_id,
+        "samples": samples,
+    }
+
+
 @router.post("/track", response_model=TrackedKeyword)
 async def track(
     body: TrackKeywordIn,
@@ -202,7 +338,7 @@ async def track(
 ):
     if pool is None:
         raise HTTPException(status_code=503, detail="no_db")
-    tracked_id = await positions_storage.add_tracked(
+    tracked_id, _was_inserted = await positions_storage.add_tracked(
         pool,
         user_id=user.id,
         item_id=body.itemId,
