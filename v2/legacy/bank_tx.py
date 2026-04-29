@@ -227,14 +227,23 @@ def _read_bank_csv(source_key: str, file_bytes: bytes) -> Optional[pd.DataFrame]
 
 
 def _find_columns(df: pd.DataFrame) -> dict[str, Optional[str]]:
-    """Locate the description/amount/date columns across BR bank CSV dialects."""
+    """Locate the description/amount/date columns across BR bank CSV dialects.
+
+    Recognised header tokens (case-insensitive substring match unless noted):
+      desc:    descri / título / titulo / transaction_type / title (English)
+      value:   valor / transaction_net_amount / amount (English)
+      entrada: entrada
+      saída:   saída / saida
+      date:    data / release_date / exact 'date' (English)
+    """
     cols: dict[str, Optional[str]] = {
         "desc": None, "value": None, "entrada": None, "saida": None, "date": None,
     }
     for c in df.columns:
-        cl = str(c).lower()
+        cl = str(c).strip().lower()
         if cols["desc"] is None and (
-            "descri" in cl or "título" in cl or "titulo" in cl or "transaction_type" in cl
+            "descri" in cl or "título" in cl or "titulo" in cl
+            or "transaction_type" in cl or cl == "title"
         ):
             cols["desc"] = str(c)
         if cols["entrada"] is None and "entrada" in cl:
@@ -242,12 +251,24 @@ def _find_columns(df: pd.DataFrame) -> dict[str, Optional[str]]:
         if cols["saida"] is None and ("saída" in cl or "saida" in cl):
             cols["saida"] = str(c)
         if cols["value"] is None and (
-            ("valor" in cl and "valor do dia" not in cl) or "transaction_net_amount" in cl
+            ("valor" in cl and "valor do dia" not in cl)
+            or "transaction_net_amount" in cl
+            or cl == "amount"
         ):
             cols["value"] = str(c)
-        if cols["date"] is None and ("data" in cl or "release_date" in cl):
+        if cols["date"] is None and ("data" in cl or "release_date" in cl or cl == "date"):
             cols["date"] = str(c)
     return cols
+
+
+def _is_nubank_credit_card_csv(df: pd.DataFrame) -> bool:
+    """Detect Nubank's credit-card export (English headers, sign-inverted).
+
+    Format: `date,title,amount` where positive = charge, negative = payment-in.
+    Different from the Nubank checking-account CSV which uses Portuguese headers.
+    """
+    headers = {str(c).strip().lower() for c in df.columns}
+    return {"date", "title", "amount"}.issubset(headers)
 
 
 # ── MP transaction classification (#4) ──────────────────────────────────────
@@ -344,6 +365,10 @@ def parse_bank_tx_bytes(source_key: str, file_bytes: bytes) -> list[dict[str, An
         return []
 
     cols = _find_columns(df)
+    # Nubank credit-card CSV uses inverted sign convention (charge=positive,
+    # payment-in=negative). Flip so our app's "value < 0 = outflow" holds.
+    flip_sign = _is_nubank_credit_card_csv(df)
+
     rows: list[dict[str, Any]] = []
     for idx, row in df.iterrows():
         desc = str(row.get(cols["desc"], "") or "") if cols["desc"] else ""
@@ -353,6 +378,9 @@ def parse_bank_tx_bytes(source_key: str, file_bytes: bytes) -> list[dict[str, An
             val = _parse_val(row.get(cols["value"], 0))
         else:
             val = 0.0
+
+        if flip_sign:
+            val = -val
 
         # #3: skip zero-only rows — Nubank exports include "no movement" lines
         # for posting/scheduling that visually duplicate real transactions.
