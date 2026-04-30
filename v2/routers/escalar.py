@@ -3650,6 +3650,66 @@ async def promotions_tg_action(
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=15.0,
             )
+        elif body.action == "reenable_dynamic_pricing":
+            # User wants ML Pricing Automation back ON for this item.
+            # Reads previous rule (rule_id, min, max) from
+            # ml_user_pricing_history (saved when DELETE'ed). If no history
+            # — falls back to INT_EXT with ±15% range from current price.
+            async with pool.acquire() as conn:
+                hist = await conn.fetchrow(
+                    """
+                    SELECT rule_id, min_price, max_price
+                      FROM ml_user_pricing_history
+                     WHERE user_id = $1 AND item_id = $2
+                     ORDER BY disabled_at DESC LIMIT 1
+                    """,
+                    body.user_id, mlb,
+                )
+            rule_id = (hist["rule_id"] if hist else None) or "INT_EXT"
+            min_price = float(hist["min_price"]) if hist and hist["min_price"] is not None else None
+            max_price = float(hist["max_price"]) if hist and hist["max_price"] is not None else None
+
+            if not min_price or not max_price or min_price <= 0 or max_price <= min_price:
+                # Derive ±15% range from current item price.
+                gr = await http.get(
+                    f"https://api.mercadolibre.com/items/{mlb}",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=15.0,
+                )
+                cur_price = float((gr.json() or {}).get("price") or 0.0) if gr.status_code < 400 else 0.0
+                if cur_price <= 0:
+                    return {"error": "no_current_price_for_range"}
+                min_price = round(cur_price * 0.85, 2)
+                max_price = round(cur_price * 1.15, 2)
+
+            payload = {
+                "rule_id": rule_id,
+                "min_price": float(min_price),
+                "max_price": float(max_price),
+            }
+            r = await http.post(
+                f"https://api.mercadolibre.com/pricing-automation/items/{mlb}/automation",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=15.0,
+            )
+            if r.status_code >= 400:
+                return {
+                    "error": "ml_dyn_reenable_rejected",
+                    "status": r.status_code,
+                    "detail": r.text[:300],
+                    "attempted_payload": payload,
+                }
+            raise_info = {
+                "dyn_reenabled": True,
+                "rule_id": rule_id,
+                "min_price": float(min_price),
+                "max_price": float(max_price),
+            }
+
         elif body.action in ("raise_only", "raise_with_disable_dyn"):
             # Standalone price raise.
             #   raise_only: just PUT /items {price}. If ML rejects with
