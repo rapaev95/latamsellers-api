@@ -299,6 +299,26 @@ async def _backfill_all_users_job() -> None:
         _ml_log.exception("ML backfill job failed: %s", err)
 
 
+async def _inventory_alerts_job() -> None:
+    """Daily inventory critical-stock alerts. For each user with TG settings
+    iterate active items, send alert (1 per item per 7 days dedup) if
+    days_left < 7. Runs at 12 UTC = 09 BRT — morning seller checks TG."""
+    try:
+        from v2.services import ml_inventory_forecast as inv_svc
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("inventory alerts tick skipped: no DB pool")
+            return
+        result = await inv_svc.dispatch_inventory_alerts_all_users(pool)
+        _ml_log.info(
+            "inventory alerts tick: users=%s checked=%s sent=%s skipped=%s",
+            result.get("users"), result.get("checked"),
+            result.get("sent"), result.get("skipped"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("inventory alerts job failed: %s", err)
+
+
 async def _dispatch_pending_telegram_job() -> None:
     """Drain Telegram queue for every user with pending notices.
 
@@ -857,6 +877,17 @@ async def _v2_startup() -> None:
         _daily_kpi_snapshot_job,
         CronTrigger(hour=4, minute=0, timezone="UTC"),
         id="listing_kpi_daily_snapshot",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Inventory critical-stock alerts at 12:00 UTC = 09:00 BRT — morning
+    # window when sellers actually check TG. Per-item dedup 7 days so the
+    # same item can't repeat-alert daily while seller waits for restock.
+    _ml_scheduler.add_job(
+        _inventory_alerts_job,
+        CronTrigger(hour=12, minute=0, timezone="UTC"),
+        id="inventory_alerts_daily",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

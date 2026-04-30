@@ -33,10 +33,24 @@ ALTER TABLE notification_settings
   ADD COLUMN IF NOT EXISTS inventory_window_days INTEGER DEFAULT 14;
 """
 
+CREATE_DISPATCH_LOG_SQL = """
+CREATE TABLE IF NOT EXISTS inventory_alert_log (
+  user_id INTEGER NOT NULL,
+  item_id TEXT NOT NULL,
+  level TEXT NOT NULL,
+  days_left INTEGER,
+  dispatched_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (user_id, item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_inv_alert_dispatched
+  ON inventory_alert_log(user_id, dispatched_at DESC);
+"""
+
 
 async def ensure_schema(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
         await conn.execute(CREATE_INVENTORY_SETTINGS_SQL)
+        await conn.execute(CREATE_DISPATCH_LOG_SQL)
 
 
 async def _get_window_days(pool: asyncpg.Pool, user_id: int) -> int:
@@ -130,3 +144,199 @@ async def get_inventory_snapshot(
         "days_left": days_left,
         "level": level,
     }
+
+
+# ── Daily critical-stock alerts ────────────────────────────────────────────
+
+ALERT_DEDUP_DAYS = 7
+ALERT_BATCH_SLEEP = 0.3  # seconds between TG messages, anti-rate-limit
+
+
+async def _list_active_items(pool: asyncpg.Pool, user_id: int) -> list[str]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT item_id FROM ml_user_items
+             WHERE user_id = $1 AND COALESCE(status, 'active') = 'active'
+            """,
+            user_id,
+        )
+    return [r["item_id"] for r in rows]
+
+
+async def _was_recently_alerted(
+    pool: asyncpg.Pool, user_id: int, item_id: str,
+) -> bool:
+    async with pool.acquire() as conn:
+        ts = await conn.fetchval(
+            """
+            SELECT dispatched_at FROM inventory_alert_log
+             WHERE user_id = $1 AND item_id = $2
+            """,
+            user_id, item_id,
+        )
+    if ts is None:
+        return False
+    age = (datetime.now(timezone.utc) - ts.astimezone(timezone.utc)).days
+    return age < ALERT_DEDUP_DAYS
+
+
+async def _record_alert(
+    pool: asyncpg.Pool, user_id: int, item_id: str, level: str, days_left: Optional[int],
+) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO inventory_alert_log
+              (user_id, item_id, level, days_left, dispatched_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (user_id, item_id) DO UPDATE SET
+              level = EXCLUDED.level,
+              days_left = EXCLUDED.days_left,
+              dispatched_at = NOW()
+            """,
+            user_id, item_id, level, days_left,
+        )
+
+
+async def dispatch_inventory_alerts(
+    pool: asyncpg.Pool, user_id: int,
+) -> dict[str, int]:
+    """For one user: scan active items, send TG alert for each `critical`
+    item not alerted in last 7 days. Returns counts.
+
+    Triggered daily via APScheduler. Per-item dedup keeps TG quiet — same
+    item won't trigger more than once per week even if stock stays low.
+    """
+    import asyncio
+    import os
+
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not bot_token:
+        return {"checked": 0, "sent": 0, "skipped": 0, "error": "no_bot_token"}
+    async with pool.acquire() as conn:
+        settings = await conn.fetchrow(
+            """
+            SELECT telegram_chat_id, COALESCE(notify_daily_sales, TRUE) AS notify_on,
+                   COALESCE(language, 'pt') AS language
+              FROM notification_settings
+             WHERE user_id = $1
+            """,
+            user_id,
+        )
+    if not settings or not settings["telegram_chat_id"] or not settings["notify_on"]:
+        return {"checked": 0, "sent": 0, "skipped": 0}
+    chat_id = str(settings["telegram_chat_id"])
+    lang = settings["language"] or "pt"
+
+    items = await _list_active_items(pool, user_id)
+    sent = 0
+    skipped = 0
+    checked = 0
+    if not items:
+        return {"checked": 0, "sent": 0, "skipped": 0}
+
+    import httpx
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        for item_id in items:
+            checked += 1
+            try:
+                snap = await get_inventory_snapshot(pool, user_id, item_id)
+            except Exception as err:  # noqa: BLE001
+                log.debug("snapshot failed item=%s: %s", item_id, err)
+                continue
+            if not snap or snap["level"] != "critical":
+                continue
+            if await _was_recently_alerted(pool, user_id, item_id):
+                skipped += 1
+                continue
+
+            # Fetch item title для useful TG-message
+            async with pool.acquire() as conn:
+                title = await conn.fetchval(
+                    "SELECT title FROM ml_user_items WHERE user_id = $1 AND item_id = $2",
+                    user_id, item_id,
+                )
+            title_short = (title or item_id)[:80]
+            days_left = snap["days_left"] if snap["days_left"] is not None else 0
+            stock = snap["stock"]
+            avg = snap["avg_daily"]
+
+            if lang == "ru":
+                text = (
+                    f"⚠️ *Скоро закончится товар*\n\n"
+                    f"📦 {title_short}\n"
+                    f"🆔 `{item_id}`\n\n"
+                    f"Остаток: {stock} ед. · скорость: {avg:.1f}/день\n"
+                    f"⏰ Хватит на ~{days_left} дней\n\n"
+                    f"_Закажи Full / пополни запас, чтобы не потерять продажи._"
+                )
+            elif lang == "en":
+                text = (
+                    f"⚠️ *Stock running out*\n\n"
+                    f"📦 {title_short}\n"
+                    f"🆔 `{item_id}`\n\n"
+                    f"Stock: {stock} un. · pace: {avg:.1f}/day\n"
+                    f"⏰ Lasts only ~{days_left} days\n\n"
+                    f"_Replenish Full to avoid lost sales._"
+                )
+            else:
+                text = (
+                    f"⚠️ *Estoque acabando*\n\n"
+                    f"📦 {title_short}\n"
+                    f"🆔 `{item_id}`\n\n"
+                    f"Estoque: {stock} un. · ritmo: {avg:.1f}/dia\n"
+                    f"⏰ Dura apenas ~{days_left} dias\n\n"
+                    f"_Reponha o Full para não perder vendas._"
+                )
+
+            try:
+                r = await http.post(
+                    f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                    json={
+                        "chat_id": chat_id,
+                        "text": text,
+                        "parse_mode": "Markdown",
+                        "disable_web_page_preview": True,
+                    },
+                )
+                if r.status_code == 200:
+                    await _record_alert(pool, user_id, item_id, snap["level"], days_left)
+                    sent += 1
+                else:
+                    log.warning("inventory alert TG failed user=%s item=%s status=%s",
+                                user_id, item_id, r.status_code)
+            except Exception as err:  # noqa: BLE001
+                log.warning("inventory alert exception user=%s item=%s: %s",
+                            user_id, item_id, err)
+            await asyncio.sleep(ALERT_BATCH_SLEEP)
+
+    return {"checked": checked, "sent": sent, "skipped": skipped}
+
+
+async def dispatch_inventory_alerts_all_users(pool: asyncpg.Pool) -> dict[str, int]:
+    """Daily cron entrypoint — iterate all TG-linked users."""
+    if pool is None:
+        return {"users": 0, "sent": 0}
+    await ensure_schema(pool)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT t.user_id
+              FROM ml_user_tokens t
+              JOIN notification_settings n ON n.user_id = t.user_id
+             WHERE t.access_token IS NOT NULL
+               AND n.telegram_chat_id IS NOT NULL
+            """,
+        )
+    totals = {"users": 0, "sent": 0, "checked": 0, "skipped": 0}
+    for r in rows:
+        try:
+            res = await dispatch_inventory_alerts(pool, r["user_id"])
+            totals["users"] += 1
+            totals["sent"] += res.get("sent", 0)
+            totals["checked"] += res.get("checked", 0)
+            totals["skipped"] += res.get("skipped", 0)
+        except Exception as err:  # noqa: BLE001
+            log.exception("inventory alerts user=%s failed: %s", r["user_id"], err)
+    return totals

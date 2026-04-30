@@ -4779,6 +4779,24 @@ async def breakeven_recompute(
     return out
 
 
+@router.post("/inventory-alerts/dispatch-now")
+async def inventory_alerts_dispatch_now(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Manual trigger: scan current user's active items and send TG alerts
+    for any that hit `critical` (and weren't alerted in last 7 days).
+
+    Used to test the daily cron without waiting for 12 UTC. Returns counts
+    of checked / sent / skipped items.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    from v2.services import ml_inventory_forecast as inv_svc
+    await inv_svc.ensure_schema(pool)
+    return await inv_svc.dispatch_inventory_alerts(pool, user.id)
+
+
 @router.get("/items/{mlb}/inventory-probe")
 async def inventory_probe(
     mlb: str,
