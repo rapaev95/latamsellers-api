@@ -402,6 +402,130 @@ async def items_stock_lookup(
     return {"query": q, "count": len(out_items), "items": out_items}
 
 
+@router.get("/items/paused-with-stock")
+async def items_paused_with_stock(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Список paused-объявлений у которых остаток > 0 на складе ML.
+    Аномалия — paused обычно auto-set при stockout, но иногда юзер ставит
+    pause вручную и забывает, либо ML модерация. Эти позиции занимают
+    Full без trafficа продаж — нужно либо активировать, либо разобраться."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT item_id, title, available_quantity, sold_quantity, status, raw,
+                   to_char(fetched_at AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS fetched_at
+              FROM ml_user_items
+             WHERE user_id = $1
+               AND status = 'paused'
+               AND available_quantity > 0
+             ORDER BY available_quantity DESC, sold_quantity DESC
+            """,
+            user.id,
+        )
+
+    out_items: list[dict[str, Any]] = []
+    for r in rows:
+        raw = r["raw"]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                raw = {}
+        raw = raw or {}
+        sku = ""
+        for attr in (raw.get("attributes") or []):
+            if isinstance(attr, dict) and attr.get("id") == "SELLER_SKU":
+                sku = str(attr.get("value_name") or "")
+                break
+        sub_status = raw.get("sub_status") or []
+        if not isinstance(sub_status, list):
+            sub_status = [sub_status]
+        out_items.append({
+            "item_id": r["item_id"],
+            "title": r["title"],
+            "sku": sku,
+            "available_quantity": r["available_quantity"],
+            "sold_quantity": r["sold_quantity"],
+            "sub_status": sub_status,
+            "fetched_at": r["fetched_at"],
+        })
+    return {"count": len(out_items), "items": out_items}
+
+
+@router.post("/items/{item_id}/activate")
+async def items_activate(
+    item_id: str,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Активирует paused-объявление через ML API (PUT /items/{id} status=active).
+
+    Pre-flight проверка: товар должен принадлежать юзеру (есть в `ml_user_items`)
+    и иметь stock > 0 (иначе ML всё равно не активирует — auto-pause при 0).
+
+    После успеха обновляет `ml_user_items.status = 'active'` локально, чтобы
+    UI сразу видел новый статус без ожидания ночного refresh."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT item_id, status, available_quantity
+              FROM ml_user_items
+             WHERE user_id = $1 AND item_id = $2
+            """,
+            user.id, item_id,
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail={"error": "item_not_owned"})
+    stock = int(row["available_quantity"] or 0)
+    if stock <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "no_stock", "stock": stock,
+                    "hint": "ML auto-pauses listings without stock; refill Full first"},
+        )
+
+    try:
+        token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        raise HTTPException(status_code=401,
+                            detail={"error": "ml_oauth_required", "message": str(err)})
+
+    item_url = f"https://api.mercadolibre.com/items/{item_id}"
+    try:
+        async with httpx.AsyncClient() as http:
+            pr = await http.put(
+                item_url,
+                json={"status": "active"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=15.0,
+            )
+    except Exception as err:  # noqa: BLE001
+        return {"ok": False, "error": "ml_call_failed", "detail": str(err)}
+    if pr.status_code >= 400:
+        return {"ok": False, "error": "ml_rejected",
+                "status": pr.status_code, "detail": pr.text[:400]}
+
+    new_status = (pr.json() or {}).get("status") or "active"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE ml_user_items SET status = $1 WHERE user_id = $2 AND item_id = $3",
+            new_status, user.id, item_id,
+        )
+
+    return {"ok": True, "item_id": item_id, "new_status": new_status, "stock": stock}
+
+
 @router.post("/snooze", response_model=SnoozeOut)
 async def post_snooze(
     body: SnoozeIn,
