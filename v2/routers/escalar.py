@@ -2987,6 +2987,164 @@ async def orders_notice_from_webhook(
     }
 
 
+@router.get("/orders/{order_id}/replay-notice")
+async def order_replay_notice(
+    order_id: str,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Diagnostic — replays the orders_v2 notice pipeline for an existing
+    order and shows where margin/breakeven enrichment landed (or didn't).
+
+    Steps mirrored:
+      1. Pull saved notice from ml_notices (by notice_id orders_v2:{order_id}).
+      2. Try to fetch full order from ML API to re-enrich (so we see what
+         live webhook would inject).
+      3. Run _enrich_order_with_margin → log _margin/_breakeven additions.
+      4. Run normalize_event → return resulting description.
+
+    Returns enough state to tell whether:
+      - item_id is in ml_item_margin_cache (margin block won't render if not)
+      - sale_price could be parsed (margin needs unit_price > 0)
+      - break-even tracker initialized for project
+    """
+    if pool is None:
+        return {"error": "no_db"}
+
+    notice_id = f"orders_v2:{order_id}"
+    out: dict[str, Any] = {"order_id": order_id, "notice_id": notice_id}
+
+    # 1. Saved TG notice
+    async with pool.acquire() as conn:
+        saved = await conn.fetchrow(
+            """
+            SELECT description, raw, tags, updated_at
+              FROM ml_notices
+             WHERE user_id = $1 AND notice_id = $2
+            """,
+            user.id, notice_id,
+        )
+    if saved:
+        raw = saved["raw"]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                raw = {}
+        out["saved_notice"] = {
+            "tags": json.loads(saved["tags"]) if isinstance(saved["tags"], str) else (saved["tags"] or []),
+            "description_preview": (saved["description"] or "")[:600],
+            "has_margin_block": bool(saved["description"] and "argem" in (saved["description"] or "")),
+            "has_breakeven_block": bool(saved["description"] and "reak-even" in (saved["description"] or "")),
+            "raw_keys": sorted(list(raw.keys()))[:30] if isinstance(raw, dict) else None,
+            "updated_at": saved["updated_at"].isoformat() if saved["updated_at"] else None,
+        }
+    else:
+        out["saved_notice"] = None
+
+    # 2. Fetch full order from ML to replay enrichment
+    try:
+        token, _exp, _ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except Exception as err:  # noqa: BLE001
+        return {**out, "error": "oauth_failed", "detail": str(err)}
+
+    enriched: dict[str, Any] = {}
+    async with httpx.AsyncClient() as http:
+        gr = await http.get(
+            f"https://api.mercadolibre.com/orders/{order_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15.0,
+        )
+        if gr.status_code >= 400:
+            return {**out, "error": "ml_order_fetch_failed", "status": gr.status_code, "detail": gr.text[:300]}
+        try:
+            enriched = gr.json() or {}
+        except Exception:  # noqa: BLE001
+            enriched = {}
+
+    # 3. Extract first item_id + sale_price (same logic as _enrich_order_with_margin)
+    items_arr = enriched.get("order_items") or enriched.get("items") or []
+    first = items_arr[0] if items_arr and isinstance(items_arr[0], dict) else None
+    item_id = ""
+    sale_price = 0.0
+    if first:
+        inner = first.get("item") if isinstance(first.get("item"), dict) else first
+        if isinstance(inner, dict):
+            item_id = str(inner.get("id") or inner.get("mlb") or "").strip().upper()
+        if not item_id:
+            item_id = str(first.get("mlb") or "").strip().upper()
+        try:
+            sale_price = float(first.get("unit_price") or 0.0)
+        except (TypeError, ValueError):
+            sale_price = 0.0
+    out["extracted"] = {
+        "item_id": item_id,
+        "sale_price": sale_price,
+        "items_count": len(items_arr),
+        "status": enriched.get("status"),
+        "date_created": enriched.get("date_created"),
+    }
+
+    # 4. Check margin cache directly
+    margin_cache: Optional[dict[str, Any]] = None
+    if item_id:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT computed_at FROM ml_item_margin_cache
+                 WHERE user_id = $1 AND item_id = $2 AND period_months = 3
+                """,
+                user.id, item_id,
+            )
+        if row:
+            margin_cache = {
+                "exists": True,
+                "computed_at": row["computed_at"].isoformat() if row["computed_at"] else None,
+            }
+        else:
+            margin_cache = {"exists": False}
+    out["margin_cache_for_item"] = margin_cache
+
+    # 5. Run _enrich_order_with_margin and capture _margin / _breakeven
+    enrich_result = {"called": False, "exception": None}
+    if item_id and sale_price > 0 and pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                await ml_backfill_svc._enrich_order_with_margin(
+                    conn, user.id, enriched, pool=pool,
+                )
+            enrich_result["called"] = True
+        except Exception as err:  # noqa: BLE001
+            enrich_result["exception"] = str(err)
+    out["enrichment"] = enrich_result
+    out["margin_injected"] = bool(enriched.get("_margin"))
+    out["breakeven_injected"] = bool(enriched.get("_breakeven"))
+    if enriched.get("_margin"):
+        m = enriched["_margin"]
+        out["margin_summary"] = {
+            "project": m.get("project"),
+            "margin_variable_pct": (m.get("unit") or {}).get("margin_variable_pct"),
+            "profit_variable": (m.get("unit") or {}).get("profit_variable"),
+        }
+    if enriched.get("_breakeven"):
+        out["breakeven_summary"] = enriched["_breakeven"]
+
+    # 6. Run normalize_event to see what description would emerge
+    try:
+        notice = ml_normalize_svc.normalize_event(
+            "orders_v2", f"/orders/{order_id}", enriched,
+        )
+        out["replayed_notice"] = {
+            "label": notice.get("label"),
+            "description_preview": (notice.get("description") or "")[:1500],
+            "tags": notice.get("tags") or [],
+        }
+    except Exception as err:  # noqa: BLE001
+        out["replayed_notice"] = {"error": str(err)}
+
+    return out
+
+
 @router.get("/user-promotions/diagnostic")
 async def promotions_diagnostic(
     user: CurrentUser = Depends(current_user),
