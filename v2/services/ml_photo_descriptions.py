@@ -267,3 +267,108 @@ def descriptions_to_prompt_block(descriptions: list[dict[str, Any]]) -> str:
         if desc:
             lines.append(f"\nFoto {idx}: {desc}")
     return "\n".join(lines)
+
+
+# ── Auto-generation cron ──────────────────────────────────────────────────
+
+DEFAULT_MAX_ITEMS_PER_RUN = 15  # caps OpenRouter spend (≈ $1 per run)
+ITEM_THROTTLE_SECONDS = 4.0
+
+
+async def auto_generate_for_user(
+    pool: asyncpg.Pool, user_id: int, max_items: int = DEFAULT_MAX_ITEMS_PER_RUN,
+) -> dict[str, int]:
+    """For one user: pick up to N most-sold active items WITHOUT cached
+    descriptions, generate one batch each. Throttled at ~4s/item to keep
+    OpenRouter latency tame and avoid rate spikes.
+
+    Active item filter: status='active', uses ml_user_items.sold_quantity
+    DESC for priority (popular items get descriptions first — they receive
+    the most buyer questions).
+    """
+    import asyncio
+    import json as _json
+
+    await ensure_schema(pool)
+    async with pool.acquire() as conn:
+        # LEFT JOIN: items lacking ANY description for this user
+        rows = await conn.fetch(
+            """
+            SELECT i.item_id, ctx.pictures, i.sold_quantity
+              FROM ml_user_items i
+              JOIN ml_item_context ctx
+                ON ctx.user_id = i.user_id AND ctx.item_id = i.item_id
+              LEFT JOIN ml_item_photo_descriptions pd
+                ON pd.user_id = i.user_id AND pd.item_id = i.item_id
+             WHERE i.user_id = $1
+               AND COALESCE(i.status, 'active') = 'active'
+               AND pd.item_id IS NULL
+               AND ctx.pictures IS NOT NULL
+             GROUP BY i.item_id, ctx.pictures, i.sold_quantity
+             ORDER BY i.sold_quantity DESC NULLS LAST
+             LIMIT $2
+            """,
+            user_id, max_items,
+        )
+
+    processed = 0
+    generated_total = 0
+    skipped = 0
+    errors = 0
+    for r in rows:
+        pics = r["pictures"]
+        if isinstance(pics, str):
+            try:
+                pics = _json.loads(pics)
+            except Exception:  # noqa: BLE001
+                pics = []
+        if not isinstance(pics, list) or not pics:
+            skipped += 1
+            continue
+        try:
+            res = await generate_descriptions_for_item(
+                pool, user_id, r["item_id"], pics, force=False,
+            )
+            generated_total += int(res.get("generated") or 0)
+            if res.get("error"):
+                errors += 1
+        except Exception as err:  # noqa: BLE001
+            log.warning("auto-gen photo desc user=%s item=%s failed: %s",
+                        user_id, r["item_id"], err)
+            errors += 1
+        processed += 1
+        await asyncio.sleep(ITEM_THROTTLE_SECONDS)
+
+    return {
+        "user_id": user_id,
+        "items_processed": processed,
+        "descriptions_generated": generated_total,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
+async def auto_generate_all_users(
+    pool: asyncpg.Pool, max_items_per_user: int = DEFAULT_MAX_ITEMS_PER_RUN,
+) -> dict[str, int]:
+    """Daily cron entrypoint. Iterate all ML-connected users + run
+    auto_generate_for_user with the per-user cap."""
+    if pool is None:
+        return {"users": 0}
+    await ensure_schema(pool)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT user_id FROM ml_user_tokens WHERE access_token IS NOT NULL"
+        )
+    totals = {"users": 0, "items_processed": 0,
+              "descriptions_generated": 0, "errors": 0}
+    for r in rows:
+        try:
+            res = await auto_generate_for_user(pool, r["user_id"], max_items_per_user)
+            totals["users"] += 1
+            totals["items_processed"] += int(res.get("items_processed") or 0)
+            totals["descriptions_generated"] += int(res.get("descriptions_generated") or 0)
+            totals["errors"] += int(res.get("errors") or 0)
+        except Exception as err:  # noqa: BLE001
+            log.exception("photo-desc auto-gen user=%s failed: %s", r["user_id"], err)
+    return totals

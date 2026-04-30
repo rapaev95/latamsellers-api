@@ -299,6 +299,26 @@ async def _backfill_all_users_job() -> None:
         _ml_log.exception("ML backfill job failed: %s", err)
 
 
+async def _photo_descriptions_auto_gen_job() -> None:
+    """Daily auto-generate AI photo descriptions for items without them.
+    Picks top-15 most-sold active items per user, throttles 4s per item.
+    Cost cap ≈ $1/user/day at $0.06 per item batch."""
+    try:
+        from v2.services import ml_photo_descriptions as photo_svc
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("photo-desc auto-gen tick skipped: no DB pool")
+            return
+        result = await photo_svc.auto_generate_all_users(pool)
+        _ml_log.info(
+            "photo-desc auto-gen: users=%s items=%s desc=%s errors=%s",
+            result.get("users"), result.get("items_processed"),
+            result.get("descriptions_generated"), result.get("errors"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("photo-desc auto-gen job failed: %s", err)
+
+
 async def _inventory_alerts_job() -> None:
     """Daily inventory critical-stock alerts. For each user with TG settings
     iterate active items, send alert (1 per item per 7 days dedup) if
@@ -888,6 +908,18 @@ async def _v2_startup() -> None:
         _inventory_alerts_job,
         CronTrigger(hour=12, minute=0, timezone="UTC"),
         id="inventory_alerts_daily",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Photo-description auto-generation at 05:00 UTC — runs after nightly
+    # ml_user_items refresh (03:00) so popular new items get described
+    # without seller manually triggering. Caps at 15 items/user/day to
+    # control OpenRouter spend (~$1/user/day worst case).
+    _ml_scheduler.add_job(
+        _photo_descriptions_auto_gen_job,
+        CronTrigger(hour=5, minute=0, timezone="UTC"),
+        id="photo_descriptions_auto_gen_daily",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

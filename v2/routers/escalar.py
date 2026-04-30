@@ -4957,6 +4957,24 @@ async def photo_descriptions_generate(
     )
 
 
+@router.post("/items/photo-descriptions/auto-generate")
+async def photo_descriptions_auto_generate(
+    max_items: int = Query(15, ge=1, le=50),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Manual trigger: pick top-N most-sold active items without cached
+    descriptions, generate batches. Same logic as daily 05:00 UTC cron.
+
+    Use to bootstrap a fresh seller account or top up after adding new
+    products without waiting for tomorrow's auto-run.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    from v2.services import ml_photo_descriptions as photo_svc
+    return await photo_svc.auto_generate_for_user(pool, user.id, max_items)
+
+
 @router.get("/items/{mlb}/photo-descriptions")
 async def photo_descriptions_get(
     mlb: str,
