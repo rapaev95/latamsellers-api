@@ -353,10 +353,12 @@ async def _enrich_order_with_margin(
 
     # Paused-with-stock — товары которые юзер либо сам поставил на паузу,
     # либо ML модерация, но stock реально есть. Это «мёртвый Full капитал»
-    # без трафика. В TG прикладываем top-3 + signed activate-link к каждому
-    # — юзер кликает прямо из мессенджера → активация без UI.
+    # без трафика. В TG показываем top-3 + ссылку на UI-страничку
+    # /escalar/activate/{id} — там cookie-auth → кнопка «Ativar» → POST
+    # /escalar/items/{id}/activate (как все остальные endpoint'ы).
     try:
-        from . import tg_action_links as _tg_links
+        import os as _os_pws
+        _app_base_pws = _os_pws.environ.get("APP_BASE_URL", "https://app.lsprofit.app").rstrip("/")
         async with pool.acquire() as conn:
             paused_rows = await conn.fetch(
                 """
@@ -379,10 +381,7 @@ async def _enrich_order_with_margin(
                     "stock": int(pr["available_quantity"] or 0),
                     "sold": int(pr["sold_quantity"] or 0),
                     "title": pr["title"] or "",
-                    "activate_url": _tg_links.make_signed_url(
-                        action="activate-via-link",
-                        user_id=user_id, item_id=pid,
-                    ),
+                    "activate_url": f"{_app_base_pws}/escalar/activate/{pid}",
                 })
             enriched["_paused_with_stock"] = paused_list
     except Exception as err:  # noqa: BLE001
