@@ -47,7 +47,6 @@ from v2.schemas.finance import (
     DividendIn, DividendOut, DividendsListOut, DividendMutOut,
     APListOut,
     ManualInflowIn, ManualInflowOut, ManualInflowsListOut,
-    ServicesPnlOut, ServicesCashflowOut, ServicesBalanceOut, ServicesReportsBundleOut,
 )
 from v2.storage import uploads_storage
 from v2.storage import manual_usd_inflows as manual_inflows_svc
@@ -240,111 +239,6 @@ async def get_reports(
     )
     out.update(bundle)
     response.headers["X-Cache"] = status
-    return out
-
-
-@router.get("/services-reports", response_model=ServicesReportsBundleOut)
-async def get_services_reports(
-    response: Response,
-    project: str = Query(..., description="Project ID, must have type='services'"),
-    period_from: Optional[str] = Query(None, alias="from"),
-    period_to: Optional[str] = Query(None, alias="to"),
-    fresh: bool = Query(False, description="Bypass cache and recompute from scratch"),
-    user: CurrentUser = Depends(current_user),
-    pool=Depends(get_pool),
-) -> dict[str, Any]:
-    """Invoice-based ОПиУ + ДДС + Balance for services-projects (Estonia /
-    GANZA-USD / `compensation_mode='rental'|'profit_share'`).
-
-    Wraps `v2/services/services_reports.compute_for_user` with the same
-    durable read-through cache as the ecom `/reports` endpoint
-    (`finance_compute_cache` table). First call after data change recomputes;
-    subsequent identical requests served from JSONB in ~50ms.
-
-    Returns 404 if project doesn't exist; 400 if it's not a services project.
-    Per-tab errors surface as `{pnl_error, cashflow_error, balance_error}`
-    instead of a single 500 — same UX pattern as ecom reports.
-    """
-    if pool is None:
-        raise HTTPException(status_code=503, detail="db_unavailable")
-    _bind_user(user)
-
-    projects = legacy_config.load_projects()
-    if project not in projects:
-        raise HTTPException(
-            status_code=404,
-            detail={"error": "project_not_found", "available": list(projects.keys())},
-        )
-    proj_meta = projects.get(project, {}) or {}
-    if proj_meta.get("type") != "services":
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "not_services_project",
-                "got_type": proj_meta.get("type"),
-                "hint": "use /finance/reports for ecom projects",
-            },
-        )
-
-    pf = _parse_iso(period_from)
-    pt = _parse_iso(period_to) or date.today()
-    if pf is None:
-        pf = date.fromordinal(pt.toordinal() - 365)  # default: 12 months back
-
-    out: dict[str, Any] = {
-        "project": project,
-        "period": {"from": pf.isoformat(), "to": pt.isoformat()},
-    }
-
-    from v2.services import services_reports as services_svc
-
-    async def _compute_async() -> dict[str, Any]:
-        bundle = await services_svc.compute_for_user(
-            pool, user.id, project, period_from=pf, period_to=pt,
-        )
-        # Drop top-level project/period — they're already in `out`. Keep only
-        # pnl/cashflow/balance + per-tab errors so finance_cache stores the
-        # heavy compute result, not redundant routing fields.
-        return {
-            k: v for k, v in bundle.items()
-            if k not in ("project", "period")
-        }
-
-    cache_key = f"services_reports:{project}:{pf.isoformat()}:{pt.isoformat()}"
-
-    # finance_cache.cached_compute is sync — run our async builder via a
-    # synchronous bridge that uses asyncio.run inside a thread (lazy import of
-    # the helper keeps the cache module unaware of asyncio). For now: just
-    # await the compute and inline-cache via the same UPSERT primitives.
-    # Bypass cache when `fresh=true`.
-    bundle: dict[str, Any]
-    cache_status: str
-    if fresh:
-        bundle = await _compute_async()
-        cache_status = "force"
-    else:
-        # Try cached read first (sync, fast).
-        fp, deps = finance_cache.compute_fingerprint(user.id)
-        cached = (
-            finance_cache._read_cached(user.id, cache_key, fp) if fp else None  # noqa: SLF001
-        )
-        if cached is not None:
-            bundle = cached
-            cache_status = "hit"
-        else:
-            bundle = await _compute_async()
-            # Don't cache partial / errored bundles.
-            has_error = any(k.endswith("_error") for k in bundle)
-            if not has_error and fp:
-                stored = finance_cache._write_cached(  # noqa: SLF001
-                    user.id, cache_key, bundle, fp, deps,
-                )
-                cache_status = "miss" if stored else "compute_only"
-            else:
-                cache_status = "skip_cache"
-
-    out.update(bundle)
-    response.headers["X-Cache"] = cache_status
     return out
 
 
