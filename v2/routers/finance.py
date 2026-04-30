@@ -2668,6 +2668,8 @@ async def uploads_diag_retirada_period(
             "units_other": rc.get("units_other"),
             "rows_count": rc.get("rows_count"),
             "missing_cost_skus_count": len(rc.get("missing_cost_skus") or []),
+            "missing_cost_skus": rc.get("missing_cost_skus") or [],
+            "fallback_avg_used": rc.get("fallback_avg_used"),
         }
     except Exception as err:  # noqa: BLE001
         out["compute_retirada_cost_error"] = f"{type(err).__name__}: {err}"
