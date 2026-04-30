@@ -329,6 +329,17 @@ async def _enrich_order_with_margin(
     except Exception as err:  # noqa: BLE001
         log.debug("breakeven update failed for project=%s: %s", project, err)
 
+    # Inventory forecast — стoк + 14d скорость → сколько дней хватит.
+    # Skip silently если service не доступен / item не в ml_user_items.
+    try:
+        from . import ml_inventory_forecast as inv_svc
+        await inv_svc.ensure_schema(pool)
+        snap = await inv_svc.get_inventory_snapshot(pool, user_id, item_id)
+        if snap:
+            enriched["_inventory"] = snap
+    except Exception as err:  # noqa: BLE001
+        log.debug("inventory snapshot failed for item=%s: %s", item_id, err)
+
 
 async def _upsert_batch(
     conn: asyncpg.Connection,

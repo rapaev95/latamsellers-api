@@ -237,6 +237,35 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                         ).replace(",", "X").replace(".", ",").replace("X", ".")
                     )
                 # Если target=0 — нет fixed costs, не показываем progress.
+
+            # ── Inventory forecast block ──────────────────────────────
+            # Stock + window-based velocity → days_left. memory:
+            # project_inventory_forecast_in_tg.md (14d default, cancelled
+            # excluded, both Full и MEnvios).
+            inv = enriched.get("_inventory") or {}
+            if inv:
+                stock = int(inv.get("stock") or 0)
+                sold_w = int(inv.get("sold_in_window") or 0)
+                window_d = int(inv.get("window_days") or 14)
+                avg_d = float(inv.get("avg_daily") or 0)
+                days_left = inv.get("days_left")
+                level = inv.get("level") or "ok"
+
+                desc_lines.append("")
+                if level == "no_history" or avg_d <= 0:
+                    desc_lines.append(f"📦 Estoque: {stock} un. · sem histórico em {window_d}d")
+                elif level == "critical":
+                    days_disp = days_left if days_left is not None else 0
+                    desc_lines.append(
+                        f"📦 ⚠️ Estoque: {stock} un. · {window_d}d: {sold_w} vendas "
+                        f"(≈{avg_d:.1f}/dia) · ⏰ apenas ~{days_disp} dias!"
+                    )
+                else:
+                    days_disp = days_left if days_left is not None else "∞"
+                    desc_lines.append(
+                        f"📦 Estoque: {stock} un. · {window_d}d: {sold_w} vendas "
+                        f"(≈{avg_d:.1f}/dia) · ⏰ ~{days_disp} dias"
+                    )
         elif sale_price > 0 and item_id:
             # Margin не подсчитан. Причины: либо unit_cost_brl пуст в каталоге
             # (тогда заполнить через sku-mapping), либо ml_item_margin_cache
