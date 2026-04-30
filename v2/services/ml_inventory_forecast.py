@@ -67,19 +67,62 @@ async def _get_window_days(pool: asyncpg.Pool, user_id: int) -> int:
     return DEFAULT_WINDOW_DAYS
 
 
-async def _get_stock(pool: asyncpg.Pool, user_id: int, item_id: str) -> Optional[int]:
+async def _get_stock(
+    pool: asyncpg.Pool,
+    user_id: int,
+    item_id: str,
+    variation_id: Optional[str] = None,
+) -> tuple[Optional[int], Optional[str]]:
+    """Returns (stock_int, variation_label).
+
+    If variation_id is provided, drills into ml_user_items.raw.variations[]
+    and returns the matched variation's available_quantity + a short
+    label derived from variation attributes. Falls back to item-level
+    available_quantity if variation not found in cached raw.
+    """
     try:
         async with pool.acquire() as conn:
-            v = await conn.fetchval(
-                "SELECT available_quantity FROM ml_user_items WHERE user_id = $1 AND item_id = $2",
+            row = await conn.fetchrow(
+                "SELECT available_quantity, raw FROM ml_user_items "
+                "WHERE user_id = $1 AND item_id = $2",
                 user_id, item_id,
             )
-        if v is None:
-            return None
-        return int(v)
+        if row is None:
+            return None, None
+        item_total = int(row["available_quantity"] or 0)
+        if not variation_id:
+            return item_total, None
+
+        raw = row["raw"]
+        if isinstance(raw, str):
+            try:
+                import json as _json
+                raw = _json.loads(raw)
+            except Exception:  # noqa: BLE001
+                raw = {}
+        variations = (raw or {}).get("variations") if isinstance(raw, dict) else None
+        if not isinstance(variations, list):
+            return item_total, None
+        for v in variations:
+            if not isinstance(v, dict):
+                continue
+            if str(v.get("id") or "") != str(variation_id):
+                continue
+            v_qty = int(v.get("available_quantity") or 0)
+            # Build short label from attribute_combinations
+            label_parts: list[str] = []
+            for attr in (v.get("attribute_combinations") or []):
+                name = attr.get("value_name") or attr.get("name") or ""
+                if name and len(label_parts) < 3:
+                    label_parts.append(str(name))
+            label = " · ".join(label_parts) if label_parts else f"var {variation_id}"
+            return v_qty, label
+        # variation_id supplied but not found in cache → fall back to item total
+        return item_total, None
     except Exception as err:  # noqa: BLE001
-        log.debug("get_stock failed user=%s item=%s: %s", user_id, item_id, err)
-        return None
+        log.debug("get_stock failed user=%s item=%s var=%s: %s",
+                  user_id, item_id, variation_id, err)
+        return None, None
 
 
 def _level(days_left: Optional[float], avg_daily: float) -> str:
@@ -98,6 +141,7 @@ async def get_inventory_snapshot(
     pool: asyncpg.Pool,
     user_id: int,
     item_id: str,
+    variation_id: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """Returns inventory snapshot dict, or None if stock data unavailable.
 
@@ -109,12 +153,18 @@ async def get_inventory_snapshot(
         "avg_daily": float (rounded to 2 dec),
         "days_left": int | None,    # None when avg_daily == 0
         "level": "critical" | "low" | "ok" | "no_history",
+        "variation_id": str | None,
+        "variation_label": str | None,  # e.g. "Preto · M" if variation matched
       }
+
+    Stock — per-variation if variation_id supplied AND found in cached raw,
+    else item-level total. Sales window — item-level (per-variation sales
+    needs deeper join into order items, kept simple for now).
 
     None if item not in ml_user_items (no stock to forecast against). The
     caller (normalize.orders_v2) skips the inventory block in that case.
     """
-    stock = await _get_stock(pool, user_id, item_id)
+    stock, var_label = await _get_stock(pool, user_id, item_id, variation_id)
     if stock is None:
         return None
 
@@ -143,6 +193,8 @@ async def get_inventory_snapshot(
         "avg_daily": avg_daily,
         "days_left": days_left,
         "level": level,
+        "variation_id": str(variation_id) if variation_id else None,
+        "variation_label": var_label,
     }
 
 

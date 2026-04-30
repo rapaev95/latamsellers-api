@@ -333,10 +333,19 @@ async def _enrich_order_with_margin(
 
     # Inventory forecast — стoк + 14d скорость → сколько дней хватит.
     # Skip silently если service не доступен / item не в ml_user_items.
+    # Если у order есть variation_id — берём stock per-variation (точнее
+    # для multi-variant товаров).
     try:
         from . import ml_inventory_forecast as inv_svc
         await inv_svc.ensure_schema(pool)
-        snap = await inv_svc.get_inventory_snapshot(pool, user_id, item_id)
+        var_id_for_inv: Optional[str] = None
+        if isinstance(inner, dict):
+            var_id_for_inv = str(inner.get("variation_id") or "").strip() or None
+        if not var_id_for_inv:
+            var_id_for_inv = str(first.get("variation_id") or "").strip() or None
+        snap = await inv_svc.get_inventory_snapshot(
+            pool, user_id, item_id, variation_id=var_id_for_inv,
+        )
         if snap:
             enriched["_inventory"] = snap
     except Exception as err:  # noqa: BLE001

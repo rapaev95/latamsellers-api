@@ -275,6 +275,9 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                 avg_d = float(inv.get("avg_daily") or 0)
                 days_left = inv.get("days_left")
                 level = inv.get("level") or "ok"
+                var_label = inv.get("variation_label") or ""
+                # «Estoque (Preto · M):» когда stock считался per-variation.
+                est_label = f"Estoque ({var_label})" if var_label else "Estoque"
 
                 desc_lines.append("")
                 # Stockout = особый случай: сообщать «хватит на ~0 дней» —
@@ -284,28 +287,28 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                 if stock <= 0 and avg_d > 0:
                     refill_30d = int(round(avg_d * 30))
                     desc_lines.append(
-                        f"📦 🛑 Esgotado! {window_d}d: {sold_w} vendas "
+                        f"📦 🛑 {est_label} esgotado! {window_d}d: {sold_w} vendas "
                         f"(≈{avg_d:.1f}/dia) → reabasteça ≈{refill_30d} un. "
                         f"para 30 dias"
                     )
                 elif stock <= 0:
                     # Stockout без истории продаж — просто маркер
                     desc_lines.append(
-                        f"📦 🛑 Esgotado · sem vendas em {window_d}d (impossível "
-                        f"estimar refill)"
+                        f"📦 🛑 {est_label} esgotado · sem vendas em {window_d}d "
+                        f"(impossível estimar refill)"
                     )
                 elif level == "no_history" or avg_d <= 0:
-                    desc_lines.append(f"📦 Estoque: {stock} un. · sem histórico em {window_d}d")
+                    desc_lines.append(f"📦 {est_label}: {stock} un. · sem histórico em {window_d}d")
                 elif level == "critical":
                     days_disp = days_left if days_left is not None else 0
                     desc_lines.append(
-                        f"📦 ⚠️ Estoque: {stock} un. · {window_d}d: {sold_w} vendas "
+                        f"📦 ⚠️ {est_label}: {stock} un. · {window_d}d: {sold_w} vendas "
                         f"(≈{avg_d:.1f}/dia) · ⏰ apenas ~{days_disp} dias!"
                     )
                 else:
                     days_disp = days_left if days_left is not None else "∞"
                     desc_lines.append(
-                        f"📦 Estoque: {stock} un. · {window_d}d: {sold_w} vendas "
+                        f"📦 {est_label}: {stock} un. · {window_d}d: {sold_w} vendas "
                         f"(≈{avg_d:.1f}/dia) · ⏰ ~{days_disp} dias"
                     )
         elif sale_price > 0 and item_id:
