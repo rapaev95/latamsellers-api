@@ -154,6 +154,7 @@ class BalanceReportOut(BaseModel):
     outflow_das: float = 0
     outflow_armazenagem: float = 0
     outflow_aluguel: float = 0
+    outflow_retirada: float = 0
     outflows_total: float = 0
     saldo: float = 0
     pending_rental_usd: float = 0

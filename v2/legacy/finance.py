@@ -195,6 +195,10 @@ class BalanceReport:
     outflow_das: float = 0.0
     outflow_armazenagem: float = 0.0
     outflow_aluguel: float = 0.0
+    # Списания/вывозы со склада ML (retirada) — cumulative tarifa за всё
+    # время проекта. Cash-event на счёте ML (списывается тариф за coleta /
+    # descarte). COGS списанного товара отдельно (idёт в accumulated_profit).
+    outflow_retirada: float = 0.0
     outflows_total: float = 0.0
     saldo: float = 0.0
     pending_rental_usd: float = 0.0
@@ -1237,6 +1241,22 @@ def compute_balance(
     except Exception:
         out_full_express = 0.0
 
+    # 6b. Retirada — тариф за coleta/descarte со склада ML (cash event,
+    # независимо от COGS). Учитываем за весь period (launch→as_of) так же
+    # как armazenagem/publicidade. Берём tarifa_envio + tarifa_descarte +
+    # tarifa_other (все cash-составляющие). cogs_descarte НЕ включаем сюда —
+    # это inventory writeoff, не cash.
+    try:
+        retirada_period = compute_retirada_cost(project, (period[0], as_of))
+        out_retirada = round(
+            float(retirada_period.get("tarifa_envio", 0.0) or 0.0)
+            + float(retirada_period.get("tarifa_descarte", 0.0) or 0.0)
+            + float(retirada_period.get("tarifa_other", 0.0) or 0.0),
+            2,
+        )
+    except Exception:
+        out_retirada = 0.0
+
     # 7. Mercadoria = фактические платежи поставщикам (из ДДС/banking + manual_supplier)
     # НЕ stock_value: чтобы не дублировать (stock_value = оставшийся актив,
     # supplier cash = то что юзер реально заплатил поставщикам). Stock value
@@ -1294,9 +1314,12 @@ def compute_balance(
             out_armazenagem = float(overrides["armazenagem"])
         if "aluguel" in overrides and overrides["aluguel"] not in (None, "", 0):
             out_aluguel = float(overrides["aluguel"])
+        if "retirada" in overrides and overrides["retirada"] not in (None, "", 0):
+            out_retirada = float(overrides["retirada"])
 
     outflows_total = (out_mercadoria + out_publicidade + out_devolucoes
-                      + out_full_express + out_das + out_armazenagem + out_aluguel)
+                      + out_full_express + out_das + out_armazenagem + out_aluguel
+                      + out_retirada)
 
     saldo = inflows_total - outflows_total
 
@@ -1562,6 +1585,7 @@ def compute_balance(
         outflow_das=out_das,
         outflow_armazenagem=out_armazenagem,
         outflow_aluguel=out_aluguel,
+        outflow_retirada=out_retirada,
         outflows_total=outflows_total,
         saldo=saldo,
         pending_rental_usd=pending_usd,
