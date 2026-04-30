@@ -2507,6 +2507,82 @@ async def upload_inspect(
     return out
 
 
+@router.get("/uploads/diag-mappings")
+async def uploads_diag_mappings(
+    project: str = Query(..., description="Project ID, e.g. ARTUR"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Покажи как armazenagem и retirada SKU маппятся к проектам. Используется
+    когда в PnL `Armazenagem` / `Вывоз / Списание` показывают 0 при том что
+    данные парсятся (см. diag-armazenagem / diag-retirada). Корень — SKU
+    отсутствует в catalog (cost+project mapping)."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    _bind_user(user)
+
+    from v2.legacy.reports import load_armazenagem_report, load_retirada_estoque_report
+
+    out: dict[str, Any] = {"project": project, "armazenagem": {}, "retirada": {}}
+
+    try:
+        df_arm = load_armazenagem_report()
+    except Exception as err:  # noqa: BLE001
+        out["armazenagem"]["error"] = f"{type(err).__name__}: {err}"
+        df_arm = None
+    if df_arm is not None and not df_arm.empty:
+        total_skus = int(df_arm["SKU"].nunique())
+        by_proj: dict[str, int] = {}
+        for proj in df_arm["__project"].fillna("(empty)"):
+            key = str(proj) or "(empty)"
+            by_proj[key] = by_proj.get(key, 0) + 1
+        target = df_arm[df_arm["__project"] == project]
+        unassigned = df_arm[(df_arm["__project"].isna()) | (df_arm["__project"] == "")]
+        out["armazenagem"] = {
+            "total_skus": total_skus,
+            "by_project_row_count": by_proj,
+            "skus_for_project": int(target["SKU"].nunique()) if not target.empty else 0,
+            "sample_skus_for_project": target["SKU"].head(20).tolist() if not target.empty else [],
+            "unassigned_count": int(unassigned["SKU"].nunique()) if not unassigned.empty else 0,
+            "sample_unassigned_skus": (
+                unassigned[["SKU", "MLB", "anuncio"]].head(15).to_dict(orient="records")
+                if not unassigned.empty else []
+            ),
+            "source_files": list(df_arm.attrs.get("__source_files", [])),
+            "daily_cols_total": len(df_arm.attrs.get("__daily_cols", [])),
+        }
+
+    try:
+        df_ret = load_retirada_estoque_report()
+    except Exception as err:  # noqa: BLE001
+        out["retirada"]["error"] = f"{type(err).__name__}: {err}"
+        df_ret = None
+    if df_ret is not None and not df_ret.empty:
+        total_rows = int(len(df_ret))
+        by_proj_ret: dict[str, int] = {}
+        for proj in df_ret["__project"].fillna("(empty)"):
+            key = str(proj) or "(empty)"
+            by_proj_ret[key] = by_proj_ret.get(key, 0) + 1
+        target = df_ret[df_ret["__project"] == project]
+        unassigned = df_ret[(df_ret["__project"].isna()) | (df_ret["__project"] == "")]
+        out["retirada"] = {
+            "total_rows": total_rows,
+            "by_project_row_count": by_proj_ret,
+            "rows_for_project": int(len(target)),
+            "tarifa_for_project": float(target["valor"].sum()) if not target.empty else 0.0,
+            "unassigned_rows": int(len(unassigned)),
+            "unassigned_tarifa": float(unassigned["valor"].sum()) if not unassigned.empty else 0.0,
+            "sample_unassigned": (
+                unassigned[["sku", "mlb", "anuncio", "forma", "valor", "units", "date"]]
+                .head(10).astype(str).to_dict(orient="records")
+                if not unassigned.empty else []
+            ),
+            "source_files": list(df_ret.attrs.get("__source_files", [])),
+        }
+
+    return out
+
+
 @router.get("/uploads/diag-armazenagem")
 async def uploads_diag_armazenagem(
     user: CurrentUser = Depends(current_user),
