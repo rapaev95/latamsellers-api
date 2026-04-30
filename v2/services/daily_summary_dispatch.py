@@ -580,7 +580,29 @@ async def _dispatch_for_user(
         text = text[:3990] + "…"
     keyboard = _build_keyboard(app_base, lang)
 
+    # AI narrative briefing — short human-friendly summary BEFORE the
+    # detailed metric card. Aggregates extras (claims/questions/promos)
+    # the rule-based card doesn't surface, sends as separate first message.
+    extras = await _aggregate_extras(pool, user_id, target_date)
     async with httpx.AsyncClient() as http:
+        narrative = await _build_ai_narrative(
+            http, today_metrics, yesterday_metrics, extras, lang,
+        )
+        if narrative:
+            try:
+                await http.post(
+                    f"{TG_API_BASE}/bot{bot_token}/sendMessage",
+                    json={
+                        "chat_id": chat_id,
+                        "text": narrative,
+                        "parse_mode": "Markdown",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=10.0,
+                )
+                await asyncio.sleep(0.5)  # spacing before metric card
+            except Exception as err:  # noqa: BLE001
+                log.debug("AI narrative TG send failed: %s", err)
         msg_id = await _send_card(http, bot_token, chat_id, text, keyboard)
 
     return {
@@ -593,6 +615,156 @@ async def _dispatch_for_user(
             "ad_cost": today_metrics["ad_cost"],
         },
     }
+
+
+# ── AI narrative briefing ────────────────────────────────────────
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+NARRATIVE_MODEL = "anthropic/claude-sonnet-4.5"
+
+
+async def _aggregate_extras(
+    pool: asyncpg.Pool, user_id: int, target_date: date,
+) -> dict[str, int]:
+    """Counts of new claims / unanswered questions / active promo candidates
+    for the AI narrative. Failures fall back to zeros (narrative still useful)."""
+    start_brt = datetime.combine(target_date, datetime.min.time(), tzinfo=BRT)
+    end_brt = start_brt + timedelta(days=1)
+    out = {
+        "new_claims": 0, "open_claims_total": 0,
+        "unanswered_questions": 0, "promo_candidates": 0,
+    }
+    try:
+        async with pool.acquire() as conn:
+            out["new_claims"] = int(await conn.fetchval(
+                "SELECT COUNT(*) FROM ml_user_claims WHERE user_id = $1 "
+                "AND date_created BETWEEN $2 AND $3",
+                user_id, start_brt, end_brt,
+            ) or 0)
+            out["open_claims_total"] = int(await conn.fetchval(
+                "SELECT COUNT(*) FROM ml_user_claims WHERE user_id = $1 "
+                "AND status = 'opened'",
+                user_id,
+            ) or 0)
+            out["unanswered_questions"] = int(await conn.fetchval(
+                "SELECT COUNT(*) FROM ml_user_questions WHERE user_id = $1 "
+                "AND status = 'UNANSWERED'",
+                user_id,
+            ) or 0)
+            out["promo_candidates"] = int(await conn.fetchval(
+                "SELECT COUNT(*) FROM ml_user_promotions WHERE user_id = $1 "
+                "AND status = 'candidate' AND accepted_at IS NULL "
+                "AND dismissed_at IS NULL",
+                user_id,
+            ) or 0)
+    except Exception as err:  # noqa: BLE001
+        log.debug("aggregate_extras failed user=%s: %s", user_id, err)
+    return out
+
+
+_NARRATIVE_LANG_LABELS = {
+    "ru": "русский", "en": "English",
+    "pt": "português brasileiro", "es": "español",
+}
+
+_NARRATIVE_PROMPT = """Você é um analista de vendas do Mercado Livre Brasil que escreve um BRIEFING DIÁRIO ULTRA-CURTO em {lang_label} para o seller, baseado nos números de hoje vs ontem + estado pendente.
+
+Formato OBRIGATÓRIO:
+*<emoji> Resumo do dia*
+
+📊 *Hoje:* <1 frase com vendas + receita + delta vs ontem>
+{extras_lines_format}
+
+✅ *Foco para amanhã:*
+• <ação 1 — verbo no imperativo>
+• <ação 2 — apenas se realmente prioritária>
+
+REGRAS:
+- Total ≤ 500 caracteres.
+- NÃO repita números que já estão no card detalhado (que vai logo depois).
+- Se não houve atividade — diga isso direto, sem fluff.
+- Use markdown simples (negrito *texto*) para Telegram.
+- NÃO inventar — só usar números fornecidos."""
+
+
+def _build_narrative_prompt_inputs(
+    today: dict[str, Any], yesterday: dict[str, Any], extras: dict[str, int],
+) -> str:
+    delta_orders = (today.get("orders_count", 0) - yesterday.get("orders_count", 0))
+    delta_revenue = (today.get("revenue", 0) - yesterday.get("revenue", 0))
+    return (
+        f"VENDAS HOJE: {today.get('orders_count', 0)} pedidos · "
+        f"R$ {today.get('revenue', 0):.2f}\n"
+        f"VENDAS ONTEM: {yesterday.get('orders_count', 0)} pedidos · "
+        f"R$ {yesterday.get('revenue', 0):.2f}\n"
+        f"DELTA: {delta_orders:+d} pedidos · R$ {delta_revenue:+.2f}\n"
+        f"VISITAS HOJE: {today.get('visits', 0)} (ontem {yesterday.get('visits', 0)})\n"
+        f"AD COST HOJE: R$ {today.get('ad_cost', 0):.2f} · "
+        f"ACOS {today.get('acos_pct', 0):.1f}%\n"
+        f"PENDENTES:\n"
+        f"  • Reclamações novas hoje: {extras.get('new_claims', 0)}\n"
+        f"  • Reclamações abertas total: {extras.get('open_claims_total', 0)}\n"
+        f"  • Perguntas não respondidas: {extras.get('unanswered_questions', 0)}\n"
+        f"  • Candidatos de promoção pendentes: {extras.get('promo_candidates', 0)}"
+    )
+
+
+async def _build_ai_narrative(
+    http: httpx.AsyncClient,
+    today: dict[str, Any],
+    yesterday: dict[str, Any],
+    extras: dict[str, int],
+    language: str,
+) -> Optional[str]:
+    """Returns formatted briefing text, or None if disabled / OpenRouter
+    failure (caller falls back to silent — rule-based card still goes)."""
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return None
+    lang_label = _NARRATIVE_LANG_LABELS.get((language or "pt").lower(), "português brasileiro")
+    inputs = _build_narrative_prompt_inputs(today, yesterday, extras)
+    extras_fmt = (
+        "📌 *Pendentes:* <claims, perguntas e candidatos de promoção em 1 linha>"
+    )
+    prompt = _NARRATIVE_PROMPT.format(
+        lang_label=lang_label, extras_lines_format=extras_fmt,
+    )
+    try:
+        r = await http.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://app.lsprofit.app",
+                "X-Title": "LS Profit App",
+            },
+            json={
+                "model": NARRATIVE_MODEL,
+                "max_tokens": 350,
+                "temperature": 0.4,
+                "messages": [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": inputs},
+                ],
+            },
+            timeout=20.0,
+        )
+        if r.status_code != 200:
+            log.warning("daily narrative %s: %s", r.status_code, r.text[:200])
+            try:
+                from . import tg_admin_alerts as _alerts
+                await _alerts.alert_openrouter_failure(
+                    r.status_code, r.text, service="daily-summary/narrative",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+        data = r.json()
+        content = (data.get("choices") or [{}])[0].get("message", {}).get("content")
+        return content.strip() if isinstance(content, str) else None
+    except Exception as err:  # noqa: BLE001
+        log.debug("narrative exception: %s", err)
+        return None
 
 
 # ── Cron entry point ─────────────────────────────────────────────
