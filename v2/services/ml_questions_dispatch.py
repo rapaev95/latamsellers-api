@@ -31,7 +31,8 @@ log = logging.getLogger(__name__)
 
 TG_API_BASE = "https://api.telegram.org"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-LLM_MODEL = "openai/gpt-4o-mini"
+LLM_MODEL = "anthropic/claude-sonnet-4.5"  # match Next.js ai-suggest, supports vision
+IMAGE_DETAIL = "high"  # ~$0.01/image; 6 images ≈ $0.06 per suggestion
 TG_BATCH_CAP = 10  # max questions per user per tick (avoid TG rate limit)
 TG_THROTTLE = 1.1  # 1 sec between TG sends per chat
 
@@ -92,20 +93,62 @@ def _strip_md2_escapes(text: str) -> str:
     return _MD2_UNESCAPE_RE.sub(r"\1", out)
 
 
-SUGGEST_SYSTEM_PROMPT = """Você é um vendedor profissional do Mercado Livre Brasil.
+SUGGEST_SYSTEM_PROMPT = """Você é um vendedor profissional do Mercado Livre Brasil respondendo perguntas de compradores.
 
-REGRAS CRÍTICAS:
-1. Resposta SEMPRE em português brasileiro, tom amigável e profissional
-2. 1-3 frases (máx 350 caracteres)
-3. Use APENAS as informações fornecidas em "CONTEXTO DO PRODUTO"
-4. Se a resposta NÃO está no contexto fornecido — diga claramente que vai verificar e responde em breve
-5. NUNCA invente specs (dimensões, peso, materiais, compatibilidades)
-6. Se há SKU no contexto, NÃO mencione SKU para o cliente (é interno do vendedor)
-7. Termine de forma cordial
-8. Máx 1 emoji
-9. SEM links externos
+═══════════════════════════════════════════════════
+REGRA #1 — NUNCA INVENTE
+═══════════════════════════════════════════════════
+Se a resposta NÃO está literalmente no CONTEXTO ou nas FOTOS — responda:
+"Vou verificar essa informação e respondo em breve. 😊"
 
-Output APENAS o texto da resposta — sem aspas, sem prefácio."""
+⚠️ MAS: NÃO use "vou verificar" como resposta preguiçosa. Antes de dizer:
+  1. RELEIA todo o CONTEXTO (atributos + descrição completa).
+  2. INSPECIONE TODAS as fotos uma por uma — fotos 2-6 normalmente mostram interior/ângulos/medidas.
+  3. Se a resposta está visível em alguma foto OU em qualquer parte do contexto → RESPONDA.
+
+═══════════════════════════════════════════════════
+COMO RESPONDER POR TIPO DE PERGUNTA
+═══════════════════════════════════════════════════
+
+▸ MARCA / FABRICANTE
+  Só responda se atributo "Marca" tem valor explícito. NÃO confunda título com marca.
+
+▸ MATERIAL
+  Use a PALAVRA EXATA do contexto. "couro" sem qualificador → "couro" (não "legítimo").
+
+▸ COR / APARÊNCIA VISUAL
+  Você TEM as fotos. OLHE PARA ELAS AGORA. Descreva o que VÊ.
+
+▸ CONTAGEM / NÚMERO DE ELEMENTOS (quantas divisórias, bolsos, compartimentos, alças)
+  - INSPECIONE TODAS AS FOTOS antes de responder. Conte os elementos visíveis.
+  - Fotos de bolsas/mochilas/organizadores tipicamente mostram o INTERIOR aberto em fotos 2-6.
+  - Resposta tipo: "Pelo que mostram as fotos, esta bolsa tem 3 divisórias principais (compartimento central + 2 bolsos com zíper)."
+  - Não diga "Vou verificar" se a foto mostra a resposta — é desperdício de tempo do comprador.
+
+▸ DIMENSÕES / PESO / CAPACIDADE
+  - Atributo primeiro, depois DESCRIÇÃO (ex: "18 cm ALTURA, 24 cm LARGURA"), depois fotos com etiqueta/régua.
+  - Só "vou verificar" se NEM contexto, NEM descrição, NEM fotos têm a info.
+
+▸ COMPATIBILIDADE
+  Só afirme se contexto lista X explicitamente. Senão "Vou confirmar a compatibilidade com [X]."
+
+═══════════════════════════════════════════════════
+ABORDAGEM DE VENDAS
+═══════════════════════════════════════════════════
+Atributo "Gênero: Masculino" não é proibição — diga unissex.
+NUNCA termine com "Não" seco — sempre alternativa OU pergunta qualificadora.
+Cliente honesto > venda forçada.
+
+═══════════════════════════════════════════════════
+FORMATO
+═══════════════════════════════════════════════════
+- Português brasileiro, tom amigável mas direto
+- 1-3 frases (máx 350 caracteres)
+- Termine cordial: "Qualquer dúvida, estou à disposição!" ou similar
+- Máx 1 emoji
+- NÃO mencione SKU (é interno)
+- NÃO inclua links externos
+- Output APENAS o texto da resposta — sem aspas, sem prefácio."""
 
 
 # ── Product context loader (ML attrs + description + custom docs + SKU) ──────
@@ -192,6 +235,7 @@ async def _fetch_product_context(
         out["shippingFree"] = ml_ctx.get("shipping_free")
         out["attributes"] = ml_ctx.get("attributes") or []
         out["description"] = ml_ctx.get("description") or ""
+        out["pictures"] = ml_ctx.get("pictures") or []
         out["fetchedAt"] = ml_ctx.get("fetched_at")
     out["customDocs"] = docs or []
     out["sku"] = sku
@@ -268,25 +312,50 @@ async def _ai_suggest(
     question_text: str,
     item_title: str,
     context_block: Optional[str] = None,
+    picture_urls: Optional[list[str]] = None,
 ) -> Optional[str]:
+    """Generate AI suggestion. Multimodal: passes up to 6 product photos to
+    Claude as image_url blocks alongside the textual product context. Without
+    photos Claude cannot answer count/dimension/visual questions and falls
+    back to "Vou verificar" — exactly the bug user reported.
+    """
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         log.warning("OPENROUTER_API_KEY not set — skipping AI suggestion")
         return None
+    pic_urls = [u for u in (picture_urls or []) if u][:6]
+    photo_hint = ""
+    if pic_urls:
+        photo_hint = (
+            f"\n\n[{len(pic_urls)} foto(s) anexada(s) — INSPECIONE cada uma; "
+            "fotos 2-6 normalmente mostram interior/ângulos/medidas]"
+        )
     if context_block:
-        user_msg = (
+        user_text = (
             "CONTEXTO DO PRODUTO (use SOMENTE estas informações para responder):\n"
-            f"{context_block}\n\n"
+            f"{context_block}{photo_hint}\n\n"
             "---\n\n"
             f'Pergunta do comprador: "{question_text}"\n\n'
-            "Escreva a resposta agora, baseada APENAS no contexto acima."
+            "Escreva a resposta agora, baseada APENAS no contexto e fotos acima."
         )
     else:
-        user_msg = (
-            f'Anúncio: "{item_title or "sem título"}"\n'
+        user_text = (
+            f'Anúncio: "{item_title or "sem título"}"{photo_hint}\n'
             f'Pergunta do comprador: "{question_text}"\n\n'
-            "⚠️ Sem informações detalhadas do produto. Se a pergunta exige specs, peça desculpas e diga que vai verificar."
+            "⚠️ Sem informações detalhadas do produto. Se a pergunta exige specs e nem as fotos respondem, peça desculpas e diga que vai verificar."
         )
+
+    if pic_urls:
+        user_content: Any = [
+            {"type": "text", "text": user_text},
+            *[
+                {"type": "image_url", "image_url": {"url": u, "detail": IMAGE_DETAIL}}
+                for u in pic_urls
+            ],
+        ]
+    else:
+        user_content = user_text
+
     try:
         r = await http.post(
             OPENROUTER_URL,
@@ -298,13 +367,14 @@ async def _ai_suggest(
             },
             json={
                 "model": LLM_MODEL,
-                "max_tokens": 200,
+                "max_tokens": 250,
+                "temperature": 0.2,
                 "messages": [
                     {"role": "system", "content": SUGGEST_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg},
+                    {"role": "user", "content": user_content},
                 ],
             },
-            timeout=15.0,
+            timeout=20.0,
         )
         if r.status_code != 200:
             log.warning("OpenRouter %s: %s", r.status_code, r.text[:200])
@@ -586,6 +656,7 @@ async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int) -> dict[str, int]
             ctx_block = ""
             sku: Optional[str] = None
             context_used = False
+            picture_urls: list[str] = []
             if item_id:
                 try:
                     ctx = await _fetch_product_context(http, pool, user_id, item_id)
@@ -599,10 +670,18 @@ async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int) -> dict[str, int]
                     if ctx.get("attributes") or ctx.get("description") or ctx.get("customDocs"):
                         ctx_block = block
                         context_used = True
+                    # Extract up to 6 picture URLs for vision (secure_url first).
+                    for p in (ctx.get("pictures") or [])[:6]:
+                        if isinstance(p, dict):
+                            url = p.get("secure_url") or p.get("url")
+                            if url:
+                                picture_urls.append(str(url))
                 except Exception as err:  # noqa: BLE001
                     log.warning("context fetch failed for q=%s item=%s: %s", qid, item_id, err)
 
-            suggestion = await _ai_suggest(http, text, item_title, ctx_block) or "(falha ao gerar sugestão; responda manualmente)"
+            suggestion = await _ai_suggest(
+                http, text, item_title, ctx_block, picture_urls=picture_urls,
+            ) or "(falha ao gerar sugestão; responda manualmente)"
 
             msg_id = await _tg_send_question(
                 http, bot_token, chat_id, qid,
