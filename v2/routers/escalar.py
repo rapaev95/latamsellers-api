@@ -343,35 +343,63 @@ async def get_products(
 
 @router.get("/items/stock-lookup")
 async def items_stock_lookup(
-    q: str = Query(..., description="SKU, MLB или часть title для поиска"),
+    q: str = Query(..., description="MLB-id, часть title или ML attribute SELLER_SKU"),
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ) -> dict[str, Any]:
     """Текущий остаток `available_quantity` из `ml_user_items` для items
-    matching `q` (по item_id / SKU / part of title). Также показывает
-    fetched_at чтобы видеть свежесть snapshot'а."""
+    matching `q`. SKU и sub_status извлекаются из `raw` JSONB (отдельных
+    колонок нет — см. v2/services/ml_user_items.py CREATE_SQL)."""
     if pool is None:
         raise HTTPException(status_code=503, detail="db_unavailable")
     pat = f"%{q}%"
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT item_id, title, available_quantity, status, sub_status, sku,
+            SELECT item_id, title, available_quantity, sold_quantity, status, raw,
                    to_char(fetched_at AT TIME ZONE 'UTC',
                            'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS fetched_at
               FROM ml_user_items
              WHERE user_id = $1
-               AND (item_id ILIKE $2 OR sku ILIKE $2 OR title ILIKE $2)
+               AND (
+                 item_id ILIKE $2
+                 OR title ILIKE $2
+                 OR raw::text ILIKE $2
+               )
              ORDER BY fetched_at DESC NULLS LAST
              LIMIT 50
             """,
             user.id, pat,
         )
-    return {
-        "query": q,
-        "count": len(rows),
-        "items": [dict(r) for r in rows],
-    }
+
+    out_items: list[dict[str, Any]] = []
+    for r in rows:
+        raw = r["raw"]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                raw = {}
+        raw = raw or {}
+        sku = ""
+        for attr in (raw.get("attributes") or []):
+            if isinstance(attr, dict) and attr.get("id") == "SELLER_SKU":
+                sku = str(attr.get("value_name") or "")
+                break
+        sub_status = raw.get("sub_status") or []
+        if not isinstance(sub_status, list):
+            sub_status = [sub_status]
+        out_items.append({
+            "item_id": r["item_id"],
+            "title": r["title"],
+            "sku": sku,
+            "available_quantity": r["available_quantity"],
+            "sold_quantity": r["sold_quantity"],
+            "status": r["status"],
+            "sub_status": sub_status,
+            "fetched_at": r["fetched_at"],
+        })
+    return {"query": q, "count": len(out_items), "items": out_items}
 
 
 @router.post("/snooze", response_model=SnoozeOut)
@@ -3655,11 +3683,61 @@ async def promotions_tg_action(
 
             dyn_disabled = False
             if body.action == "raise_with_disable_dyn":
-                # Explicit user confirmation — delete pricing-automation rule.
+                # Explicit user confirmation — first save current automation
+                # rule to history (so user can re-enable later via TG button),
+                # then DELETE pricing-automation rule.
                 # Doc: DELETE /pricing-automation/items/{id}/automation.
                 # Errors swallowed/logged: if 404 automation_not_found, ML
                 # already cleared it elsewhere — proceed to PUT anyway.
                 try:
+                    # Read current rule before deleting (best-effort)
+                    cur_auto = None
+                    try:
+                        gar = await http.get(
+                            f"https://api.mercadolibre.com/pricing-automation/items/{mlb}/automation",
+                            headers={"Authorization": f"Bearer {token}"},
+                            timeout=15.0,
+                        )
+                        if gar.status_code == 200:
+                            cur_auto = gar.json() or {}
+                    except Exception:  # noqa: BLE001
+                        cur_auto = None
+                    if isinstance(cur_auto, dict) and cur_auto:
+                        rule = (cur_auto.get("item_rule") or {}).get("rule_id") or "INT_EXT"
+                        try:
+                            min_p = float(cur_auto.get("min_price") or 0)
+                        except (TypeError, ValueError):
+                            min_p = 0.0
+                        try:
+                            max_p = float(cur_auto.get("max_price") or 0)
+                        except (TypeError, ValueError):
+                            max_p = 0.0
+                        async with pool.acquire() as conn:
+                            await conn.execute(
+                                """
+                                CREATE TABLE IF NOT EXISTS ml_user_pricing_history (
+                                  user_id INTEGER NOT NULL,
+                                  item_id TEXT NOT NULL,
+                                  rule_id TEXT,
+                                  min_price NUMERIC,
+                                  max_price NUMERIC,
+                                  raw JSONB,
+                                  disabled_at TIMESTAMPTZ DEFAULT NOW()
+                                );
+                                CREATE INDEX IF NOT EXISTS idx_pricing_hist_user_item
+                                  ON ml_user_pricing_history(user_id, item_id, disabled_at DESC);
+                                """,
+                            )
+                            await conn.execute(
+                                """
+                                INSERT INTO ml_user_pricing_history
+                                  (user_id, item_id, rule_id, min_price, max_price, raw)
+                                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                                """,
+                                body.user_id, mlb, rule, min_p, max_p,
+                                json.dumps(cur_auto, default=str),
+                            )
+
                     dr = await http.delete(
                         f"https://api.mercadolibre.com/pricing-automation/items/{mlb}/automation",
                         headers={"Authorization": f"Bearer {token}"},
