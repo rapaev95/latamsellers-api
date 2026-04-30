@@ -384,7 +384,12 @@ def compute_retirada_cost(project: str, period: tuple[date, date]) -> dict:
         units = int(bucket.get("units", 0) or 0)
         sku_dict = bucket.get("by_sku") or {}
 
-        if forma == RETIRADA_FORMA_DESCARTE:
+        # ML за 2026 ввёл новые варианты forma: `Descarte de estoque não apto`
+        # (вместо просто `Descarte`), `Custo do serviço de coleta Full` (parser
+        # маппит в `Envio para o endereço`). Точное сравнение `== Descarte`
+        # пропускало эти строки в `tarifa_other`. Используем startswith.
+        forma_norm = forma.strip()
+        if forma_norm.startswith("Descarte"):
             out["tarifa_descarte"] += tarifa
             out["units_descarte"] += units
             for sku, sb in sku_dict.items():
@@ -407,7 +412,7 @@ def compute_retirada_cost(project: str, period: tuple[date, date]) -> dict:
                     "cost_source": src, "mlb": sb.get("mlb", ""),
                     "titulo": sb.get("titulo", ""),
                 }
-        elif forma == RETIRADA_FORMA_ENVIO:
+        elif forma_norm.startswith("Envio") or forma_norm.startswith("Coleta"):
             out["tarifa_envio"] += tarifa
             out["units_envio"] += units
             for sku, sb in sku_dict.items():

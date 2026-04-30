@@ -3816,51 +3816,72 @@ def get_armazenagem_by_period(project: str, period_from, period_to) -> dict:
 RETIRADA_FORMA_ENVIO = "Envio para o endereço"
 RETIRADA_FORMA_DESCARTE = "Descarte"
 
-# Заголовок листа Custo por retirada de estoque начинается с "Nº NF-e" в строке 5.
+# Старый формат retirada (`Custo por retirada de estoque`) с колонкой
+# `Forma de retirada` ∈ {Envio para o endereço, Descarte}.
 _RETIRADA_SHEET_NAME = "Custo por retirada de estoque"
+# Новый формат (с 2026): отдельный лист `Custo por serviço de coleta` —
+# coleta — услуга вывоза товара со склада ML на адрес продавца. По экономике
+# = `Envio para o endereço` (товар у продавца, COGS не списывается; только
+# тариф). Помечаем эти rows как ENVIO, чтобы существующая логика
+# `compute_retirada_cost` и пользовательские overrides работали без изменений.
+_COLETA_SHEET_NAME = "Custo por serviço de coleta"
 
 
-def _parse_retirada_estoque_xlsx(xl, filename: str) -> dict | None:
-    """Source-agnostic парсер: принимает уже открытый pd.ExcelFile.
+def _parse_retirada_sheet(
+    xl,
+    sheet_prefix: str,
+    *,
+    required_extra: list[str],
+    units_col: str,
+    forma_col: str | None,
+    forma_default: str,
+) -> list[dict]:
+    """Парсит один retirada-лист в xlsx и возвращает список row-dict'ов.
 
-    Возвращает {rows: [{custo_id, date, forma, sku, mlb, anuncio, titulo,
-    variacao, units, valor}, ...], source_file}.
-    Заголовок ML на строке 5 (header=5). Сторно отбрасываются через колонку
-    `Nº do custo estornado`.
+    `sheet_prefix` — префикс sheet name (matches via str.startswith).
+    `required_extra` — required колонки помимо стандартных Data/Valor/SKU.
+    `units_col` — название колонки с количеством единиц
+        (`Unidades retiradas` / `Unidades coletadas`).
+    `forma_col` — колонка `Forma de retirada` если есть; None если forma
+        фиксированный (для coleta).
+    `forma_default` — fallback значение если forma_col=None или пусто.
     """
     from datetime import date as _date, datetime as _dt
     target_sheet = None
     for s in xl.sheet_names:
-        if s.strip().startswith(_RETIRADA_SHEET_NAME):
+        if s.strip().startswith(sheet_prefix):
             target_sheet = s
             break
     if target_sheet is None:
-        return None
+        return []
     try:
         df = pd.read_excel(xl, sheet_name=target_sheet, header=5)
     except Exception:
-        return None
+        return []
     if df is None or df.empty:
-        return None
+        return []
 
     cols = {str(c).strip(): c for c in df.columns}
-    required = ["Data do custo", "Forma de retirada", "Valor do custo", "Unidades retiradas", "SKU"]
+    required = ["Data do custo", "Valor do custo", units_col, "SKU"] + required_extra
     for r in required:
         if r not in cols:
-            return None
+            return []
 
-    rows: list[dict] = []
+    out: list[dict] = []
     for _, row in df.iterrows():
         sku_raw = row.get(cols["SKU"])
         sku = "" if pd.isna(sku_raw) else str(sku_raw).strip()
-        forma_raw = row.get(cols["Forma de retirada"])
-        if pd.isna(forma_raw):
-            continue
+        if forma_col is not None:
+            forma_raw = row.get(cols[forma_col])
+            if pd.isna(forma_raw):
+                continue
+            forma = str(forma_raw).strip()
+        else:
+            forma = forma_default
         if "Nº do custo estornado" in cols:
             estor = row.get(cols["Nº do custo estornado"])
             if not pd.isna(estor) and str(estor).strip() not in ("", "-", "0"):
                 continue
-        forma = str(forma_raw).strip()
 
         d_raw = row.get(cols["Data do custo"])
         d_obj = None
@@ -3879,7 +3900,7 @@ def _parse_retirada_estoque_xlsx(xl, filename: str) -> dict | None:
 
         valor = pd.to_numeric(row.get(cols["Valor do custo"]), errors="coerce")
         valor = 0.0 if pd.isna(valor) else float(valor)
-        units = pd.to_numeric(row.get(cols["Unidades retiradas"]), errors="coerce")
+        units = pd.to_numeric(row.get(cols[units_col]), errors="coerce")
         units = 0 if pd.isna(units) else int(units)
 
         mlb = ""
@@ -3906,7 +3927,7 @@ def _parse_retirada_estoque_xlsx(xl, filename: str) -> dict | None:
             else:
                 custo_id = str(raw_cid).strip()
 
-        rows.append({
+        out.append({
             "custo_id": custo_id,
             "date": d_obj,
             "forma": forma,
@@ -3918,7 +3939,35 @@ def _parse_retirada_estoque_xlsx(xl, filename: str) -> dict | None:
             "units": units,
             "valor": valor,
         })
+    return out
 
+
+def _parse_retirada_estoque_xlsx(xl, filename: str) -> dict | None:
+    """Source-agnostic парсер xlsx «Tarifas Full» / «Custos retirada Full».
+
+    Поддерживает ОБА листа в одном файле:
+    - `Custo por retirada de estoque` — старый формат с Envio/Descarte
+    - `Custo por serviço de coleta` — новый формат (с 2026), помечаем как
+      forma=Envio (по экономике то же самое — товар у продавца, без COGS).
+
+    Возвращает {rows: [...], source_file} или None если ни один лист не
+    нашёлся / оба пустые. Сторно отбрасываются через `Nº do custo estornado`.
+    """
+    rows: list[dict] = []
+    rows.extend(_parse_retirada_sheet(
+        xl, _RETIRADA_SHEET_NAME,
+        required_extra=["Forma de retirada"],
+        units_col="Unidades retiradas",
+        forma_col="Forma de retirada",
+        forma_default=RETIRADA_FORMA_ENVIO,
+    ))
+    rows.extend(_parse_retirada_sheet(
+        xl, _COLETA_SHEET_NAME,
+        required_extra=[],
+        units_col="Unidades coletadas",
+        forma_col=None,
+        forma_default=RETIRADA_FORMA_ENVIO,
+    ))
     if not rows:
         return None
     return {"rows": rows, "source_file": filename}
