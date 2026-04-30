@@ -341,6 +341,39 @@ async def get_products(
     }
 
 
+@router.get("/items/stock-lookup")
+async def items_stock_lookup(
+    q: str = Query(..., description="SKU, MLB или часть title для поиска"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Текущий остаток `available_quantity` из `ml_user_items` для items
+    matching `q` (по item_id / SKU / part of title). Также показывает
+    fetched_at чтобы видеть свежесть snapshot'а."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    pat = f"%{q}%"
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT item_id, title, available_quantity, status, sub_status, sku,
+                   to_char(fetched_at AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS fetched_at
+              FROM ml_user_items
+             WHERE user_id = $1
+               AND (item_id ILIKE $2 OR sku ILIKE $2 OR title ILIKE $2)
+             ORDER BY fetched_at DESC NULLS LAST
+             LIMIT 50
+            """,
+            user.id, pat,
+        )
+    return {
+        "query": q,
+        "count": len(rows),
+        "items": [dict(r) for r in rows],
+    }
+
+
 @router.post("/snooze", response_model=SnoozeOut)
 async def post_snooze(
     body: SnoozeIn,

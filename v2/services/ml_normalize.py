@@ -277,7 +277,24 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                 level = inv.get("level") or "ok"
 
                 desc_lines.append("")
-                if level == "no_history" or avg_d <= 0:
+                # Stockout = особый случай: сообщать «хватит на ~0 дней» —
+                # тавтология. Лучше показать скорость продаж + suggested
+                # refill (на 30 дней по среднему темпу), чтобы продавец
+                # сразу понимал сколько закупить.
+                if stock <= 0 and avg_d > 0:
+                    refill_30d = int(round(avg_d * 30))
+                    desc_lines.append(
+                        f"📦 🛑 Esgotado! {window_d}d: {sold_w} vendas "
+                        f"(≈{avg_d:.1f}/dia) → reabasteça ≈{refill_30d} un. "
+                        f"para 30 dias"
+                    )
+                elif stock <= 0:
+                    # Stockout без истории продаж — просто маркер
+                    desc_lines.append(
+                        f"📦 🛑 Esgotado · sem vendas em {window_d}d (impossível "
+                        f"estimar refill)"
+                    )
+                elif level == "no_history" or avg_d <= 0:
                     desc_lines.append(f"📦 Estoque: {stock} un. · sem histórico em {window_d}d")
                 elif level == "critical":
                     days_disp = days_left if days_left is not None else 0
