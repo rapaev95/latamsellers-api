@@ -398,7 +398,16 @@ async def get_valid_access_token(
         return tokens["access_token"], expires_at, False
 
     # Needs refresh
-    await refresh_user_token(pool, user_id)
+    try:
+        await refresh_user_token(pool, user_id)
+    except MLRefreshError as err:
+        # Notify admins — invalid_grant means the user must re-authorize.
+        try:
+            from . import tg_admin_alerts as _alerts
+            await _alerts.alert_ml_oauth_broken(user_id, str(err))
+        except Exception as a_err:  # noqa: BLE001
+            log.debug("admin alert failed: %s", a_err)
+        raise
     refreshed = await load_user_tokens(pool, user_id)
     if not refreshed:
         raise MLRefreshError("token_disappeared_after_refresh")

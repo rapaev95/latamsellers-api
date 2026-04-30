@@ -4528,6 +4528,35 @@ class _AiQuestionProbeIn(__import__("pydantic").BaseModel):
     invoke: bool = False  # call OpenRouter (costs cents per call)
 
 
+@router.post("/admin-alerts/test")
+async def admin_alerts_test(
+    user: CurrentUser = Depends(current_user),
+):
+    """Test endpoint — fires a sample admin alert. Use to verify
+    LS_ADMIN_TG_CHAT_IDS env var is configured correctly. Returns the
+    parsed chat_ids so caller can see what got loaded.
+    """
+    import os as _os
+    from v2.services import tg_admin_alerts as alerts_svc
+
+    raw = _os.environ.get("LS_ADMIN_TG_CHAT_IDS", "")
+    chat_ids = [c.strip() for c in raw.split(",") if c.strip()]
+    if not chat_ids:
+        return {
+            "ok": False,
+            "error": "no_admin_chat_ids",
+            "hint": "Set LS_ADMIN_TG_CHAT_IDS=94675114 in Railway env",
+        }
+    await alerts_svc.send_admin_alert(
+        title="Test alert",
+        detail=f"Triggered by user {user.id} ({user.email}). All admin alerts working.",
+        severity="warn",
+        service="admin-alerts/test",
+        deduplicate_key=f"test:{user.id}:{int(__import__('time').time() // 60)}",
+    )
+    return {"ok": True, "chat_ids": chat_ids, "sent_alert": True}
+
+
 @router.get("/claims/{claim_id}/render-preview")
 async def claim_render_preview(
     claim_id: str,

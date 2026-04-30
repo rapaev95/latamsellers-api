@@ -378,6 +378,13 @@ async def _ai_suggest(
         )
         if r.status_code != 200:
             log.warning("OpenRouter %s: %s", r.status_code, r.text[:200])
+            try:
+                from . import tg_admin_alerts as _alerts
+                await _alerts.alert_openrouter_failure(
+                    r.status_code, r.text, service="questions/ai-suggest",
+                )
+            except Exception as err:  # noqa: BLE001
+                log.debug("admin alert failed: %s", err)
             return None
         data = r.json()
         content = (data.get("choices") or [{}])[0].get("message", {}).get("content")
