@@ -3375,10 +3375,14 @@ async def promotions_tg_action(
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=15.0,
             )
-        elif body.action == "raise_only":
-            # Standalone price raise — used on started promotions to push the
-            # buyer-facing price back toward the seller's original (the promo
-            # stays active, but its discount applies to a higher base).
+        elif body.action in ("raise_only", "raise_with_disable_dyn"):
+            # Standalone price raise.
+            #   raise_only: just PUT /items {price}. If ML rejects with
+            #     `item.price.not_modifiable` (item has Dynamic Pricing enabled),
+            #     return needs_dyn_confirm so TG webhook can ask the user to
+            #     opt-out first.
+            #   raise_with_disable_dyn: explicit confirmation — DELETE the
+            #     pricing-automation rule first, then PUT /items {price}.
             item_url = f"https://api.mercadolibre.com/items/{mlb}"
             try:
                 gr = await http.get(
@@ -3401,6 +3405,30 @@ async def promotions_tg_action(
             if old_price <= 0:
                 return {"error": "no_current_price"}
             new_price = round(old_price * (1.0 + raise_pct / 100.0), 2)
+
+            dyn_disabled = False
+            if body.action == "raise_with_disable_dyn":
+                # Explicit user confirmation — delete pricing-automation rule.
+                # Doc: DELETE /pricing-automation/items/{id}/automation.
+                # Errors swallowed/logged: if 404 automation_not_found, ML
+                # already cleared it elsewhere — proceed to PUT anyway.
+                try:
+                    dr = await http.delete(
+                        f"https://api.mercadolibre.com/pricing-automation/items/{mlb}/automation",
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=15.0,
+                    )
+                    if dr.status_code in (200, 204, 404):
+                        dyn_disabled = True
+                    elif dr.status_code >= 400:
+                        return {
+                            "error": "ml_dyn_disable_rejected",
+                            "status": dr.status_code,
+                            "detail": dr.text[:300],
+                        }
+                except Exception as err:  # noqa: BLE001
+                    return {"error": "ml_dyn_disable_failed", "detail": str(err)}
+
             try:
                 pr = await http.put(
                     item_url,
@@ -3414,12 +3442,29 @@ async def promotions_tg_action(
             except Exception as err:  # noqa: BLE001
                 return {"error": "ml_price_update_failed", "detail": str(err)}
             if pr.status_code >= 400:
+                # Detect Dynamic Pricing block — return needs_dyn_confirm so TG
+                # webhook can render confirmation prompt instead of an error.
+                detail_text = pr.text or ""
+                if (
+                    body.action == "raise_only"
+                    and pr.status_code == 400
+                    and "item.price.not_modifiable" in detail_text
+                ):
+                    return {
+                        "ok": False,
+                        "needs_dyn_confirm": True,
+                        "reason": "dynamic_pricing_active",
+                        "old_price": old_price,
+                        "attempted_new_price": new_price,
+                        "raise_pct": raise_pct,
+                    }
                 return {
                     "error": "ml_price_update_rejected",
                     "status": pr.status_code,
-                    "detail": pr.text[:300],
+                    "detail": detail_text[:300],
                     "old_price": old_price,
                     "attempted_new_price": new_price,
+                    "dyn_disabled": dyn_disabled,
                 }
             raise_info = {
                 "old_price": old_price,
@@ -3427,6 +3472,7 @@ async def promotions_tg_action(
                 "raise_pct": raise_pct,
                 "raise_mode": (body.raise_mode or "exact").lower(),
                 "entrada_pct": entrada_pct,
+                "dyn_disabled": dyn_disabled,
             }
             # raise_only doesn't talk to /seller-promotions endpoint; we synthesize
             # a 200-shaped response so the downstream success-path handles it.
