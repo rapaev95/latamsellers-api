@@ -354,13 +354,14 @@ async def _upsert_batch(
             log.warning("normalize failed for %s: %s", topic, err)
             continue
         try:
+            from . import ml_notices as _ml_notices_svc
             await conn.execute(
                 _UPSERT_SQL,
                 user_id,
                 notice["notice_id"],
                 notice.get("label"),
                 notice.get("description"),
-                notice.get("from_date"),
+                _ml_notices_svc._coerce_to_datetime(notice.get("from_date")),
                 json.dumps(notice.get("tags") or []),
                 json.dumps(notice.get("actions") or []),
                 json.dumps(notice.get("raw") or {}),

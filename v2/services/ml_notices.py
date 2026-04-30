@@ -116,6 +116,23 @@ async def _fetch_notices(http: httpx.AsyncClient, access_token: str) -> list[dic
 
 # ── Sync one user ─────────────────────────────────────────────────────────────
 
+def _coerce_to_datetime(v: Any) -> Any:
+    """asyncpg для TIMESTAMPTZ принимает только datetime instance — не string.
+    normalize_event иногда возвращает from_date как ISO string (приходит из
+    ML payload `date_created` без парсинга). Конвертируем здесь, чтобы
+    upsert не падал «expected datetime instance, got 'str'».
+    """
+    if v is None or isinstance(v, datetime):
+        return v
+    if isinstance(v, str) and v.strip():
+        s = v.strip().replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(s)
+        except ValueError:
+            return None
+    return None
+
+
 async def upsert_normalized(
     pool: asyncpg.Pool,
     user_id: int,
@@ -156,7 +173,7 @@ async def upsert_normalized(
             nid,
             notice.get("label"),
             notice.get("description"),
-            notice.get("from_date"),
+            _coerce_to_datetime(notice.get("from_date")),
             json.dumps(notice.get("tags") or [], default=str),
             json.dumps(notice.get("actions") or [], default=str),
             json.dumps(notice.get("raw") or {}, default=str),
@@ -190,7 +207,7 @@ async def _upsert_notices(conn: asyncpg.Connection, user_id: int, notices: list[
             str(nid),
             n.get("label"),
             n.get("description"),
-            n.get("from_date"),
+            _coerce_to_datetime(n.get("from_date")),
             json.dumps(n.get("tags") or []),
             json.dumps(n.get("actions") or []),
             json.dumps(n),
