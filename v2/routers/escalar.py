@@ -4742,6 +4742,66 @@ class _AiQuestionProbeIn(__import__("pydantic").BaseModel):
     invoke: bool = False  # call OpenRouter (costs cents per call)
 
 
+@router.post("/items/{mlb}/photo-descriptions/generate")
+async def photo_descriptions_generate(
+    mlb: str,
+    force: bool = Query(False, description="Re-generate even if cached"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Generate AI descriptions for item's photos (cached in DB).
+
+    Pre-fills ml_item_photo_descriptions so subsequent ai-suggest calls can
+    inject description text alongside the vision blocks. Idempotent unless
+    force=True.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    from v2.services import ml_photo_descriptions as photo_svc
+
+    await photo_svc.ensure_schema(pool)
+    item_id = mlb.upper()
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT pictures FROM ml_item_context
+             WHERE user_id = $1 AND item_id = $2
+            """,
+            user.id, item_id,
+        )
+    if not row:
+        return {
+            "error": "no_item_context",
+            "hint": f"refresh ml_item_context for {item_id} first",
+        }
+    pics = row["pictures"]
+    if isinstance(pics, str):
+        try:
+            pics = json.loads(pics)
+        except Exception:  # noqa: BLE001
+            pics = []
+    if not isinstance(pics, list):
+        pics = []
+    return await photo_svc.generate_descriptions_for_item(
+        pool, user.id, item_id, pics, force=force,
+    )
+
+
+@router.get("/items/{mlb}/photo-descriptions")
+async def photo_descriptions_get(
+    mlb: str,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Returns cached descriptions for item (empty list if none generated)."""
+    if pool is None:
+        return {"error": "no_db"}
+    from v2.services import ml_photo_descriptions as photo_svc
+    descs = await photo_svc.get_descriptions_for_item(pool, user.id, mlb.upper())
+    return {"item_id": mlb.upper(), "count": len(descs), "descriptions": descs}
+
+
 @router.post("/admin-alerts/test")
 async def admin_alerts_test(
     user: CurrentUser = Depends(current_user),

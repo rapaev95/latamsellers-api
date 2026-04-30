@@ -313,6 +313,7 @@ async def _ai_suggest(
     item_title: str,
     context_block: Optional[str] = None,
     picture_urls: Optional[list[str]] = None,
+    photo_descriptions_block: Optional[str] = None,
 ) -> Optional[str]:
     """Generate AI suggestion. Multimodal: passes up to 6 product photos to
     Claude as image_url blocks alongside the textual product context. Without
@@ -330,13 +331,17 @@ async def _ai_suggest(
             f"\n\n[{len(pic_urls)} foto(s) anexada(s) — INSPECIONE cada uma; "
             "fotos 2-6 normalmente mostram interior/ângulos/medidas]"
         )
+    desc_section = ""
+    if photo_descriptions_block:
+        desc_section = f"\n\n{photo_descriptions_block}"
+
     if context_block:
         user_text = (
             "CONTEXTO DO PRODUTO (use SOMENTE estas informações para responder):\n"
-            f"{context_block}{photo_hint}\n\n"
+            f"{context_block}{desc_section}{photo_hint}\n\n"
             "---\n\n"
             f'Pergunta do comprador: "{question_text}"\n\n'
-            "Escreva a resposta agora, baseada APENAS no contexto e fotos acima."
+            "Escreva a resposta agora, baseada APENAS no contexto, descrições e fotos acima."
         )
     else:
         user_text = (
@@ -686,8 +691,24 @@ async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int) -> dict[str, int]
                 except Exception as err:  # noqa: BLE001
                     log.warning("context fetch failed for q=%s item=%s: %s", qid, item_id, err)
 
+            # Pre-generated photo descriptions — RAG block. Helps Claude
+            # find counts/measurements faster and reduces vision-miss rate.
+            photo_descs_block: Optional[str] = None
+            if item_id:
+                try:
+                    from . import ml_photo_descriptions as photo_svc
+                    descs = await photo_svc.get_descriptions_for_item(
+                        pool, user_id, item_id,
+                    )
+                    if descs:
+                        photo_descs_block = photo_svc.descriptions_to_prompt_block(descs)
+                except Exception as err:  # noqa: BLE001
+                    log.debug("photo desc fetch failed for q=%s item=%s: %s", qid, item_id, err)
+
             suggestion = await _ai_suggest(
-                http, text, item_title, ctx_block, picture_urls=picture_urls,
+                http, text, item_title, ctx_block,
+                picture_urls=picture_urls,
+                photo_descriptions_block=photo_descs_block,
             ) or "(falha ao gerar sugestão; responda manualmente)"
 
             msg_id = await _tg_send_question(
