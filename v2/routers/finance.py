@@ -2222,6 +2222,159 @@ async def uploads_source_fix(
     }
 
 
+@router.get("/uploads/diag-retirada")
+async def uploads_diag_retirada(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Per-file breakdown of retirada_full uploads — confirms which месяцы
+    действительно дают envio/descarte и какие файлы парсер тихо отверг.
+
+    Используется когда в PnL-строке "Списание товара" значения только в
+    одном месяце, а в БД 7 файлов retirada — этот endpoint показывает
+    rows_count + sum_envio + sum_descarte для каждого upload'а.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    from v2.legacy.reports import _parse_retirada_estoque_bytes
+
+    files = await uploads_storage.fetch_files_by_source(pool, user.id, "retirada_full")
+
+    out: list[dict[str, Any]] = []
+    total_envio = 0.0
+    total_descarte_tarifa = 0.0
+    total_descarte_units = 0
+    for sf in files:
+        entry: dict[str, Any] = {
+            "upload_id": sf.id,
+            "filename": sf.filename,
+            "bytes": len(sf.file_bytes or b""),
+            "parsed": False,
+            "rows_count": 0,
+            "envio_rows": 0,
+            "descarte_rows": 0,
+            "sum_envio_brl": 0.0,
+            "sum_descarte_tarifa_brl": 0.0,
+            "descarte_units": 0,
+            "dates_min": None,
+            "dates_max": None,
+            "skus_unique": 0,
+            "error": None,
+        }
+        try:
+            parsed = _parse_retirada_estoque_bytes(sf.file_bytes or b"", sf.filename)
+        except Exception as err:  # noqa: BLE001
+            entry["error"] = f"{type(err).__name__}: {err}"
+            out.append(entry)
+            continue
+        if not parsed:
+            entry["error"] = "parser_returned_none (sheet name mismatch or required cols missing)"
+            out.append(entry)
+            continue
+
+        rows = parsed.get("rows") or []
+        entry["parsed"] = True
+        entry["rows_count"] = len(rows)
+        skus: set[str] = set()
+        dates: list[str] = []
+        for r in rows:
+            forma = (r.get("forma") or "").strip()
+            valor = float(r.get("valor") or 0.0)
+            units = int(r.get("units") or 0)
+            if r.get("sku"):
+                skus.add(str(r["sku"]))
+            if r.get("date"):
+                dates.append(str(r["date"]))
+            if forma.startswith("Envio"):
+                entry["envio_rows"] += 1
+                entry["sum_envio_brl"] += valor
+                total_envio += valor
+            elif forma.startswith("Descarte"):
+                entry["descarte_rows"] += 1
+                entry["sum_descarte_tarifa_brl"] += valor
+                entry["descarte_units"] += units
+                total_descarte_tarifa += valor
+                total_descarte_units += units
+        entry["sum_envio_brl"] = round(entry["sum_envio_brl"], 2)
+        entry["sum_descarte_tarifa_brl"] = round(entry["sum_descarte_tarifa_brl"], 2)
+        entry["skus_unique"] = len(skus)
+        if dates:
+            dates.sort()
+            entry["dates_min"] = dates[0]
+            entry["dates_max"] = dates[-1]
+        out.append(entry)
+
+    return {
+        "files": out,
+        "totals": {
+            "files_count": len(files),
+            "files_parsed": sum(1 for e in out if e["parsed"]),
+            "envio_brl": round(total_envio, 2),
+            "descarte_tarifa_brl": round(total_descarte_tarifa, 2),
+            "descarte_units": total_descarte_units,
+        },
+    }
+
+
+@router.get("/uploads/diag-armazenagem")
+async def uploads_diag_armazenagem(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Per-file breakdown of armazenagem_full uploads — показывает range дат
+    и SKU count в каждом файле. Используется чтобы увидеть какие файлы
+    парсер принимает (и до какой даты они дают coverage).
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    from v2.legacy.reports import _parse_armazenagem_bytes_daily
+
+    files = await uploads_storage.fetch_files_by_source(pool, user.id, "armazenagem_full")
+
+    out: list[dict[str, Any]] = []
+    for sf in files:
+        ext = "xlsx" if (sf.file_bytes or b"")[:4] == b"PK\x03\x04" else "csv"
+        entry: dict[str, Any] = {
+            "upload_id": sf.id,
+            "filename": sf.filename,
+            "ext": ext,
+            "bytes": len(sf.file_bytes or b""),
+            "parsed": False,
+            "skus_count": 0,
+            "daily_cols_count": 0,
+            "first_date": None,
+            "last_date": None,
+            "error": None,
+        }
+        try:
+            parsed = _parse_armazenagem_bytes_daily(sf.file_bytes or b"")
+        except Exception as err:  # noqa: BLE001
+            entry["error"] = f"{type(err).__name__}: {err}"
+            out.append(entry)
+            continue
+        if not parsed:
+            entry["error"] = "parser_returned_none (binary blob, missing SKU header, or empty rows)"
+            out.append(entry)
+            continue
+        daily_cols = parsed.get("daily_cols") or []
+        entry["parsed"] = True
+        entry["skus_count"] = len(parsed.get("by_sku") or {})
+        entry["daily_cols_count"] = len(daily_cols)
+        if daily_cols:
+            sorted_cols = sorted(daily_cols, key=lambda d: tuple(reversed(d.split("/"))))
+            entry["first_date"] = sorted_cols[0]
+            entry["last_date"] = sorted_cols[-1]
+        out.append(entry)
+
+    return {
+        "files": out,
+        "totals": {
+            "files_count": len(files),
+            "files_parsed": sum(1 for e in out if e["parsed"]),
+        },
+    }
+
+
 # ── Bank balance anchors (manual + reconciliation) ──────────────────────────
 
 

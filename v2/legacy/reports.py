@@ -3476,12 +3476,48 @@ def _parse_armazenagem_file(path) -> dict | None:
 def _parse_armazenagem_bytes_daily(file_bytes: bytes) -> dict | None:
     """Bytes-variant of `_parse_armazenagem_file` for DB-mode (LS_STORAGE_MODE=db).
 
-    Returns the same `{by_sku, daily_cols}` dict shape. Tries utf-8-sig / utf-8 /
-    latin-1 encodings to match the FS parser's `encoding="utf-8-sig"` default.
+    Returns the same `{by_sku, daily_cols}` dict shape. Auto-detects format:
+    XLSX (PK\\x03\\x04 magic) is read через pandas/openpyxl, CSV — через
+    csv.reader с попыткой нескольких encodings.
     """
     import csv as _csv
     import io
     import logging
+    log = logging.getLogger(__name__)
+
+    # XLSX magic bytes — ML недавно начал экспортировать armazenagem как .xlsx
+    # рядом с .csv. Парсер CSV молча возвращал None на бинарных данных, и свежий
+    # отчёт не учитывался → coverage застревал на дате последнего CSV.
+    if len(file_bytes) >= 4 and file_bytes[:4] == b"PK\x03\x04":
+        from datetime import date as _date, datetime as _dt
+        try:
+            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=None, dtype=object)
+        except Exception as err:  # noqa: BLE001
+            log.warning("armazenagem xlsx parse failed: %s", err)
+            return None
+        if df is None or df.empty:
+            return None
+
+        def _cell(v: object) -> str:
+            # Дневные заголовки в xlsx приходят как datetime — приводим в
+            # `DD/MM/YYYY`, иначе shared regex не матчит.
+            if pd.isna(v):
+                return ""
+            if isinstance(v, (_dt, _date)):
+                return v.strftime("%d/%m/%Y")
+            try:
+                ts = pd.Timestamp(v)
+                if not pd.isna(ts) and isinstance(v, pd.Timestamp):
+                    return ts.strftime("%d/%m/%Y")
+            except Exception:
+                pass
+            return str(v)
+
+        rows: list[list[str]] = []
+        for _, r in df.iterrows():
+            rows.append([_cell(v) for v in r.tolist()])
+        return _parse_armazenagem_rows(rows)
+
     text: str | None = None
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
         try:
@@ -3496,7 +3532,7 @@ def _parse_armazenagem_bytes_daily(file_bytes: bytes) -> dict | None:
     try:
         rows = list(_csv.reader(io.StringIO(text, newline=""), delimiter=";"))
     except Exception as err:  # noqa: BLE001
-        logging.getLogger(__name__).warning("armazenagem csv parse failed: %s", err)
+        log.warning("armazenagem csv parse failed: %s", err)
         return None
     return _parse_armazenagem_rows(rows)
 
