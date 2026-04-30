@@ -2583,6 +2583,107 @@ async def uploads_diag_mappings(
     return out
 
 
+@router.get("/uploads/diag-armazenagem-period")
+async def uploads_diag_armazenagem_period(
+    project: str = Query(...),
+    period_from: str = Query(..., alias="from"),
+    period_to: str = Query(..., alias="to"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """For a given (project, period) показывает per-day total, top SKU,
+    coverage. Используется для апрельского прочерка — увидеть какие даты
+    в df_armazenagem попадают в период и сколько каждый SKU/день даёт."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    _bind_user(user)
+
+    from datetime import date as _date, datetime as _dt
+    from v2.legacy.reports import load_armazenagem_report, get_armazenagem_by_period
+    import pandas as pd
+
+    try:
+        pf = _date.fromisoformat(period_from)
+        pt = _date.fromisoformat(period_to)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bad_date")
+
+    df = load_armazenagem_report()
+    out: dict[str, Any] = {
+        "project": project,
+        "period": {"from": period_from, "to": period_to},
+        "df_loaded": df is not None,
+    }
+    if df is None or df.empty:
+        return out
+
+    out["df_total_skus"] = int(df["SKU"].nunique())
+    out["source_files"] = list(df.attrs.get("__source_files", []))
+
+    daily_cols = list(df.attrs.get("__daily_cols", []))
+    out["daily_cols_total"] = len(daily_cols)
+    if daily_cols:
+        out["daily_cols_first"] = daily_cols[0]
+        out["daily_cols_last"] = daily_cols[-1]
+
+    relevant_cols: list[str] = []
+    for c in daily_cols:
+        try:
+            d = _dt.strptime(c, "%d/%m/%Y").date()
+        except ValueError:
+            continue
+        if pf <= d <= pt:
+            relevant_cols.append(c)
+    out["relevant_cols_count"] = len(relevant_cols)
+    if relevant_cols:
+        out["relevant_cols_first"] = relevant_cols[0]
+        out["relevant_cols_last"] = relevant_cols[-1]
+
+    sub = df[df["__project"] == project]
+    out["skus_for_project"] = int(sub["SKU"].nunique()) if not sub.empty else 0
+
+    # Per-day totals для проекта
+    daily_totals: dict[str, float] = {}
+    for c in relevant_cols:
+        if c in sub.columns:
+            v = float(pd.to_numeric(sub[c], errors="coerce").fillna(0).sum())
+            if v > 0:
+                daily_totals[c] = round(v, 4)
+    out["daily_totals"] = daily_totals
+    out["daily_totals_sum"] = round(sum(daily_totals.values()), 4)
+
+    # Top 5 SKU по сумме за период
+    if not sub.empty and relevant_cols:
+        sku_sums: list[tuple[str, float]] = []
+        for _, row in sub.iterrows():
+            sku = str(row["SKU"])
+            total_for_sku = 0.0
+            for c in relevant_cols:
+                if c in row.index:
+                    v = pd.to_numeric(row[c], errors="coerce")
+                    if not pd.isna(v):
+                        total_for_sku += float(v)
+            if total_for_sku > 0:
+                sku_sums.append((sku, round(total_for_sku, 4)))
+        sku_sums.sort(key=lambda t: t[1], reverse=True)
+        out["top_skus_in_period"] = [
+            {"sku": s, "total": v} for s, v in sku_sums[:10]
+        ]
+
+    # Сравнение с officical aggregator
+    try:
+        rc = get_armazenagem_by_period(project, pf, pt)
+        out["get_armazenagem_by_period"] = {
+            "total": rc.get("total"),
+            "days_in_period": rc.get("days_in_period"),
+            "skus_count": rc.get("skus_count"),
+        }
+    except Exception as err:  # noqa: BLE001
+        out["get_armazenagem_by_period_error"] = f"{type(err).__name__}: {err}"
+
+    return out
+
+
 @router.get("/uploads/diag-retirada-period")
 async def uploads_diag_retirada_period(
     project: str = Query(...),
