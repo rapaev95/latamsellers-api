@@ -88,6 +88,12 @@ CREATE INDEX IF NOT EXISTS idx_ml_user_orders_user_status
 -- в Postgres 11+, мгновенное даже на больших таблицах.
 ALTER TABLE ml_user_orders ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ;
 
+-- stock_state: 'decremented' / 'restored' / NULL. Tracks применили ли мы
+-- local stock decrement на ml_user_items. Без этого поля повторный
+-- webhook (paid → paid → paid) делал бы повторный decrement; колонка
+-- delают upsert идемпотентным относительно stock side-effect.
+ALTER TABLE ml_user_orders ADD COLUMN IF NOT EXISTS stock_state TEXT;
+
 -- ВАЖНО: partial index на notified_at IS NULL вынесен из этого блока
 -- специально. CREATE INDEX без CONCURRENTLY блокирует таблицу при сборке;
 -- на существующей продуктивной ml_user_orders это занимает >20s и
@@ -194,8 +200,52 @@ def _slim_items(order: dict) -> list[dict]:
     return out
 
 
+PAID_STOCK_STATUSES = {"paid", "shipped", "delivered", "ready_to_ship"}
+CANCEL_STOCK_STATUSES = {"cancelled", "invalid"}
+
+
+async def _apply_stock_change(
+    conn: asyncpg.Connection,
+    user_id: int,
+    items: list[dict],
+    direction: str,
+) -> None:
+    """Apply stock decrement (`'paid'`) or restore (`'cancelled'`) to
+    `ml_user_items.available_quantity`:
+      - `paid`: subtract quantity (clamp to 0)
+      - `cancelled`: add quantity back
+
+    Status поле НЕ трогаем. Решение о pause/active — за ML и пользователем
+    (для paused-with-stock есть отдельный endpoint /items/{id}/activate +
+    UI-кнопка). Mirror ML status здесь привёл бы к surprises.
+    """
+    for it in items:
+        mlb = it.get("mlb")
+        qty = int(it.get("quantity") or 0)
+        if not mlb or qty <= 0:
+            continue
+        if direction == "paid":
+            await conn.execute(
+                """
+                UPDATE ml_user_items
+                   SET available_quantity = GREATEST(0, COALESCE(available_quantity, 0) - $3)
+                 WHERE user_id = $1 AND item_id = $2
+                """,
+                user_id, mlb, qty,
+            )
+        elif direction == "cancelled":
+            await conn.execute(
+                """
+                UPDATE ml_user_items
+                   SET available_quantity = COALESCE(available_quantity, 0) + $3
+                 WHERE user_id = $1 AND item_id = $2
+                """,
+                user_id, mlb, qty,
+            )
+
+
 async def _upsert_order(conn: asyncpg.Connection, user_id: int, order: dict) -> None:
-    """Upsert ml_user_orders row.
+    """Upsert ml_user_orders row + apply local stock side-effect.
 
     Notify-tracking: только реально свежие orders (date_created в окне последних
     24ч от now) идут с `notified_at = NULL` — они потом подхватятся диспатчером.
@@ -203,6 +253,14 @@ async def _upsert_order(conn: asyncpg.Connection, user_id: int, order: dict) -> 
     при первой массовой загрузке за неделю/месяц TG-чат не получил 100+
     устаревших уведомлений. Если order уже existed — оставляем notified_at
     как было (не сбрасываем).
+
+    Stock side-effect:
+      - first time seeing order as paid → decrement ml_user_items
+      - paid → cancelled → restore stock
+      - re-paid after cancelled (rare) → re-decrement
+      - pure backfill (cron pulls historical paid orders): тоже decrement
+        ОДИН раз (stock_state guards repeats), но nightly refresh всё
+        равно перезапишет available_quantity из ML. Net effect = no harm.
     """
     order_id = order.get("id")
     if order_id is None:
@@ -219,14 +277,36 @@ async def _upsert_order(conn: asyncpg.Connection, user_id: int, order: dict) -> 
         except Exception:  # noqa: BLE001
             is_recent = False
     initial_notified_at = None if is_recent else datetime.now(timezone.utc)
+
+    # ── Stock state machine ─────────────────────────────────────────────────
+    # Read previous row (status + stock_state) ДО upsert, чтобы решить —
+    # нужен ли decrement / restore. Без prev_state повторный webhook про тот
+    # же order делал бы повторный decrement.
+    prev_row = await conn.fetchrow(
+        "SELECT stock_state FROM ml_user_orders WHERE user_id = $1 AND order_id = $2",
+        user_id, int(order_id),
+    )
+    prev_state = (prev_row["stock_state"] if prev_row else None)
+    new_status_raw = str(order.get("status") or "").strip().lower()
+    new_state = prev_state  # default: unchanged
+    if is_recent and items:
+        # Backfill (старые orders) пропускаем — ML stock уже отражён в ночном
+        # refresh. Decrement применяем только к свежим/live webhook'ам.
+        if new_status_raw in PAID_STOCK_STATUSES and prev_state != "decremented":
+            await _apply_stock_change(conn, user_id, items, "paid")
+            new_state = "decremented"
+        elif new_status_raw in CANCEL_STOCK_STATUSES and prev_state == "decremented":
+            await _apply_stock_change(conn, user_id, items, "cancelled")
+            new_state = "restored"
+
     await conn.execute(
         """
         INSERT INTO ml_user_orders
           (user_id, order_id, pack_id, date_created, date_closed,
            status, status_detail, total_amount, currency, buyer_id,
-           items, tags, raw, fetched_at, notified_at)
+           items, tags, raw, fetched_at, notified_at, stock_state)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11::jsonb, $12::jsonb, $13::jsonb, NOW(), $14)
+                $11::jsonb, $12::jsonb, $13::jsonb, NOW(), $14, $15)
         ON CONFLICT (user_id, order_id) DO UPDATE SET
           pack_id = EXCLUDED.pack_id,
           date_created = EXCLUDED.date_created,
@@ -239,7 +319,8 @@ async def _upsert_order(conn: asyncpg.Connection, user_id: int, order: dict) -> 
           items = EXCLUDED.items,
           tags = EXCLUDED.tags,
           raw = EXCLUDED.raw,
-          fetched_at = NOW()
+          fetched_at = NOW(),
+          stock_state = EXCLUDED.stock_state
           -- ВАЖНО: notified_at НЕ обновляем — сохраняем существующее значение
         """,
         user_id,
@@ -256,6 +337,7 @@ async def _upsert_order(conn: asyncpg.Connection, user_id: int, order: dict) -> 
         json.dumps(order.get("tags") or [], default=str),
         json.dumps(order, default=str),
         initial_notified_at,
+        new_state,
     )
 
 
