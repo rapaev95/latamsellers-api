@@ -572,7 +572,15 @@ def _build_claim_card(
     if isinstance(returns, list) and returns and isinstance(returns[0], dict):
         head_status = (returns[0].get("status") or "").lower()
     needs_review = head_status == "delivered"
-    if needs_review:
+    is_resolved = _is_ml_resolved(claim)
+    if is_resolved:
+        if summary_lang == "ru":
+            title = "ℹ️ *Жалоба решена ML — только проверь детали*"
+        elif summary_lang == "en":
+            title = "ℹ️ *Claim resolved by ML — review only*"
+        else:
+            title = "ℹ️ *Reclamação resolvida pelo ML — só conferir*"
+    elif needs_review:
         title = "📦 *Devolução chegou — inspecionar*"
     else:
         title = "⚠️ *Reclamação aberta — atender agora*"
@@ -640,7 +648,18 @@ def _build_claim_card(
             if len(complaint) > 600:
                 clip += "…"
             lines.append("")
-            lines.append("💬 *Motivo do comprador:*")
+            if is_resolved:
+                # Mediator уже описал решение — показываем дословно как «Resumo
+                # da resolução», без AI-bullets.
+                if summary_lang == "ru":
+                    head_lbl = "📋 *Решение ML:*"
+                elif summary_lang == "en":
+                    head_lbl = "📋 *ML resolution:*"
+                else:
+                    head_lbl = "📋 *Resumo da resolução:*"
+                lines.append(head_lbl)
+            else:
+                lines.append("💬 *Motivo do comprador:*")
             lines.append(_esc(clip))
 
     # If ML expects the seller to respond to the mediator (action
@@ -702,6 +721,53 @@ def _build_claim_card(
     else:
         lines.append("_Escolha uma solução abaixo antes do prazo expirar\\._")
     return "\n".join(lines)
+
+
+_ML_RESOLVED_MARKERS = (
+    "encerrado",                     # "O caso foi encerrado..."
+    "resolvi tudo",                  # "Eu analisei o caso e resolvi tudo..."
+    "reputação não foi",             # "sua reputação não foi e nunca será impactada"
+    "no se vio afectada",            # ES variant
+    "won't be impacted",             # EN variant
+)
+
+
+def _is_ml_resolved(claim: Optional[dict[str, Any]]) -> bool:
+    """Type B detection — ML mediator уже разрулил case, продавцу нечего «atender».
+
+    Признаки (оба должны быть true):
+      1. seller_available_actions пусто (или только send_message_to_mediator —
+         его всё равно через public API не вызвать).
+      2. Последнее mediator-сообщение содержит маркер закрытия
+         (encerrado / resolvi tudo / reputação não foi).
+
+    На таком claim мы шлём read-only TG card: только кнопка «Ver no ML»,
+    без AI-summary (mediator текст сам понятен), без «Atender no app».
+    """
+    if not isinstance(claim, dict):
+        return False
+    actions = _seller_available_actions(claim)
+    if actions and actions != {"send_message_to_mediator"}:
+        return False
+
+    messages = claim.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return False
+    # Самое свежее сообщение — обычно последнее в массиве.
+    last_mediator_text = ""
+    for m in reversed(messages):
+        if not isinstance(m, dict):
+            continue
+        sender = m.get("sender_role") or ""
+        if isinstance(m.get("sender"), dict):
+            sender = m["sender"].get("role") or sender
+        if sender != "mediator":
+            continue
+        last_mediator_text = (m.get("message") or m.get("text") or "").lower()
+        break
+    if not last_mediator_text:
+        return False
+    return any(marker in last_mediator_text for marker in _ML_RESOLVED_MARKERS)
 
 
 def _seller_available_actions(claim: Optional[dict[str, Any]]) -> set[str]:
@@ -813,6 +879,14 @@ def _build_keyboard(
     return_id = head_return.get("id")
 
     rows: list[list[dict[str, Any]]] = []
+
+    # Type B — ML mediator уже всё разрулил. Кнопку «Atender» не показываем
+    # потому что нечего atender. Только Ver no ML для проверки деталей.
+    if _is_ml_resolved(claim):
+        rows.append([
+            {"text": "🔗 Ver detalhes no ML", "url": ml_link},
+        ])
+        return {"inline_keyboard": rows}
 
     # Special-case: send_message_to_mediator. ML's public API has NO
     # endpoint for this action — and our app uses the same public API,
@@ -1020,7 +1094,15 @@ async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int, app_base_url: str
             # prompt re-runs once per claim.
             summary: Optional[str] = None
             SUMMARY_PROMPT_VERSION = "v2-analysis"
-            if summary_lang in ("ru", "en"):
+            # Type B (ML mediator уже разрулил) — пропускаем AI-summary.
+            # Mediator-text сам по себе понятен, а bullet-разбор «Devolução /
+            # Troca / Reembolso» при закрытом case'e только запутывает.
+            # _build_claim_card сам подхватит mediator-текст через
+            # _extract_buyer_complaint и пометит его как «Resumo da resolução».
+            skip_ai_summary = _is_ml_resolved(enriched)
+            if skip_ai_summary:
+                pass
+            elif summary_lang in ("ru", "en"):
                 cached = row["tg_summary"]
                 cached_lang = row["tg_summary_lang"]
                 # Tag cached lang as e.g. "ru:v2-analysis" — matches only when
