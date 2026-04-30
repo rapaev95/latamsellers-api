@@ -525,6 +525,13 @@ class CommissionFormula(BaseModel):
     simples_anexo: str = "III"                  # "I" | "II" | "III" (matches v2/legacy/tax_brazil.ANEXOS)
     margin_pct: float = 0.09                    # 0..1 fraction (0.09 = 9%) — наша наценка поверх effective Simples
     baseline_rbt12: float = 0.0                 # стартовое значение RBT12 на t=0 (BRL)
+    # Дата на которую baseline_rbt12 был установлен (ISO YYYY-MM-DD). Без неё
+    # baseline учитывается ВЕЧНО (старое поведение, backward-compat). С ней
+    # baseline выпадает из RBT12 через 365 дней — корректное Receita Federal
+    # поведение: после 12 мес паузы проект становится "fresh business" с
+    # rate ~ first faixa. Используется когда хочется реалистичный sliding
+    # window (например GANZA: Май 2026 → пауза → Июн 2027 → fresh start).
+    baseline_rbt12_as_of: Optional[str] = None
 
 
 class ServicesOpeningSnapshot(BaseModel):

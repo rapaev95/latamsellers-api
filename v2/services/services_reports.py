@@ -117,31 +117,59 @@ def compute_bracket_rate(rbt12: float, brackets: list[dict[str, Any]]) -> dict[s
     }
 
 
-def _rolling_rbt12(history: list[tuple[str, float]], current_iso: str, baseline: float = 0.0) -> float:
+def _rolling_rbt12(
+    history: list[tuple[str, float]],
+    current_iso: str,
+    baseline: float = 0.0,
+    baseline_as_of: Optional[str] = None,
+) -> float:
     """Sliding 12-month sum: revenue from `history` whose date falls in
     [current − 12 months, current], inclusive of current_iso's month. Adds
-    `baseline` (used when project record carries pre-loaded RBT12 from a
-    period before our local history starts — e.g. fresh services-project
-    migrating from a paper-trail past).
+    `baseline` (pre-loaded RBT12 from a period before local history starts —
+    e.g. project migrating with paper-trail past).
+
+    When `baseline_as_of` is set (ISO YYYY-MM-DD), the baseline ALSO obeys
+    the 365-day decay: if `current_iso` is more than a year past
+    `baseline_as_of`, baseline contributes 0 — modelling the legal Receita
+    Federal definition where RBT12 is strictly the last 12 months. This is
+    what makes GANZA's "12-month pause → fresh start" scenario work: by
+    Jun 2027 (13+ months after baseline as_of=2026-04-30), the 676 699
+    baseline drops out and only the still-in-window invoices count.
 
     `history` items are `(date_iso, gross_brl)` already accumulated by caller.
-    `current_iso` is the date of the row we're computing the rate for.
     """
     try:
         cur = datetime.strptime(current_iso[:10], "%Y-%m-%d").date()
     except (ValueError, TypeError):
         return baseline
+
     # Window opens 12 months back, inclusive — i.e. for May 2026 it's
-    # [Jun 2025, May 2026]. Approximation: 365 days back works for MVP;
-    # exact "same day previous year" would need calendar arithmetic.
+    # [Jun 2025, May 2026]. 365 days approximation works for MVP; exact
+    # "same day previous year" would need calendar arithmetic.
     cutoff = date.fromordinal(max(1, cur.toordinal() - 365))
-    s = baseline
+
+    # Baseline decay — only applies when baseline_as_of given (opt-in).
+    base_contrib = baseline
+    if baseline_as_of:
+        try:
+            ba = datetime.strptime(baseline_as_of[:10], "%Y-%m-%d").date()
+            if (cur - ba).days > 365:
+                base_contrib = 0.0
+        except (ValueError, TypeError):
+            pass  # malformed date → behave as if no decay (safer)
+
+    s = base_contrib
     for ds, g in history:
         try:
             d = datetime.strptime(ds[:10], "%Y-%m-%d").date()
         except (ValueError, TypeError):
             continue
-        if cutoff <= d <= cur:
+        # Strict-exclusive cutoff matches user's spreadsheet: Jun 2027 row
+        # gives RBT12=630k = 3 invoices (Jul/Aug/Sep 2026), with the May/Jun
+        # 2026 ones already out of the 365-day window. Current invoice isn't
+        # in history yet (added after this fn) so the upper bound's
+        # inclusiveness doesn't matter — kept open for clarity.
+        if cutoff < d < cur:
             s += float(g or 0)
     return s
 
@@ -167,6 +195,7 @@ def compute_pnl_dynamic(project: dict[str, Any], invoices: list[dict[str, Any]])
     formula = project.get("commission_formula") or None
     brackets = project.get("commission_brackets") or []
     baseline = float(formula.get("baseline_rbt12", 0.0)) if formula else 0.0
+    baseline_as_of = (formula or {}).get("baseline_rbt12_as_of") if formula else None
 
     invoices_sorted = sorted(invoices, key=lambda inv: str(inv.get("date") or "")[:10])
     history: list[tuple[str, float]] = []
@@ -182,28 +211,17 @@ def compute_pnl_dynamic(project: dict[str, Any], invoices: list[dict[str, Any]])
         if gross <= 0 or not d_iso:
             continue
 
-        # Different "RBT12 reference point" conventions per mode:
-        #
-        # - formula (GANZA-style): rate uses RBT12 AFTER current invoice is
-        #   added — matches user's spreadsheet column "Окно до" = baseline +
-        #   sum-including-current.
-        # - brackets (LATAMSELLERS-style): rate uses RBT12 BEFORE current —
-        #   matches Receita Federal's strict definition (12 prior months only)
-        #   and matches user's spreadsheet "Окно 0 / 210k / 420k" pattern.
-        #
-        # Both are valid; the user picks via mode. Receita's definition is the
-        # legal one but the user's GANZA invoices use the "after" convention,
-        # so we honour both. (Future: expose `rbt12_includes_current: bool`
-        # for explicit override if needed.)
+        # RBT12 by Receita Federal definition: sum of revenue of the 12 prior
+        # months — STRICTLY EXCLUDING current month. Same convention for both
+        # formula and brackets modes. User's 21-row scenario confirms it:
+        #   - LATAMSELLERS Окт 2026 (RBT12=0, fresh): no past months ✓
+        #   - GANZA Июн 2027 (RBT12=630k = Июл/Авг/Сен 2026 only):
+        #     baseline already decayed (>365d after as_of), and 4-mo-prior
+        #     invoice (Май 2026) just out of window ✓
+        # Add current invoice to history AFTER computing rbt12.
         is_formula = bool(formula and formula.get("mode") == "simples_progressive")
-
-        if is_formula:
-            history.append((d_iso, gross))
-            rbt12 = _rolling_rbt12(history, d_iso, baseline=baseline)
-        else:
-            # bracket mode — RBT12 from history BEFORE adding this invoice
-            rbt12 = _rolling_rbt12(history, d_iso, baseline=baseline)
-            history.append((d_iso, gross))
+        rbt12 = _rolling_rbt12(history, d_iso, baseline=baseline, baseline_as_of=baseline_as_of)
+        history.append((d_iso, gross))
 
         # Pick rate from whichever config the project has set.
         if is_formula:
