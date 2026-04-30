@@ -3478,6 +3478,130 @@ def _parse_armazenagem_file(path) -> dict | None:
     return _parse_armazenagem_rows(rows)
 
 
+def _parse_armazenagem_xlsx_detalhe(file_bytes: bytes) -> dict | None:
+    """Парсер новой xlsx-структуры armazenagem (sheet 'Detalhe').
+
+    Структура (Custos_por_servico_armazenamento.xlsx):
+      Sheet 'Resumo'  — агрегатная сводка (игнорируем)
+      Sheet 'Detalhe' — реальные данные:
+        rows[0..4] — title, blank, subtitle, blank, group-headers
+        rows[5]    — column headers (`SKU`, `Código ML`, дневные даты,...)
+        rows[6+]   — по 2 строки на SKU: первая с BRL-тарифом, вторая с
+                     unit-count `"0 u"` (пропускаем).
+        col[0]     — пустая sentinel-колонка (всегда NaN).
+
+    Возвращает тот же `{by_sku, daily_cols}` shape что и CSV-парсер, чтобы
+    `load_armazenagem_report` мог merge-ить xlsx и csv источники прозрачно.
+    """
+    import io as _io
+    import re as _re
+    import logging
+    from datetime import date as _date, datetime as _dt
+
+    log = logging.getLogger(__name__)
+    try:
+        xl = pd.ExcelFile(_io.BytesIO(file_bytes))
+    except Exception as err:  # noqa: BLE001
+        log.warning("armazenagem xlsx open failed: %s", err)
+        return None
+
+    target_sheet = None
+    for s in xl.sheet_names:
+        if s.strip().lower().startswith("detalhe"):
+            target_sheet = s
+            break
+    if target_sheet is None:
+        log.warning("armazenagem xlsx: 'Detalhe' sheet not found in %s", xl.sheet_names)
+        return None
+
+    try:
+        df = pd.read_excel(xl, sheet_name=target_sheet, header=None, dtype=object)
+    except Exception as err:  # noqa: BLE001
+        log.warning("armazenagem xlsx Detalhe read failed: %s", err)
+        return None
+    if df is None or df.shape[0] < 7:
+        return None
+
+    def _hdr_cell(v: object) -> str:
+        if pd.isna(v):
+            return ""
+        if isinstance(v, (_dt, _date)):
+            return v.strftime("%d/%m/%Y")
+        try:
+            ts = pd.Timestamp(v)
+            if not pd.isna(ts) and isinstance(v, (pd.Timestamp,)):
+                return ts.strftime("%d/%m/%Y")
+        except Exception:
+            pass
+        s = str(v).strip()
+        # Иногда даты приходят как text "2025-10-29 00:00:00".
+        m = _re.match(r"^(\d{4})-(\d{2})-(\d{2})", s)
+        if m:
+            return f"{m.group(3)}/{m.group(2)}/{m.group(1)}"
+        return s
+
+    hdr = [_hdr_cell(v) for v in df.iloc[5].tolist()]
+
+    i_sku = next((i for i, c in enumerate(hdr) if c == "SKU"), None)
+    i_mlb = next((i for i, c in enumerate(hdr) if "Código ML" in c), None)
+    i_anuncio = next(
+        (i for i, c in enumerate(hdr)
+         if "Código do anúncio" in c or "Número do anúncio" in c),
+        None,
+    )
+    if i_sku is None:
+        log.warning("armazenagem xlsx: SKU column missing in Detalhe header")
+        return None
+
+    daily_cols: list[tuple[int, str]] = []
+    for i, c in enumerate(hdr):
+        if _re.match(r"^\d{2}/\d{2}/\d{4}$", c):
+            daily_cols.append((i, c))
+    if not daily_cols:
+        log.warning("armazenagem xlsx: no daily date columns in Detalhe header")
+        return None
+
+    by_sku: dict = {}
+    for r_idx in range(6, df.shape[0]):
+        r = df.iloc[r_idx].tolist()
+        sku_raw = r[i_sku] if i_sku < len(r) else None
+        if sku_raw is None or pd.isna(sku_raw) or not str(sku_raw).strip():
+            # Пустая строка-разделитель или unit-count row (там SKU пуст).
+            continue
+        sku = str(sku_raw).strip()
+        mlb = ""
+        if i_mlb is not None and i_mlb < len(r) and not pd.isna(r[i_mlb]):
+            mlb = str(r[i_mlb]).strip()
+        anuncio = ""
+        if i_anuncio is not None and i_anuncio < len(r) and not pd.isna(r[i_anuncio]):
+            anuncio = str(r[i_anuncio]).strip()
+
+        values: dict[str, float] = {}
+        for col_i, col_name in daily_cols:
+            if col_i >= len(r):
+                values[col_name] = 0.0
+                continue
+            v = r[col_i]
+            if pd.isna(v):
+                values[col_name] = 0.0
+                continue
+            if isinstance(v, (int, float)):
+                values[col_name] = float(v)
+                continue
+            s = str(v).strip()
+            # Skip unit-count cells like "0 u" / "1 u" — на этой строке они
+            # не должны встречаться (sku не пуст), но на всякий случай.
+            if s.endswith(" u") or s.lower().endswith("unidades"):
+                values[col_name] = 0.0
+                continue
+            values[col_name] = _parse_brl_money(s)
+        by_sku[sku] = {"MLB": mlb, "anuncio": anuncio, "values": values}
+
+    if not by_sku:
+        return None
+    return {"by_sku": by_sku, "daily_cols": [c for _, c in daily_cols]}
+
+
 def _parse_armazenagem_bytes_daily(file_bytes: bytes) -> dict | None:
     """Bytes-variant of `_parse_armazenagem_file` for DB-mode (LS_STORAGE_MODE=db).
 
@@ -3490,38 +3614,14 @@ def _parse_armazenagem_bytes_daily(file_bytes: bytes) -> dict | None:
     import logging
     log = logging.getLogger(__name__)
 
-    # XLSX magic bytes — ML недавно начал экспортировать armazenagem как .xlsx
-    # рядом с .csv. Парсер CSV молча возвращал None на бинарных данных, и свежий
-    # отчёт не учитывался → coverage застревал на дате последнего CSV.
+    # XLSX magic bytes — ML экспортирует armazenagem как .xlsx с двумя листами:
+    # 'Resumo' (агрегатная сводка) и 'Detalhe' (по SKU × дням). CSV-формат —
+    # daily-matrix с header на строке 5; xlsx-формат — header на rows[5],
+    # первая колонка пустая (sentinel), каждый SKU занимает 2 строки (BRL +
+    # "0 u" units row). Старая версия парсера брала sheet 0 = Resumo и
+    # возвращала None → свежий отчёт не учитывался.
     if len(file_bytes) >= 4 and file_bytes[:4] == b"PK\x03\x04":
-        from datetime import date as _date, datetime as _dt
-        try:
-            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=None, dtype=object)
-        except Exception as err:  # noqa: BLE001
-            log.warning("armazenagem xlsx parse failed: %s", err)
-            return None
-        if df is None or df.empty:
-            return None
-
-        def _cell(v: object) -> str:
-            # Дневные заголовки в xlsx приходят как datetime — приводим в
-            # `DD/MM/YYYY`, иначе shared regex не матчит.
-            if pd.isna(v):
-                return ""
-            if isinstance(v, (_dt, _date)):
-                return v.strftime("%d/%m/%Y")
-            try:
-                ts = pd.Timestamp(v)
-                if not pd.isna(ts) and isinstance(v, pd.Timestamp):
-                    return ts.strftime("%d/%m/%Y")
-            except Exception:
-                pass
-            return str(v)
-
-        rows: list[list[str]] = []
-        for _, r in df.iterrows():
-            rows.append([_cell(v) for v in r.tolist()])
-        return _parse_armazenagem_rows(rows)
+        return _parse_armazenagem_xlsx_detalhe(file_bytes)
 
     text: str | None = None
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
