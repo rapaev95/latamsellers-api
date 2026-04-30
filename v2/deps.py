@@ -126,3 +126,21 @@ async def require_admin(user: CurrentUser = Depends(current_user)) -> CurrentUse
             detail={"code": "admin_required"},
         )
     return user
+
+
+def _is_superadmin(user: CurrentUser) -> bool:
+    return user.role == "superadmin"
+
+
+async def require_superadmin(user: CurrentUser = Depends(current_user)) -> CurrentUser:
+    """Stricter gate than `require_admin` — used for services-projects flow
+    (Estonia / GANZA) which exposes hand-curated tax brackets, RBT12 baseline
+    decay, partner contributions, approved transfers. Regular admins can't
+    create or edit these — they're owner-only because mistakes propagate
+    into invoice-based ОПиУ and DAS calculations."""
+    if not _is_superadmin(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "superadmin_required"},
+        )
+    return user

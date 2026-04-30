@@ -16,7 +16,7 @@ from typing import Any, Callable, Optional, TypeVar
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, Response, UploadFile
 
 from v2.db import get_pool
-from v2.deps import CurrentUser, current_user
+from v2.deps import CurrentUser, current_user, _is_superadmin
 from v2.legacy import db_storage as legacy_db
 from v2.legacy import config as legacy_config
 from v2.services import finance_cache
@@ -267,6 +267,15 @@ async def get_services_reports(
     """
     if pool is None:
         raise HTTPException(status_code=503, detail="db_unavailable")
+    # Services-projects are superadmin-only — they expose hand-curated tax
+    # brackets, RBT12 baseline decay, and partner contributions that affect
+    # invoice-based ОПиУ + DAS calculations. Regular admins should not see
+    # or edit them.
+    if not _is_superadmin(user):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "superadmin_required", "feature": "services_reports"},
+        )
     _bind_user(user)
 
     projects = legacy_config.load_projects()
@@ -3169,6 +3178,27 @@ def create_project(
     pid = (body.project_id or "").strip().upper()
     if not pid:
         raise HTTPException(status_code=400, detail="project_id_required")
+
+    # Services-projects are superadmin-only — they expose hand-curated tax
+    # config (commission_brackets/formula, tomador_cnpj, services_opening)
+    # that has direct effect on invoice-based ОПиУ + DAS calculations.
+    # Gate ANY services-shaped payload, even if the user just sets
+    # project_type='services' without filling the rest.
+    requested_type = (body.project_type or "ecom").strip().lower()
+    has_services_payload = (
+        requested_type == "services"
+        or body.tomador_cnpj or body.tomador_name
+        or body.commission_brackets
+        or body.commission_formula
+        or body.services_opening
+        or body.das_apportionment
+    )
+    if has_services_payload and not _is_superadmin(user):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "superadmin_required", "feature": "services_project_create"},
+        )
+
     existing = load_projects() or {}
     is_new = pid not in existing
 
@@ -3218,6 +3248,30 @@ def update_project_endpoint(
     pid = project_id.strip().upper()
     if not pid:
         raise HTTPException(status_code=400, detail="project_id_required")
+
+    # Services-project gate (superadmin only). Trigger if either:
+    #  (a) target project is currently type='services' — ANY edit on it,
+    #  (b) the new fields try to switch to 'services' or set
+    #      services-only config keys (tomador / commission_brackets /
+    #      commission_formula / services_opening / das_apportionment).
+    fields = body.fields or {}
+    services_keys = {
+        "tomador_cnpj", "tomador_name",
+        "commission_brackets", "commission_formula",
+        "services_opening", "das_apportionment",
+    }
+    target_type_now = (load_projects() or {}).get(pid, {}).get("type") or ""
+    target_type_after = str(fields.get("type") or target_type_now or "").lower()
+    has_services_payload = (
+        target_type_now == "services"
+        or target_type_after == "services"
+        or any(k in fields for k in services_keys)
+    )
+    if has_services_payload and not _is_superadmin(user):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "superadmin_required", "feature": "services_project_edit"},
+        )
 
     ok = update_project(pid, body.fields or {}, body.rental_fields)
     if not ok:
