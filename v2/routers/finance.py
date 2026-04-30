@@ -47,6 +47,7 @@ from v2.schemas.finance import (
     DividendIn, DividendOut, DividendsListOut, DividendMutOut,
     APListOut,
     ManualInflowIn, ManualInflowOut, ManualInflowsListOut,
+    ServicesPnlOut, ServicesCashflowOut, ServicesBalanceOut, ServicesReportsBundleOut,
 )
 from v2.storage import uploads_storage
 from v2.storage import manual_usd_inflows as manual_inflows_svc
@@ -239,6 +240,111 @@ async def get_reports(
     )
     out.update(bundle)
     response.headers["X-Cache"] = status
+    return out
+
+
+@router.get("/services-reports", response_model=ServicesReportsBundleOut)
+async def get_services_reports(
+    response: Response,
+    project: str = Query(..., description="Project ID, must have type='services'"),
+    period_from: Optional[str] = Query(None, alias="from"),
+    period_to: Optional[str] = Query(None, alias="to"),
+    fresh: bool = Query(False, description="Bypass cache and recompute from scratch"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Invoice-based ОПиУ + ДДС + Balance for services-projects (Estonia /
+    GANZA-USD / `compensation_mode='rental'|'profit_share'`).
+
+    Wraps `v2/services/services_reports.compute_for_user` with the same
+    durable read-through cache as the ecom `/reports` endpoint
+    (`finance_compute_cache` table). First call after data change recomputes;
+    subsequent identical requests served from JSONB in ~50ms.
+
+    Returns 404 if project doesn't exist; 400 if it's not a services project.
+    Per-tab errors surface as `{pnl_error, cashflow_error, balance_error}`
+    instead of a single 500 — same UX pattern as ecom reports.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    _bind_user(user)
+
+    projects = legacy_config.load_projects()
+    if project not in projects:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "project_not_found", "available": list(projects.keys())},
+        )
+    proj_meta = projects.get(project, {}) or {}
+    if proj_meta.get("type") != "services":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "not_services_project",
+                "got_type": proj_meta.get("type"),
+                "hint": "use /finance/reports for ecom projects",
+            },
+        )
+
+    pf = _parse_iso(period_from)
+    pt = _parse_iso(period_to) or date.today()
+    if pf is None:
+        pf = date.fromordinal(pt.toordinal() - 365)  # default: 12 months back
+
+    out: dict[str, Any] = {
+        "project": project,
+        "period": {"from": pf.isoformat(), "to": pt.isoformat()},
+    }
+
+    from v2.services import services_reports as services_svc
+
+    async def _compute_async() -> dict[str, Any]:
+        bundle = await services_svc.compute_for_user(
+            pool, user.id, project, period_from=pf, period_to=pt,
+        )
+        # Drop top-level project/period — they're already in `out`. Keep only
+        # pnl/cashflow/balance + per-tab errors so finance_cache stores the
+        # heavy compute result, not redundant routing fields.
+        return {
+            k: v for k, v in bundle.items()
+            if k not in ("project", "period")
+        }
+
+    cache_key = f"services_reports:{project}:{pf.isoformat()}:{pt.isoformat()}"
+
+    # finance_cache.cached_compute is sync — run our async builder via a
+    # synchronous bridge that uses asyncio.run inside a thread (lazy import of
+    # the helper keeps the cache module unaware of asyncio). For now: just
+    # await the compute and inline-cache via the same UPSERT primitives.
+    # Bypass cache when `fresh=true`.
+    bundle: dict[str, Any]
+    cache_status: str
+    if fresh:
+        bundle = await _compute_async()
+        cache_status = "force"
+    else:
+        # Try cached read first (sync, fast).
+        fp, deps = finance_cache.compute_fingerprint(user.id)
+        cached = (
+            finance_cache._read_cached(user.id, cache_key, fp) if fp else None  # noqa: SLF001
+        )
+        if cached is not None:
+            bundle = cached
+            cache_status = "hit"
+        else:
+            bundle = await _compute_async()
+            # Don't cache partial / errored bundles.
+            has_error = any(k.endswith("_error") for k in bundle)
+            if not has_error and fp:
+                stored = finance_cache._write_cached(  # noqa: SLF001
+                    user.id, cache_key, bundle, fp, deps,
+                )
+                cache_status = "miss" if stored else "compute_only"
+            else:
+                cache_status = "skip_cache"
+
+    out.update(bundle)
+    response.headers["X-Cache"] = cache_status
     return out
 
 
@@ -2314,6 +2420,93 @@ async def uploads_diag_retirada(
             "descarte_units": total_descarte_units,
         },
     }
+
+
+@router.get("/uploads/{upload_id}/inspect")
+async def upload_inspect(
+    upload_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Show структуру xlsx/csv: sheet_names + первые 12 строк каждого листа.
+    Используется когда парсер возвращает None — увидеть как ML обновил
+    формат (sheet renamed, header сдвинулся, новая колонка)."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+
+    sf = await uploads_storage.get_file(pool, user.id, upload_id)
+    if not sf:
+        raise HTTPException(status_code=404, detail="upload_not_found")
+
+    file_bytes = sf.file_bytes or b""
+    out: dict[str, Any] = {
+        "upload_id": sf.id,
+        "filename": sf.filename,
+        "source_key": sf.source_key,
+        "bytes": len(file_bytes),
+        "magic": file_bytes[:4].hex() if file_bytes else "",
+    }
+
+    if len(file_bytes) >= 4 and file_bytes[:4] == b"PK\x03\x04":
+        import io as _io
+        try:
+            xl = pd.ExcelFile(_io.BytesIO(file_bytes))
+        except Exception as err:  # noqa: BLE001
+            out["error"] = f"ExcelFile open failed: {type(err).__name__}: {err}"
+            return out
+
+        out["format"] = "xlsx"
+        out["sheet_names"] = list(xl.sheet_names)
+        sheets_preview: dict[str, Any] = {}
+        for sname in xl.sheet_names[:5]:
+            try:
+                df = pd.read_excel(xl, sheet_name=sname, header=None, nrows=12, dtype=object)
+                rows: list[list[str]] = []
+                for _, r in df.iterrows():
+                    row = []
+                    for v in r.tolist():
+                        if pd.isna(v):
+                            row.append("")
+                        else:
+                            s = str(v)
+                            row.append(s[:60] + "…" if len(s) > 60 else s)
+                    rows.append(row)
+                sheets_preview[sname] = {
+                    "shape": [int(df.shape[0]), int(df.shape[1])],
+                    "rows": rows,
+                }
+            except Exception as err:  # noqa: BLE001
+                sheets_preview[sname] = {"error": f"{type(err).__name__}: {err}"}
+        out["sheets_preview"] = sheets_preview
+        return out
+
+    out["format"] = "csv"
+    text: str | None = None
+    enc_used = ""
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            text = file_bytes.decode(enc)
+            enc_used = enc
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        out["error"] = "decode_failed"
+        return out
+    out["encoding"] = enc_used
+    import csv as _csv
+    import io as _io2
+    try:
+        rows_csv = list(_csv.reader(_io2.StringIO(text, newline=""), delimiter=";"))
+    except Exception as err:  # noqa: BLE001
+        out["error"] = f"csv_parse: {type(err).__name__}: {err}"
+        return out
+    preview: list[list[str]] = []
+    for r in rows_csv[:12]:
+        preview.append([(c[:60] + "…" if len(c) > 60 else c) for c in r])
+    out["rows_total"] = len(rows_csv)
+    out["rows_preview"] = preview
+    return out
 
 
 @router.get("/uploads/diag-armazenagem")
