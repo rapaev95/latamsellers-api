@@ -4528,6 +4528,71 @@ class _AiQuestionProbeIn(__import__("pydantic").BaseModel):
     invoke: bool = False  # call OpenRouter (costs cents per call)
 
 
+@router.get("/claims/{claim_id}/render-preview")
+async def claim_render_preview(
+    claim_id: str,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Diagnostic — runs the same _build_claim_card + _build_keyboard +
+    _is_ml_resolved logic that ml_claims_dispatch uses, but returns the
+    rendered output as JSON instead of pushing to Telegram.
+
+    Lets us verify Type A vs Type B classification on a real cached claim
+    without waiting for the next dispatch tick.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    try:
+        cid = int(claim_id)
+    except (TypeError, ValueError):
+        return {"error": "bad_claim_id"}
+
+    from v2.services.ml_claims_dispatch import (
+        _build_claim_card, _build_keyboard, _is_ml_resolved,
+        _seller_available_actions,
+    )
+    import os as _os
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT enriched, raw, status FROM ml_user_claims
+             WHERE user_id = $1 AND claim_id = $2
+            """,
+            user.id, cid,
+        )
+    if not row:
+        return {"error": "claim_not_in_cache", "claim_id": cid}
+
+    enriched_raw = row["enriched"]
+    if isinstance(enriched_raw, str):
+        try:
+            enriched = json.loads(enriched_raw)
+        except Exception:  # noqa: BLE001
+            enriched = {}
+    else:
+        enriched = enriched_raw or {}
+
+    is_resolved = _is_ml_resolved(enriched)
+    actions = sorted(_seller_available_actions(enriched))
+    app_base_url = _os.environ.get("APP_BASE_URL", "https://app.lsprofit.app")
+
+    text = _build_claim_card(enriched, summary=None, summary_lang="ru")
+    keyboard = _build_keyboard(cid, app_base_url, claim=enriched)
+
+    return {
+        "claim_id": cid,
+        "type_classification": "B_ml_resolved" if is_resolved else "A_actionable",
+        "is_ml_resolved": is_resolved,
+        "seller_available_actions": actions,
+        "claim_status_in_cache": row["status"],
+        "card_text_preview": text[:1500],
+        "keyboard": keyboard,
+        "would_skip_ai_summary": is_resolved,
+    }
+
+
 @router.post("/items/ai-question-probe")
 async def ai_question_probe(
     body: _AiQuestionProbeIn,
