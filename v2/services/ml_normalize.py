@@ -156,11 +156,12 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
 
             # ── Net margin block (после fixed overhead allocation) ──────
             # Net = variable - fixed_overhead_per_unit. Показывает реальную
-            # прибыль после распределения публикасьон / armazenagem /
-            # aluguel / fulfillment / manual fixed costs на каждую единицу
-            # из месячного объёма. Если net < 0 — товар нерентабельный
-            # с учётом overhead'а.
-            fixed_overhead_pu = unit.get("fixed_overhead_per_unit")
+            # прибыль после распределения publi/armaz/aluguel/fulfillment/
+            # manual fixed costs на каждую единицу из месячного объёма.
+            #
+            # В TG показываем monthly project total (real BRL/мес) — per-unit
+            # цифра ничего не говорит продавцу. Breakdown — только non-zero
+            # статьи, чтобы видно что реально кушает в проекте.
             if profit_net_pu is not None and qty > 0:
                 total_profit_net = float(profit_net_pu) * qty
                 net_str = f"{margin_net_pct}%" if margin_net_pct is not None else "—"
@@ -169,11 +170,35 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                 desc_lines.append(
                     f"{emoji} *Lucro líquido: {net_str} ({_money(total_profit_net)})*"
                 )
-                if fixed_overhead_pu is not None and float(fixed_overhead_pu) > 0:
-                    desc_lines.append(
-                        f"   • Overhead /un. (publi+armaz+aluguel+ful+fixos): "
-                        f"{_money(float(fixed_overhead_pu) * qty)}"
-                    )
+                # Monthly fixed costs project-level (НЕ per-unit).
+                aluguel_m = float(margin.get("aluguel_share") or 0)
+                armaz_m = float(margin.get("armazenagem_share") or 0)
+                publi_m = float(margin.get("publicidade_share") or 0)
+                ful_m = float(margin.get("fulfillment_share") or 0)
+                manual_m = float(unit.get("manual_fixed_total_monthly") or 0)
+                fixed_total_m = aluguel_m + armaz_m + publi_m + ful_m + manual_m
+
+                if fixed_total_m > 0:
+                    parts: list[str] = []
+                    if aluguel_m > 0:
+                        parts.append(f"Aluguel {_money(aluguel_m)}")
+                    if armaz_m > 0:
+                        parts.append(f"Armaz {_money(armaz_m)}")
+                    if publi_m > 0:
+                        parts.append(f"Publi {_money(publi_m)}")
+                    if ful_m > 0:
+                        parts.append(f"Ful {_money(ful_m)}")
+                    if manual_m > 0:
+                        parts.append(f"Outros {_money(manual_m)}")
+                    breakdown = " · ".join(parts) if parts else ""
+                    if breakdown:
+                        desc_lines.append(
+                            f"   • Custos fixos /mês: {_money(fixed_total_m)} ({breakdown})"
+                        )
+                    else:
+                        desc_lines.append(
+                            f"   • Custos fixos /mês: {_money(fixed_total_m)}"
+                        )
                 if margin_net_pct is not None and float(margin_net_pct) < 0:
                     desc_lines.append(
                         "   ⚠ Sem cobrir overhead — considere subir preço ou cortar custos fixos"

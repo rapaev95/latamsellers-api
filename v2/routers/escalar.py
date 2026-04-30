@@ -4742,6 +4742,87 @@ class _AiQuestionProbeIn(__import__("pydantic").BaseModel):
     invoke: bool = False  # call OpenRouter (costs cents per call)
 
 
+@router.get("/items/{mlb}/inventory-probe")
+async def inventory_probe(
+    mlb: str,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Diagnostic — compare cached vs live stock data + variations breakdown.
+
+    Use when seller doubts the «📦 Estoque: 0 un.» blocked in TG. Shows:
+      - ml_user_items.available_quantity (cached, used by inventory_forecast)
+      - Live ML /items/{id} available_quantity / initial_quantity
+      - Variations available_quantity sum (if item has variations)
+      - ml_stock_full row if exists (Full warehouse delegated stock)
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    try:
+        token, _exp, _ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except Exception as err:  # noqa: BLE001
+        return {"error": "oauth_failed", "detail": str(err)}
+
+    item_id = mlb.upper()
+    out: dict[str, Any] = {"item_id": item_id}
+
+    # Cached available_quantity (что использует inventory_forecast)
+    async with pool.acquire() as conn:
+        cached_qty = await conn.fetchval(
+            "SELECT available_quantity FROM ml_user_items WHERE user_id = $1 AND item_id = $2",
+            user.id, item_id,
+        )
+    out["cached_available_quantity"] = cached_qty
+
+    # Live ML
+    async with httpx.AsyncClient() as http:
+        gr = await http.get(
+            f"https://api.mercadolibre.com/items/{item_id}"
+            "?attributes=id,available_quantity,initial_quantity,sold_quantity,"
+            "status,sub_status,variations.available_quantity,"
+            "variations.id,shipping.logistic_type,inventory_id",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15.0,
+        )
+    if gr.status_code >= 400:
+        out["live_error"] = {"status": gr.status_code, "detail": gr.text[:300]}
+        return out
+    live = gr.json() or {}
+    out["live"] = {
+        "available_quantity": live.get("available_quantity"),
+        "initial_quantity": live.get("initial_quantity"),
+        "sold_quantity": live.get("sold_quantity"),
+        "status": live.get("status"),
+        "sub_status": live.get("sub_status"),
+        "logistic_type": (live.get("shipping") or {}).get("logistic_type"),
+        "inventory_id": live.get("inventory_id"),
+    }
+
+    # Variations breakdown
+    variations = live.get("variations") or []
+    if variations:
+        out["variations"] = [
+            {"id": v.get("id"), "available_quantity": v.get("available_quantity")}
+            for v in variations
+        ]
+        out["variations_sum_available"] = sum(
+            int(v.get("available_quantity") or 0) for v in variations
+        )
+
+    # Mismatch detection
+    cached_v = int(cached_qty or 0)
+    live_v = int(live.get("available_quantity") or 0)
+    out["mismatch"] = {
+        "cached_vs_live": cached_v != live_v,
+        "delta": live_v - cached_v,
+        "hint": (
+            "ml_user_items stale — run /escalar/items/refresh"
+            if cached_v != live_v else "consistent"
+        ),
+    }
+    return out
+
+
 @router.post("/items/{mlb}/photo-descriptions/generate")
 async def photo_descriptions_generate(
     mlb: str,
