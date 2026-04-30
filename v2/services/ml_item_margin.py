@@ -475,11 +475,25 @@ def _build_item_payload(
     # Pull manual fixed costs (salaries/utilities/software/outros) per project.
     # Они НЕ в P&L opex (compute_pnl их не парсит), но формируют part of total
     # fixed overhead для break-even tracker. Source: project.fixed_costs_monthly.
+    # User-entered breakdown по всем 6 канонiческим категориям (см.
+    # legacy/config.py:_PROJECT_EDITABLE_KEYS). Используется в TG-сообщении
+    # как «то что пользователь сам заполнил» — без подмешивания computed
+    # shares (юзер требовал чтобы блок «Custos fixos» отражал только
+    # его явный input, а не реальные расходы из выписок/ads).
+    manual_fc_breakdown_user: dict[str, float] = {}
     try:
         from .config import load_projects as _lp_fixed
         proj_meta_fixed = (_lp_fixed() or {}).get(str(project).upper(), {}) or {}
         manual_fc = proj_meta_fixed.get("fixed_costs_monthly") or {}
         if isinstance(manual_fc, dict):
+            for k in ("aluguel", "armazenagem", "salaries", "utilities", "software", "outros"):
+                v = max(0.0, float(manual_fc.get(k, 0) or 0))
+                if v > 0:
+                    manual_fc_breakdown_user[k] = round(v, 2)
+            # break-even allocation использует ТОЛЬКО 4 категории (salaries
+            # / utilities / software / outros) — aluguel и armazenagem уже
+            # учтены через computed aluguel_share / armazenagem_share, иначе
+            # double-counting. Эта переменная остаётся для legacy расчёта.
             manual_fc_total = sum(
                 max(0.0, float(manual_fc.get(k, 0) or 0))
                 for k in ("salaries", "utilities", "software", "outros")
@@ -488,6 +502,7 @@ def _build_item_payload(
             manual_fc_total = 0.0
     except Exception:  # noqa: BLE001
         manual_fc_total = 0.0
+    manual_fc_user_total = round(sum(manual_fc_breakdown_user.values()), 2)
     manual_fc_per_unit = manual_fc_total / max(total_units, 1)
     fixed_overhead_per_unit = fixed_overhead_per_unit + manual_fc_per_unit
 
@@ -564,6 +579,11 @@ def _build_item_payload(
             # продаже надо покрывать чтобы P&L был положительным».
             "fixed_overhead_per_unit": round(fixed_overhead_per_unit, 2),
             "manual_fixed_total_monthly": round(manual_fc_total, 2),
+            # User-only values for TG display (без подмешивания computed
+            # aluguel/armazenagem/publicidade/fulfillment shares). См.
+            # ml_normalize.py — TG показывает breakdown ТОЛЬКО из этих полей.
+            "manual_fc_user_breakdown": manual_fc_breakdown_user,
+            "manual_fc_user_total": manual_fc_user_total,
             "profit_net_per_unit": round(profit_net_per_unit, 2) if profit_net_per_unit is not None else None,
             "margin_net_pct": margin_net_pct,
         },

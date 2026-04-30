@@ -170,27 +170,29 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                 desc_lines.append(
                     f"{emoji} *Lucro líquido: {net_str} ({_money(total_profit_net)})*"
                 )
-                # Monthly fixed costs project-level (НЕ per-unit).
-                aluguel_m = float(margin.get("aluguel_share") or 0)
-                armaz_m = float(margin.get("armazenagem_share") or 0)
-                publi_m = float(margin.get("publicidade_share") or 0)
-                ful_m = float(margin.get("fulfillment_share") or 0)
-                manual_m = float(unit.get("manual_fixed_total_monthly") or 0)
-                fixed_total_m = aluguel_m + armaz_m + publi_m + ful_m + manual_m
+                # Monthly fixed costs — только то что пользователь явно ввёл
+                # в проекте (`fixed_costs_monthly` через UI). НЕ подмешиваем
+                # computed shares (publi из ads, armaz из reports, и т.д.) —
+                # юзер требовал чтобы блок отражал только его настройки.
+                # Если ни одной категории не заполнено — блок не показываем.
+                fc_user = unit.get("manual_fc_user_breakdown") or {}
+                fixed_total_m = float(unit.get("manual_fc_user_total") or 0)
 
-                if fixed_total_m > 0:
+                if fixed_total_m > 0 and isinstance(fc_user, dict):
+                    LABELS_PT = {
+                        "aluguel": "Aluguel",
+                        "armazenagem": "Armaz",
+                        "salaries": "Salários",
+                        "utilities": "Utilidades",
+                        "software": "Software",
+                        "outros": "Outros",
+                    }
                     parts: list[str] = []
-                    if aluguel_m > 0:
-                        parts.append(f"Aluguel {_money(aluguel_m)}")
-                    if armaz_m > 0:
-                        parts.append(f"Armaz {_money(armaz_m)}")
-                    if publi_m > 0:
-                        parts.append(f"Publi {_money(publi_m)}")
-                    if ful_m > 0:
-                        parts.append(f"Ful {_money(ful_m)}")
-                    if manual_m > 0:
-                        parts.append(f"Outros {_money(manual_m)}")
-                    breakdown = " · ".join(parts) if parts else ""
+                    for key, label in LABELS_PT.items():
+                        v = float(fc_user.get(key) or 0)
+                        if v > 0:
+                            parts.append(f"{label} {_money(v)}")
+                    breakdown = " · ".join(parts)
                     if breakdown:
                         desc_lines.append(
                             f"   • Custos fixos /mês: {_money(fixed_total_m)} ({breakdown})"
