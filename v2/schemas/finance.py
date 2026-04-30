@@ -486,11 +486,46 @@ class OnboardingState(BaseModel):
     data: dict[str, Any] = {}
 
 
+class CommissionBracket(BaseModel):
+    """One bracket in a Simples Nacional progressive commission table.
+
+    Used by services-projects (Estonia / GANZA-USD) where the "comissão" we
+    keep per invoice is the same percentage Receita retains as Simples DAS,
+    and the rate steps up as cumulative_gross crosses each ceiling.
+
+    Stored per-project in `commission_brackets`. Rate is a fraction (0.155
+    means 15.50%, NOT 15.50). Ceilings are inclusive upper bounds in BRL.
+    Ordered ascending by ceiling — `generate_services_pnl` walks them
+    in order picking the first one whose ceiling ≥ cumulative_gross.
+    """
+    ceiling_brl: float
+    rate_pct: float                      # 0..1 fraction (0.155 = 15.50%)
+
+
+class ServicesOpeningSnapshot(BaseModel):
+    """Hardcoded historical baseline for services-balance.
+
+    Streamlit had a hand-curated «approved» date (e.g. 19/03/2026 for Estonia)
+    — everything before that came from manual reconciliation, everything after
+    from live data. We carry the same idea: one snapshot per project records
+    what state the world was in at cutoff, and `generate_services_balance`
+    layers live updates on top.
+
+    All fields optional — partial baselines work (only `cutoff_date` + at
+    least one balance field required for the snapshot to be useful).
+    """
+    cutoff_date: Optional[str] = None             # ISO YYYY-MM-DD
+    opening_balance_brl: float = 0
+    debito_initial_brl: float = 0                 # client-debt at cutoff
+    ts_usd_in_stock: float = 0                    # USD inventory remaining at cutoff
+    ts_brl_value_in_stock: float = 0              # its BRL value at cutoff
+
+
 class ProjectCreateIn(BaseModel):
     """Minimal project create payload — wizard step 2. Catches the 90% case;
     full project editing stays on /finance/projects."""
     project_id: str
-    project_type: str = "ecom"           # "ecom" | "service" | "other"
+    project_type: str = "ecom"           # "ecom" | "services" | "other"
     description: str = ""
     sku_prefixes: list[str] = []
     compensation_mode: str = "profit_share"
@@ -501,6 +536,17 @@ class ProjectCreateIn(BaseModel):
     tax_regime: Optional[str] = None     # "simples_nacional" | "lucro_presumido" | ""
     simples_anexo: Optional[str] = None  # "I" | "II" | "III" | ""
     ml_only_revenue: Optional[bool] = None  # true → прогрессивный Simples без RBT12-warning
+    # ── Services-only config (project_type == 'services') ────────────────────
+    # Filled when the user chooses 'services' in onboarding step 2 OR enabled
+    # later in /finance/projects edit form. Ignored for ecom / other types.
+    tomador_cnpj: Optional[str] = None              # client CNPJ for NFS-e filtering
+    tomador_name: Optional[str] = None
+    commission_brackets: list[CommissionBracket] = []
+    services_opening: Optional[ServicesOpeningSnapshot] = None
+    # DAS apportionment between trade (ML revenue) and services (NFS-e) —
+    # `{trade_rate_pct: 0.045, services_rate_pct: <variable>}`. When None,
+    # services-side defaults to 1.0 - trade_rate_pct (legacy Estonia split).
+    das_apportionment: Optional[dict[str, float]] = None
 
 
 class ProjectCreateOut(BaseModel):
@@ -598,6 +644,9 @@ class ManualCashflowEntriesOut(BaseModel):
     manual_supplier: list[dict[str, Any]] = []
     loans_given: list[dict[str, Any]] = []       # этот проект ВЫДАЛ займ другому (outflow)
     loans_received: list[dict[str, Any]] = []    # этот проект ПОЛУЧИЛ займ от другого (inflow)
+    # Services-projects only (Estonia / GANZA-USD).
+    approved_transfer: list[dict[str, Any]] = []  # transfers to client (CALIZA / Bybit / C6 Câmbio / Cred.Nubank TS)
+    approved_invoice: list[dict[str, Any]] = []   # manually-curated invoices before NFS-e auto-load
 
 
 # ── Planned Payments (DDS Planning) ─────────────────────────────────────────
@@ -909,3 +958,100 @@ class ManualInflowsListOut(BaseModel):
     total_usd: float = 0
     total_brl: float = 0
     avg_rate: Optional[float] = None
+
+
+# ── Services-projects reports (Estonia / GANZA-USD invoice-based flow) ──────
+#
+# Returned by GET /finance/services-reports?project=X. Mirrors the dict shape
+# from `v2/services/services_reports.py:compute_for_user`. Allow `extra=ignore`
+# so the legacy generator's many ad-hoc fields don't blow up Pydantic strict
+# validation; UI reads the canonical fields below.
+
+class ServicesPnlOut(BaseModel):
+    """Invoice-based ОПиУ. Each invoice ↔ commission (= retention rate ×
+    gross). Splits across Simples brackets when cumulative_gross crosses a
+    ceiling. DAS apportioned: trade portion (4.5% × ML revenue) vs services
+    portion (DAS_total − trade)."""
+    model_config = {"extra": "ignore"}
+
+    total_gross: float = 0
+    total_tax_retained: float = 0
+    total_net_client: float = 0
+    invoice_count: int = 0
+    saldo_inicial: float = 0
+    total_enviado: float = 0
+    debito_estonia: float = 0
+    our_commission: float = 0
+    our_rental_paid_usd: float = 0
+    our_rental_pending_usd: float = 0
+    our_revenue_brl: float = 0
+    our_das_paid: float = 0
+    our_das_estimated: float = 0
+    our_das: float = 0
+    total_company_das: float = 0
+    total_trade_das: float = 0
+    trade_das_rate: float = 0
+    our_profit_brl: float = 0
+    our_profit_brl_paid_only: float = 0
+    das_payments: list[dict[str, Any]] = []
+    das_pending: list[dict[str, Any]] = []
+    pnl_by_month: list[dict[str, Any]] = []
+    current_bracket: str = ""
+    next_bracket: str = ""
+    cumulative_gross: float = 0
+    by_month: dict[str, dict[str, Any]] = {}
+    # True when the project isn't fully configured (no tomador_cnpj /
+    # commission_brackets / opening snapshot) — UI shows a config hint.
+    needs_config: bool = Field(default=False, alias="_needs_config")
+    reason: Optional[str] = Field(default=None, alias="_reason")
+
+
+class ServicesCashflowOut(BaseModel):
+    """ДДС: hardcoded transfers (CALIZA / Bybit / C6 Câmbio / Credit Nubank
+    TS) curated up to cutoff, plus live data after. Phase 4 will replace
+    hardcoded list with a UI-managed `manual_cashflow_entries` view."""
+    model_config = {"extra": "ignore"}
+
+    inflows: dict[str, float] = {}
+    outflows: dict[str, float] = {}
+    transfers: list[dict[str, Any]] = []
+    total_outflows: float = 0
+    debito_estonia: float = 0
+    by_month: dict[str, dict[str, Any]] = {}
+    needs_config: bool = Field(default=False, alias="_needs_config")
+    reason: Optional[str] = Field(default=None, alias="_reason")
+
+
+class ServicesBalanceOut(BaseModel):
+    """Balance: approved snapshot at cutoff + live FIFO TrafficStars (USD
+    spent → real BRL cost). `debito_real` is the up-to-date client-debt."""
+    model_config = {"extra": "ignore"}
+
+    approved_date: Optional[str] = None
+    saldo_inicial: float = 0
+    our_commission: float = 0
+    our_rental_paid_usd: float = 0
+    our_das: float = 0
+    our_profit_brl: float = 0
+    caliza_brl: float = 0
+    bybit_brl: float = 0
+    ts_fifo_brl: float = 0
+    usd_in_stock: float = 0
+    brl_value_in_stock: float = 0
+    debito_real: float = 0
+    needs_config: bool = Field(default=False, alias="_needs_config")
+    reason: Optional[str] = Field(default=None, alias="_reason")
+
+
+class ServicesReportsBundleOut(BaseModel):
+    """Single endpoint returns three sub-reports + per-tab errors."""
+    model_config = {"populate_by_name": True}
+
+    project: str
+    period: dict[str, Optional[str]]                  # {"from", "to"}
+    pnl: Optional[ServicesPnlOut] = None
+    pnl_error: Optional[str] = None
+    cashflow: Optional[ServicesCashflowOut] = None
+    cashflow_error: Optional[str] = None
+    balance: Optional[ServicesBalanceOut] = None
+    balance_error: Optional[str] = None

@@ -1827,6 +1827,11 @@ def load_sku_titles_from_vendas() -> dict[str, str]:
 _MANUAL_CF_KINDS = (
     "partner_contributions", "manual_expenses", "manual_supplier",
     "loan_given", "loan_received",
+    # Services-projects (Estonia / GANZA-USD): user-curated approved data —
+    # transfers to client (CALIZA-Nubank, Bybit, C6 Câmbio, Cred.Nubank TS)
+    # and approved invoices before NFS-e auto-loading kicks in. Same storage
+    # mechanics (per-project JSONB list); read by services_reports.
+    "approved_transfer", "approved_invoice",
 )
 
 

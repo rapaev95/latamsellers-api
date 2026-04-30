@@ -207,6 +207,12 @@ _PROJECT_EDITABLE_KEYS = frozenset({
     # Per-project monthly fixed costs (для break-even tracker per-sale TG):
     # {armazenagem, aluguel, salaries, utilities, software, outros} → float >= 0
     "fixed_costs_monthly",
+    # Services-projects only (type='services'): client CNPJ + commission
+    # brackets + opening snapshot for generate_services_pnl/cashflow/balance.
+    "tomador_cnpj", "tomador_name",
+    "commission_brackets",           # list[{ceiling_brl, rate_pct}]
+    "services_opening",              # {cutoff_date, opening_balance_brl, ts_usd_in_stock, ...}
+    "das_apportionment",             # {trade_rate_pct, services_rate_pct}
 })
 
 # Канонические категории fixed_costs_monthly. Любые другие keys в input

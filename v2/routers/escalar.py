@@ -2922,6 +2922,71 @@ async def refresh_user_promotions_internal(
     }
 
 
+class _OrderNoticeFromWebhookIn(__import__("pydantic").BaseModel):
+    user_id: int
+    topic: str
+    resource: Optional[str] = None
+    enriched: dict[str, Any]
+
+
+@router.post("/orders/notice-from-webhook")
+async def orders_notice_from_webhook(
+    body: _OrderNoticeFromWebhookIn,
+    pool=Depends(get_pool),
+):
+    """Server-to-server endpoint — called by Next.js ml-webhook for orders_v2 /
+    orders topics. Routes through the SAME pipeline as ml_backfill (Python
+    _enrich_order_with_margin → normalize_event → upsert), so real-time TG
+    notifications get the same profit/margin/break-even block as backfill ones.
+
+    Без этого endpoint'а Next.js использовал свой `notice-normalize.ts` (TS) —
+    он не знает про ml_item_margin_cache и break-even tracker, поэтому продажи
+    приходили без блока маржи. Теперь и backfill, и live webhook идут через
+    единый Python pipeline.
+
+    Auth: no cookie — intra-Railway call. Webhook validates ML's
+    application_id before triggering this.
+    """
+    if pool is None:
+        return {"error": "no_db", "ok": False}
+
+    enriched = dict(body.enriched or {})
+    topic = body.topic
+    resource = body.resource
+
+    # Pre-enrich with cached unit margin (for orders_v2 / orders).
+    # Mirrors ml_backfill._upsert_batch's logic.
+    if topic in ("orders_v2", "orders"):
+        try:
+            async with pool.acquire() as conn:
+                await ml_backfill_svc._enrich_order_with_margin(
+                    conn, body.user_id, enriched, pool=pool,
+                )
+        except Exception as err:  # noqa: BLE001
+            import logging as _lg
+            _lg.getLogger("escalar.orders_notice").warning(
+                "enrich order margin failed: %s", err,
+            )
+
+    try:
+        notice = ml_normalize_svc.normalize_event(topic, resource, enriched)
+    except Exception as err:  # noqa: BLE001
+        return {"ok": False, "error": f"normalize_failed: {err}"}
+
+    # Upsert via shared helper (handles JSON serialization + ON CONFLICT).
+    try:
+        inserted = await ml_notices_svc.upsert_normalized(pool, body.user_id, notice)
+    except Exception as err:  # noqa: BLE001
+        return {"ok": False, "error": f"upsert_failed: {err}", "notice": notice}
+
+    return {
+        "ok": True,
+        "inserted": inserted,
+        "notice_id": notice.get("notice_id"),
+        "tags": notice.get("tags") or [],
+    }
+
+
 @router.get("/user-promotions/diagnostic")
 async def promotions_diagnostic(
     user: CurrentUser = Depends(current_user),
@@ -4197,3 +4262,302 @@ async def team_invitation_accept(
         accepting_user_id=user.id,
         accepting_email=user.email,
     )
+
+
+# ── Diagnostic probes — production bug investigation ─────────────────────────
+# Goals:
+#   /items/{mlb}/price-shift-probe — почему PUT /items {price} даёт Validation
+#       error от кнопки "Поднять +5%". Возвращает full RAW response (без
+#       обрезки text[:300]) + active promotions state на товаре.
+#   /claims/{claim_id}/probe — какие поля ML использовать чтобы скрыть кнопку
+#       "Atender no app" когда ML уже резолвнул жалобу (Type B).
+#   /items/ai-question-probe — что именно отправляется Claude при генерации
+#       AI suggestion: фото urls, system prompt, attributes context.
+#
+# Все три используют cookie-auth (current_user) → можно дёргать прямо из
+# браузера через /api/v2-proxy/escalar/...
+
+@router.get("/items/{mlb}/price-shift-probe")
+async def price_shift_probe(
+    mlb: str,
+    pct: float = Query(5.0, description="Raise pct"),
+    dry: int = Query(1, description="0 = actually execute PUT (be careful)"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Диагностика «Validation error» при PUT /items {price} (raise +5%).
+
+    dry=1 (default): GET item state + active promotions, симуляция payload.
+    dry=0: ещё и реальный PUT — full ML response без обрезки.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    try:
+        token, _exp, _ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        return {"error": "ml_oauth_required", "detail": str(err)}
+
+    mlb_up = mlb.upper()
+    out: dict[str, Any] = {"item_id": mlb_up, "raise_pct": pct, "dry_run": bool(dry)}
+
+    async with httpx.AsyncClient() as http:
+        gr = await http.get(
+            f"https://api.mercadolibre.com/items/{mlb_up}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15.0,
+        )
+        try:
+            item_body = gr.json()
+        except Exception:  # noqa: BLE001
+            item_body = gr.text
+        out["item"] = {"status": gr.status_code, "body": item_body}
+
+        if gr.status_code >= 400 or not isinstance(item_body, dict):
+            return out
+
+        old_price = float(item_body.get("price") or 0.0)
+        new_price = round(old_price * (1.0 + pct / 100.0), 2)
+        out["old_price"] = old_price
+        out["new_price"] = new_price
+        out["item_status"] = item_body.get("status")
+        out["item_sub_status"] = item_body.get("sub_status")
+        out["catalog_listing"] = item_body.get("catalog_listing")
+        out["channels"] = item_body.get("channels")
+        out["price_lock_hint"] = {
+            "deal_ids": item_body.get("deal_ids"),
+            "tags": item_body.get("tags"),
+        }
+
+        # Active promotions on item — candidate offers can lock price.
+        pr_url = (
+            f"https://api.mercadolibre.com/seller-promotions/items/{mlb_up}"
+            f"?app_version=v2"
+        )
+        pgr = await http.get(
+            pr_url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15.0,
+        )
+        try:
+            promos = pgr.json()
+        except Exception:  # noqa: BLE001
+            promos = pgr.text
+        out["promotions_on_item"] = {"status": pgr.status_code, "body": promos}
+
+        if not dry:
+            put_url = f"https://api.mercadolibre.com/items/{mlb_up}"
+            put_body = {"price": new_price}
+            ppr = await http.put(
+                put_url,
+                json=put_body,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=15.0,
+            )
+            try:
+                put_resp = ppr.json()
+            except Exception:  # noqa: BLE001
+                put_resp = ppr.text
+            out["put_attempt"] = {
+                "url": put_url,
+                "body_sent": put_body,
+                "status": ppr.status_code,
+                "response": put_resp,
+                "headers": {k: v for k, v in ppr.headers.items() if k.lower() in (
+                    "content-type", "x-request-id", "x-error-id",
+                )},
+            }
+
+    return out
+
+
+@router.get("/claims/{claim_id}/probe")
+async def claim_type_probe(
+    claim_id: str,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Диагностика «Type A (atender) vs Type B (ML resolved)» для PDD claim.
+
+    Returns claim state, seller's available_actions, last message sender —
+    these fields drive button rendering in TG dispatch.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    try:
+        token, _exp, _ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        return {"error": "ml_oauth_required", "detail": str(err)}
+
+    out: dict[str, Any] = {"claim_id": claim_id}
+    base = "https://api.mercadolibre.com"
+
+    async with httpx.AsyncClient() as http:
+        cr = await http.get(
+            f"{base}/post-purchase/v1/claims/{claim_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15.0,
+        )
+        try:
+            claim = cr.json()
+        except Exception:  # noqa: BLE001
+            claim = cr.text
+        out["claim"] = {"status": cr.status_code, "body": claim}
+
+        seller_actions: list = []
+        last_message_role: Optional[str] = None
+        last_message_text: Optional[str] = None
+
+        if isinstance(claim, dict):
+            players = claim.get("players") or []
+            seller_player: dict = {}
+            for p in players:
+                role = (p.get("role") or "").lower()
+                ptype = (p.get("type") or "").lower()
+                if role == "respondent" or ptype == "seller":
+                    seller_player = p
+                    break
+            seller_actions = list(seller_player.get("available_actions") or [])
+            out["seller_player"] = seller_player
+            out["seller_available_actions"] = seller_actions
+            out["claim_status"] = claim.get("status")
+            out["claim_stage"] = claim.get("stage")
+            out["claim_type"] = claim.get("type")
+            out["resolution"] = claim.get("resolution")
+            out["fulfilled"] = claim.get("fulfilled")
+
+        # Messages
+        mr = await http.get(
+            f"{base}/post-purchase/v1/claims/{claim_id}/messages",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15.0,
+        )
+        try:
+            msgs = mr.json()
+        except Exception:  # noqa: BLE001
+            msgs = mr.text
+        out["messages"] = {"status": mr.status_code, "body": msgs}
+
+        if isinstance(msgs, dict):
+            arr = msgs.get("messages") or msgs.get("data") or []
+        elif isinstance(msgs, list):
+            arr = msgs
+        else:
+            arr = []
+        if arr:
+            last = arr[-1] if isinstance(arr[-1], dict) else {}
+            from_obj = last.get("from") or {}
+            last_message_role = (
+                from_obj.get("role") if isinstance(from_obj, dict) else None
+            )
+            last_message_text = str(
+                last.get("message") or last.get("text") or "",
+            )[:500]
+        out["last_message_role"] = last_message_role
+        out["last_message_preview"] = last_message_text
+
+    actionable_actions = {
+        "refund", "return_product", "change_product", "partial_refund",
+        "return_review_ok", "review_evidence", "open_dispute",
+    }
+    has_real_action = any(a in actionable_actions for a in seller_actions)
+    is_ml_resolved_text = bool(last_message_text and any(
+        marker in last_message_text.lower()
+        for marker in ("encerrado", "resolvi tudo", "reputação não foi")
+    ))
+    out["classification"] = {
+        "type": "A_actionable" if has_real_action else "B_ml_resolved",
+        "has_real_action": has_real_action,
+        "ml_mediator_closed_text": is_ml_resolved_text,
+        "rule": "Type A if seller_available_actions ∩ {refund,return_product,...} non-empty",
+    }
+    return out
+
+
+class _AiQuestionProbeIn(__import__("pydantic").BaseModel):
+    item_id: str
+    question_text: str = "Qual a cor do produto?"
+    invoke: bool = False  # call OpenRouter (costs cents per call)
+
+
+@router.post("/items/ai-question-probe")
+async def ai_question_probe(
+    body: _AiQuestionProbeIn,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Диагностика multimodal AI suggestion: что отправляется Claude.
+
+    Возвращает: какие фото переданы (URLs), длина description, кол-во
+    атрибутов, преамбула system prompt. invoke=True → ещё и реально зовёт
+    AI и возвращает ответ.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+
+    item_id = body.item_id.upper()
+
+    ctx_row = None
+    async with pool.acquire() as conn:
+        ctx_row = await conn.fetchrow(
+            """
+            SELECT title, description, attributes, pictures, fetched_at
+              FROM ml_item_context
+             WHERE user_id = $1 AND item_id = $2
+            """,
+            user.id, item_id,
+        )
+    if not ctx_row:
+        return {
+            "error": "no_item_context",
+            "hint": (
+                f"item {item_id} не в ml_item_context. Trigger refresh "
+                "via /escalar/items/refresh-context."
+            ),
+        }
+
+    def _maybe_load(v: Any) -> Any:
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:  # noqa: BLE001
+                return v
+        return v
+
+    pictures = _maybe_load(ctx_row["pictures"]) or []
+    attributes = _maybe_load(ctx_row["attributes"]) or []
+    description = ctx_row["description"] or ""
+
+    picture_urls: list[str] = []
+    for p in pictures[:6]:
+        if isinstance(p, dict):
+            url = p.get("secure_url") or p.get("url")
+            if url:
+                picture_urls.append(url)
+
+    out: dict[str, Any] = {
+        "item_id": item_id,
+        "title": ctx_row["title"],
+        "fetched_at": ctx_row["fetched_at"].isoformat() if ctx_row["fetched_at"] else None,
+        "pictures_total": len(pictures),
+        "pictures_to_send_to_llm": picture_urls[:3],
+        "attributes_count": len(attributes),
+        "description_length": len(description),
+        "description_preview": description[:600],
+        "question_text": body.question_text,
+        "would_invoke_openrouter": body.invoke,
+        "current_prompt_hint": (
+            "ai-suggest/route.ts:134 says: 'Se a resposta NÃO ESTÁ literalmente "
+            "no CONTEXTO ou nas FOTOS — responda Vou verificar...'. Photos go "
+            "as vision blocks with detail:high. Bug: prompt не инструктирует "
+            "ИЗУЧИТЬ фото для подсчёта/измерений → Claude отвечает Vou verificar."
+        ),
+    }
+    if body.invoke:
+        out["invocation_result"] = (
+            "not_implemented — call /api/escalar/questions/ai-suggest directly "
+            "from Next.js with the same item_id and observe response.text."
+        )
+    return out
