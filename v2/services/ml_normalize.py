@@ -154,6 +154,31 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                 desc_lines.append("")
                 desc_lines.append("⚠ *Esta venda é negativa* — preço abaixo do custo variável")
 
+            # ── Net margin block (после fixed overhead allocation) ──────
+            # Net = variable - fixed_overhead_per_unit. Показывает реальную
+            # прибыль после распределения публикасьон / armazenagem /
+            # aluguel / fulfillment / manual fixed costs на каждую единицу
+            # из месячного объёма. Если net < 0 — товар нерентабельный
+            # с учётом overhead'а.
+            fixed_overhead_pu = unit.get("fixed_overhead_per_unit")
+            if profit_net_pu is not None and qty > 0:
+                total_profit_net = float(profit_net_pu) * qty
+                net_str = f"{margin_net_pct}%" if margin_net_pct is not None else "—"
+                emoji = "💰" if (margin_net_pct or 0) >= 0 else "📉"
+                desc_lines.append("")
+                desc_lines.append(
+                    f"{emoji} *Lucro líquido: {net_str} ({_money(total_profit_net)})*"
+                )
+                if fixed_overhead_pu is not None and float(fixed_overhead_pu) > 0:
+                    desc_lines.append(
+                        f"   • Overhead /un. (publi+armaz+aluguel+ful+fixos): "
+                        f"{_money(float(fixed_overhead_pu) * qty)}"
+                    )
+                if margin_net_pct is not None and float(margin_net_pct) < 0:
+                    desc_lines.append(
+                        "   ⚠ Sem cobrir overhead — considere subir preço ou cortar custos fixos"
+                    )
+
             # ── Break-even progress block (Сессия C) ────────────────────
             # _breakeven инжектится ml_backfill._enrich_order_with_margin
             # после увеличения cumulative variable margin за этот месяц.
