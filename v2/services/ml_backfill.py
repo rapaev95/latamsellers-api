@@ -351,6 +351,43 @@ async def _enrich_order_with_margin(
     except Exception as err:  # noqa: BLE001
         log.debug("inventory snapshot failed for item=%s: %s", item_id, err)
 
+    # Paused-with-stock — товары которые юзер либо сам поставил на паузу,
+    # либо ML модерация, но stock реально есть. Это «мёртвый Full капитал»
+    # без трафика. В TG прикладываем top-3 + signed activate-link к каждому
+    # — юзер кликает прямо из мессенджера → активация без UI.
+    try:
+        from . import tg_action_links as _tg_links
+        async with pool.acquire() as conn:
+            paused_rows = await conn.fetch(
+                """
+                SELECT item_id, available_quantity, sold_quantity, title
+                  FROM ml_user_items
+                 WHERE user_id = $1
+                   AND status = 'paused'
+                   AND available_quantity > 0
+                 ORDER BY available_quantity DESC, sold_quantity DESC
+                 LIMIT 3
+                """,
+                user_id,
+            )
+        if paused_rows:
+            paused_list: list[dict] = []
+            for pr in paused_rows:
+                pid = str(pr["item_id"])
+                paused_list.append({
+                    "item_id": pid,
+                    "stock": int(pr["available_quantity"] or 0),
+                    "sold": int(pr["sold_quantity"] or 0),
+                    "title": pr["title"] or "",
+                    "activate_url": _tg_links.make_signed_url(
+                        action="activate-via-link",
+                        user_id=user_id, item_id=pid,
+                    ),
+                })
+            enriched["_paused_with_stock"] = paused_list
+    except Exception as err:  # noqa: BLE001
+        log.debug("paused-with-stock enrich failed: %s", err)
+
 
 async def _upsert_batch(
     conn: asyncpg.Connection,

@@ -457,6 +457,98 @@ async def items_paused_with_stock(
     return {"count": len(out_items), "items": out_items}
 
 
+@router.get("/items/{item_id}/activate-via-link", include_in_schema=False)
+async def items_activate_via_link(
+    item_id: str,
+    uid: int = Query(...),
+    exp: int = Query(...),
+    sig: str = Query(...),
+    pool=Depends(get_pool),
+) -> Response:
+    """One-shot signed-link endpoint для активации paused-объявления прямо
+    из TG-сообщения. Auth не через cookie (юзер кликает в TG-клиенте, где
+    нет browser session) — а через HMAC подпись от LS_LINK_SECRET.
+
+    Возвращает HTML с результатом (success / error)."""
+    from v2.services import tg_action_links
+    from fastapi.responses import HTMLResponse
+
+    def _html(title: str, body: str, status: int = 200) -> HTMLResponse:
+        page = f"""<!doctype html><html><head><meta charset="utf-8">
+<title>{title}</title>
+<style>
+  body{{font-family:system-ui,sans-serif;max-width:560px;margin:64px auto;padding:0 20px;color:#0b0e1a}}
+  h1{{font-size:24px;margin-bottom:12px}}
+  p{{font-size:14px;color:#555;line-height:1.5}}
+  a{{color:#3478f6}}
+</style>
+</head><body>{body}</body></html>"""
+        return HTMLResponse(content=page, status_code=status)
+
+    ok, err = tg_action_links.verify_signed(
+        action="activate-via-link", user_id=uid, item_id=item_id, exp=exp, sig=sig,
+    )
+    if not ok:
+        return _html("Erro", f"<h1>❌ Link inválido ({err})</h1><p>Solicite uma nova notificação.</p>", 400)
+
+    if pool is None:
+        return _html("Erro", "<h1>❌ DB indisponível</h1>", 503)
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, available_quantity, title FROM ml_user_items WHERE user_id = $1 AND item_id = $2",
+            uid, item_id,
+        )
+    if not row:
+        return _html("Erro", f"<h1>❌ Anúncio {item_id} não encontrado no seu catálogo</h1>", 404)
+    stock = int(row["available_quantity"] or 0)
+    if stock <= 0:
+        return _html(
+            "Sem estoque",
+            f"<h1>❌ {item_id} sem estoque ({stock} un.)</h1>"
+            f"<p>O ML auto-pausa anúncios sem estoque. Reabasteça o Full primeiro.</p>",
+            400,
+        )
+
+    try:
+        token, *_ = await ml_oauth_svc.get_valid_access_token(pool, uid)
+    except ml_oauth_svc.MLRefreshError as err:
+        return _html("Erro de autenticação", f"<h1>❌ ML OAuth: {err}</h1>", 401)
+
+    item_url = f"https://api.mercadolibre.com/items/{item_id}"
+    try:
+        async with httpx.AsyncClient() as http:
+            pr = await http.put(
+                item_url,
+                json={"status": "active"},
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                timeout=15.0,
+            )
+    except Exception as err:  # noqa: BLE001
+        return _html("Erro", f"<h1>❌ Falha ao chamar ML: {err}</h1>", 502)
+    if pr.status_code >= 400:
+        return _html(
+            "Erro ML",
+            f"<h1>❌ ML rejeitou (HTTP {pr.status_code})</h1><p>{pr.text[:300]}</p>",
+            502,
+        )
+
+    new_status = (pr.json() or {}).get("status") or "active"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE ml_user_items SET status = $1 WHERE user_id = $2 AND item_id = $3",
+            new_status, uid, item_id,
+        )
+    title_safe = (row["title"] or item_id).replace("<", "&lt;").replace(">", "&gt;")
+    return _html(
+        "Ativado",
+        f"<h1>✅ Anúncio ativado</h1>"
+        f"<p><strong>{title_safe}</strong></p>"
+        f"<p>Status: <code>{new_status}</code> · Estoque: {stock} un.</p>"
+        f"<p><a href=\"https://www.mercadolivre.com.br/anuncios/{item_id}\" target=\"_blank\">Ver no Mercado Livre</a></p>",
+    )
+
+
 @router.post("/items/{item_id}/activate")
 async def items_activate(
     item_id: str,

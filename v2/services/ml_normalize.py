@@ -324,6 +324,23 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                 f"em /finance/sku-mapping ou aguarde refresh noturno"
             )
 
+        # Paused-with-stock — top-3 объявления на паузе с остатком + ссылки
+        # на активацию (signed link, кликабельны прямо из TG).
+        # ml_backfill инжектит этот block в enriched["_paused_with_stock"].
+        paused_pws = enriched.get("_paused_with_stock") or []
+        if paused_pws:
+            desc_lines.append("")
+            desc_lines.append("⚠️ *Pausados mas com estoque:*")
+            for p in paused_pws[:3]:
+                pid = p.get("item_id") or ""
+                pstock = int(p.get("stock") or 0)
+                psold = int(p.get("sold") or 0)
+                purl = p.get("activate_url") or ""
+                line = f"   • `{pid}` ({pstock} un., vendido {psold} historicamente)"
+                if purl:
+                    line += f" → [Ativar]({purl})"
+                desc_lines.append(line)
+
         permalink = (
             f"https://www.mercadolivre.com.br/vendas/{enriched.get('id')}/detalhe"
             if enriched.get("id")
