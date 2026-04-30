@@ -33,6 +33,16 @@ NOTICES_PAGE_LIMIT = 50
 NOTICES_MAX_PAGES = 8              # up to 400 per run per user
 TG_BATCH_CAP = 20                  # cap per-user TG sends per tick
 
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+NEWS_DIGEST_MODEL = "anthropic/claude-sonnet-4.5"
+# topics created by webhook ingest — rich notice with own dispatch path,
+# no AI digest needed. Anything outside this set + with HTML content
+# is treated as ML news / generic platform notice → run digest.
+_WEBHOOK_TOPICS = frozenset({
+    "orders", "orders_v2", "questions", "questions_v2", "claims",
+    "items", "messages", "promotions", "public_offers", "public_candidates",
+})
+
 
 # ── Schema bootstrap ──────────────────────────────────────────────────────────
 
@@ -57,6 +67,7 @@ CREATE TABLE IF NOT EXISTS ml_notices (
 );
 ALTER TABLE ml_notices ADD COLUMN IF NOT EXISTS topic TEXT;
 ALTER TABLE ml_notices ADD COLUMN IF NOT EXISTS resource TEXT;
+ALTER TABLE ml_notices ADD COLUMN IF NOT EXISTS ai_digest_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_ml_notices_user_unread ON ml_notices(user_id, read_at);
 CREATE INDEX IF NOT EXISTS idx_ml_notices_user_tg_pending ON ml_notices(user_id) WHERE telegram_sent_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_ml_notices_from_date ON ml_notices(user_id, from_date DESC);
@@ -115,6 +126,132 @@ async def _fetch_notices(http: httpx.AsyncClient, access_token: str) -> list[dic
 
 
 # ── Sync one user ─────────────────────────────────────────────────────────────
+
+import os as _os
+import re as _re
+
+_HTML_TAG_RE = _re.compile(r"<[^>]+>")
+_HTML_ENTITY_RE = _re.compile(r"&(nbsp|amp|lt|gt|quot|#\d+);")
+_HTML_ENTITIES = {
+    "&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"',
+}
+
+
+def _strip_html(text: str) -> str:
+    """Remove HTML tags + decode common entities. ML news arrive with <p>,
+    <strong>, <ul>/<li>, etc. that look ugly in TG."""
+    if not text:
+        return ""
+    out = _HTML_TAG_RE.sub("", text)
+    for ent, repl in _HTML_ENTITIES.items():
+        out = out.replace(ent, repl)
+    out = _HTML_ENTITY_RE.sub("", out)
+    out = _re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
+_DIGEST_PROMPT = """Você é um analista de notificações de marketplace. Recebe um aviso oficial do Mercado Livre Brasil dirigido ao vendedor (em qualquer idioma) e produz um BRIEFING ULTRA-CURTO em {lang_label}.
+
+Formato OBRIGATÓRIO:
+*<emoji> <título-resumo em até 60 chars>*
+
+📌 *Significado para o seller:*
+<1-2 frases concretas — o que ESPECIFICAMENTE muda para este vendedor>
+
+✅ *Ação recomendada:*
+• <ação 1 — verbo no imperativo>
+• <ação 2 — só se realmente necessário>
+• (no máximo 3 ações; uma só já basta se uma resolve)
+
+⏰ *Prazo / impacto:* <data ou "imediato" / "sem prazo">
+
+REGRAS:
+- Total ≤ 600 caracteres. Cortar tudo que for marketing fluff ("aproveite", "maximize", "destaque-se").
+- Se o aviso é puramente promocional/educativo sem ação requerida — diga isso explicitamente em "Ação recomendada: nenhuma ação necessária".
+- NÃO inventar números/datas que não estão no aviso.
+- Output APENAS o briefing, sem prefixos tipo "Aqui está:" ou "Briefing:".
+- Use markdown simples (negrito *texto*) para Telegram, sem code blocks."""
+
+_DIGEST_LANG_LABELS = {
+    "ru": "russo",
+    "en": "inglês",
+    "pt": "português brasileiro",
+    "es": "espanhol",
+}
+
+
+async def _make_news_digest(
+    http: httpx.AsyncClient,
+    label: str,
+    description: str,
+    language: str = "pt",
+) -> str | None:
+    """Run Claude Sonnet 4.5 over a raw ML notice → short actionable briefing.
+
+    Returns None on failure (caller falls back to raw stripped HTML).
+    """
+    api_key = _os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return None
+    cleaned = _strip_html(description)
+    if not cleaned and not label:
+        return None
+    lang_label = _DIGEST_LANG_LABELS.get((language or "pt").lower(), "português brasileiro")
+    user_msg = (
+        f"TÍTULO: {label or '(sem título)'}\n\n"
+        f"CONTEÚDO:\n{cleaned[:2000]}"
+    )
+    try:
+        r = await http.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://app.lsprofit.app",
+                "X-Title": "LS Profit App",
+            },
+            json={
+                "model": NEWS_DIGEST_MODEL,
+                "max_tokens": 350,
+                "temperature": 0.3,
+                "messages": [
+                    {"role": "system", "content": _DIGEST_PROMPT.format(lang_label=lang_label)},
+                    {"role": "user", "content": user_msg},
+                ],
+            },
+            timeout=30.0,
+        )
+        if r.status_code != 200:
+            log.warning("news digest %s: %s", r.status_code, r.text[:200])
+            try:
+                from . import tg_admin_alerts as _alerts
+                await _alerts.alert_openrouter_failure(
+                    r.status_code, r.text, service="news/digest",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+        data = r.json()
+        content = (data.get("choices") or [{}])[0].get("message", {}).get("content")
+        return content.strip() if isinstance(content, str) else None
+    except Exception as err:  # noqa: BLE001
+        log.warning("news digest exception: %s", err)
+        return None
+
+
+def _needs_news_digest(topic: str | None, description: str | None) -> bool:
+    """Skip digest for webhook-driven topics (their own dispatchers handle
+    rich rendering). Run digest if any HTML or content suggests a marketing
+    blast."""
+    if topic and topic.lower() in _WEBHOOK_TOPICS:
+        return False
+    text = description or ""
+    if not text or len(text) < 80:
+        return False
+    if "<p>" in text or "</p>" in text or "<strong>" in text or "<ul>" in text:
+        return True
+    return False
+
 
 def _coerce_to_datetime(v: Any) -> Any:
     """asyncpg для TIMESTAMPTZ принимает только datetime instance — не string.
@@ -292,7 +429,8 @@ async def _dispatch_to_telegram(
 
         pending_rows = await conn.fetch(
             """
-            SELECT notice_id, label, description, actions, tags, topic, raw
+            SELECT notice_id, label, description, actions, tags, topic, raw,
+                   ai_digest_at
               FROM ml_notices
              WHERE user_id = $1 AND telegram_sent_at IS NULL
              ORDER BY from_date ASC NULLS FIRST
@@ -303,10 +441,37 @@ async def _dispatch_to_telegram(
 
     sent = 0
     for row in pending_rows:
+        # AI digest для платформенных news (без webhook topic, с HTML).
+        # Idempotent — уже digested rows имеют ai_digest_at IS NOT NULL.
+        description_to_use = row["description"]
+        label_to_use = row["label"]
+        if (
+            row["ai_digest_at"] is None
+            and _needs_news_digest(row["topic"], row["description"])
+        ):
+            digest = await _make_news_digest(
+                http, row["label"] or "", row["description"] or "", language,
+            )
+            if digest:
+                description_to_use = digest
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE ml_notices
+                           SET description = $1,
+                               ai_digest_at = NOW()
+                         WHERE user_id = $2 AND notice_id = $3
+                        """,
+                        digest, user_id, row["notice_id"],
+                    )
+            else:
+                # Хотя бы strip HTML, чтобы </p> не торчало.
+                description_to_use = _strip_html(row["description"] or "")
+
         notice = {
             "notice_id": row["notice_id"],
-            "label": row["label"],
-            "description": row["description"],
+            "label": label_to_use,
+            "description": description_to_use,
             "actions": row["actions"] or [],
             "tags": row["tags"] or [],
             "topic": row["topic"],
