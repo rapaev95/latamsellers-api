@@ -2583,6 +2583,98 @@ async def uploads_diag_mappings(
     return out
 
 
+@router.get("/uploads/diag-retirada-period")
+async def uploads_diag_retirada_period(
+    project: str = Query(...),
+    period_from: str = Query(..., alias="from"),
+    period_to: str = Query(..., alias="to"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """For a given (project, period) показывает RAW retirada-rows + repr(forma)
+    (для Unicode normalization debug) + результат compute_retirada_cost.
+    Сравнение с pnl-matrix позволяет точечно локализовать баг."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    _bind_user(user)
+
+    from datetime import date as _date
+    import unicodedata
+    from v2.legacy.reports import load_retirada_estoque_report
+    from v2.legacy.finance import compute_retirada_cost
+
+    try:
+        pf = _date.fromisoformat(period_from)
+        pt = _date.fromisoformat(period_to)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bad_date")
+
+    df = load_retirada_estoque_report()
+    out: dict[str, Any] = {
+        "project": project,
+        "period": {"from": period_from, "to": period_to},
+        "df_loaded": df is not None,
+        "df_total_rows": int(len(df)) if df is not None else 0,
+    }
+    if df is not None and not df.empty:
+        sub = df[(df["__project"] == project) &
+                 (df["date"] >= pf) &
+                 (df["date"] <= pt)]
+        out["rows_for_project_in_period"] = int(len(sub))
+
+        by_forma: dict[str, Any] = {}
+        rows_dump: list[dict[str, Any]] = []
+        for _, row in sub.iterrows():
+            forma_raw = row["forma"] or ""
+            f_str = str(forma_raw)
+            f_nfc = unicodedata.normalize("NFC", f_str)
+            f_nfd = unicodedata.normalize("NFD", f_str)
+            key = f_nfc
+            b = by_forma.setdefault(key, {
+                "count": 0, "tarifa": 0.0, "units": 0,
+                "forma_raw": f_str,
+                "forma_repr": repr(f_str),
+                "is_nfc": f_str == f_nfc,
+                "is_nfd": f_str == f_nfd,
+                "byte_len": len(f_str.encode("utf-8")),
+                "char_count": len(f_str),
+                "matches_envio_const": f_str == "Envio para o endereço",
+                "matches_descarte_const": f_str == "Descarte",
+            })
+            b["count"] += 1
+            b["tarifa"] += float(row["valor"])
+            b["units"] += int(row["units"])
+            if len(rows_dump) < 5:
+                rows_dump.append({
+                    "date": str(row["date"]),
+                    "sku": str(row["sku"]),
+                    "forma_repr": repr(f_str),
+                    "valor": float(row["valor"]),
+                    "units": int(row["units"]),
+                    "project": str(row["__project"]),
+                })
+        out["by_forma"] = by_forma
+        out["sample_rows"] = rows_dump
+
+    try:
+        rc = compute_retirada_cost(project, (pf, pt))
+        out["compute_retirada_cost"] = {
+            "tarifa_envio": rc.get("tarifa_envio"),
+            "tarifa_descarte": rc.get("tarifa_descarte"),
+            "cogs_descarte": rc.get("cogs_descarte"),
+            "tarifa_other": rc.get("tarifa_other"),
+            "units_envio": rc.get("units_envio"),
+            "units_descarte": rc.get("units_descarte"),
+            "units_other": rc.get("units_other"),
+            "rows_count": rc.get("rows_count"),
+            "missing_cost_skus_count": len(rc.get("missing_cost_skus") or []),
+        }
+    except Exception as err:  # noqa: BLE001
+        out["compute_retirada_cost_error"] = f"{type(err).__name__}: {err}"
+
+    return out
+
+
 @router.get("/uploads/diag-armazenagem")
 async def uploads_diag_armazenagem(
     user: CurrentUser = Depends(current_user),
