@@ -210,7 +210,8 @@ _PROJECT_EDITABLE_KEYS = frozenset({
     # Services-projects only (type='services'): client CNPJ + commission
     # brackets + opening snapshot for generate_services_pnl/cashflow/balance.
     "tomador_cnpj", "tomador_name",
-    "commission_brackets",           # list[{ceiling_brl, rate_pct}]
+    "commission_brackets",           # list[{ceiling_brl, rate_pct}] — Estonia/LATAMSELLERS-style fixed table
+    "commission_formula",            # {mode, simples_anexo, margin_pct, baseline_rbt12} — GANZA-style dynamic
     "services_opening",              # {cutoff_date, opening_balance_brl, ts_usd_in_stock, ...}
     "das_apportionment",             # {trade_rate_pct, services_rate_pct}
 })

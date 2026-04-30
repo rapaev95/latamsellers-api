@@ -502,6 +502,31 @@ class CommissionBracket(BaseModel):
     rate_pct: float                      # 0..1 fraction (0.155 = 15.50%)
 
 
+class CommissionFormula(BaseModel):
+    """Dynamic commission rate based on Simples Nacional progressive table.
+
+    Used by services-projects where the commission % we keep per invoice is
+    computed every month from the current rolling RBT12 (revenue last 12
+    months) — vs `commission_brackets` which is a hand-curated static table
+    (Estonia-style).
+
+    Formula:
+      effective_simples = (rbt12 * nominal_rate(anexo, faixa(rbt12))
+                           − parcela_a_deduzir(anexo, faixa)) / rbt12
+      total_rate = effective_simples + margin_pct
+      tax_for_month = revenue_month × total_rate
+
+    `baseline_rbt12` is the cumulative gross at month 0 of the projection —
+    used when the project's local revenue history is shorter than 12 months
+    (e.g. fresh services-project starting after migration). Set to 0 to
+    compute from scratch using only on-record revenue.
+    """
+    mode: str = "simples_progressive"           # only mode supported now; future-proof for "lucro_presumido_dynamic"
+    simples_anexo: str = "III"                  # "I" | "II" | "III" (matches v2/legacy/tax_brazil.ANEXOS)
+    margin_pct: float = 0.09                    # 0..1 fraction (0.09 = 9%) — наша наценка поверх effective Simples
+    baseline_rbt12: float = 0.0                 # стартовое значение RBT12 на t=0 (BRL)
+
+
 class ServicesOpeningSnapshot(BaseModel):
     """Hardcoded historical baseline for services-balance.
 
@@ -542,6 +567,12 @@ class ProjectCreateIn(BaseModel):
     tomador_cnpj: Optional[str] = None              # client CNPJ for NFS-e filtering
     tomador_name: Optional[str] = None
     commission_brackets: list[CommissionBracket] = []
+    # Dynamic Simples Nacional + margin formula. When set, takes precedence
+    # over `commission_brackets` — backend recalculates rate every month
+    # from rolling RBT12. Used for projects like GANZA where margin/rate
+    # plays as RBT12 grows; brackets work for projects where rates are
+    # locked to pre-agreed values (Estonia-style hand-curated table).
+    commission_formula: Optional[CommissionFormula] = None
     services_opening: Optional[ServicesOpeningSnapshot] = None
     # DAS apportionment between trade (ML revenue) and services (NFS-e) —
     # `{trade_rate_pct: 0.045, services_rate_pct: <variable>}`. When None,
