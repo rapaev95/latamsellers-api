@@ -4920,6 +4920,125 @@ async def photo_descriptions_get(
     return {"item_id": mlb.upper(), "count": len(descs), "descriptions": descs}
 
 
+@router.get("/notifications/me")
+async def notifications_me_get(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Returns current user's notification settings + admin status.
+
+    Used by Next.js Settings page.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    import os as _os
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT telegram_chat_id,
+                   COALESCE(notify_daily_sales, TRUE)  AS notify_daily_sales,
+                   COALESCE(notify_acos_change, TRUE)  AS notify_acos_change,
+                   COALESCE(notify_ml_news, TRUE)      AS notify_ml_news,
+                   COALESCE(acos_threshold, 5)         AS acos_threshold,
+                   COALESCE(language, 'pt')            AS language,
+                   COALESCE(inventory_window_days, 14) AS inventory_window_days
+              FROM notification_settings
+             WHERE user_id = $1
+            """,
+            user.id,
+        )
+    out: dict[str, Any] = {
+        "user_id": user.id,
+        "telegram_chat_id": None,
+        "telegram_linked": False,
+        "notify_daily_sales": True,
+        "notify_acos_change": True,
+        "notify_ml_news": True,
+        "acos_threshold": 5,
+        "language": "pt",
+        "inventory_window_days": 14,
+        "is_super_admin": False,
+    }
+    if row:
+        chat_id = row["telegram_chat_id"]
+        out.update({
+            "telegram_chat_id": chat_id,
+            "telegram_linked": bool(chat_id),
+            "notify_daily_sales": bool(row["notify_daily_sales"]),
+            "notify_acos_change": bool(row["notify_acos_change"]),
+            "notify_ml_news": bool(row["notify_ml_news"]),
+            "acos_threshold": float(row["acos_threshold"] or 5),
+            "language": row["language"] or "pt",
+            "inventory_window_days": int(row["inventory_window_days"] or 14),
+        })
+    admin_ids = _os.environ.get("LS_ADMIN_TG_CHAT_IDS", "").split(",")
+    admin_ids = [c.strip() for c in admin_ids if c.strip()]
+    if out["telegram_chat_id"] and str(out["telegram_chat_id"]) in admin_ids:
+        out["is_super_admin"] = True
+    return out
+
+
+class _NotificationsUpdateIn(__import__("pydantic").BaseModel):
+    notify_daily_sales: Optional[bool] = None
+    notify_acos_change: Optional[bool] = None
+    notify_ml_news: Optional[bool] = None
+    acos_threshold: Optional[float] = None
+    language: Optional[str] = None
+    inventory_window_days: Optional[int] = None
+
+
+@router.put("/notifications/me")
+async def notifications_me_update(
+    body: _NotificationsUpdateIn,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Updates per-user notification preferences. Builds dynamic UPDATE
+    only for fields explicitly provided (None = leave as is)."""
+    if pool is None:
+        return {"error": "no_db"}
+    # Validate inventory_window_days
+    if body.inventory_window_days is not None and body.inventory_window_days not in (7, 14, 30):
+        return {"error": "invalid_inventory_window", "allowed": [7, 14, 30]}
+    if body.language is not None and body.language not in ("pt", "ru", "en", "es"):
+        return {"error": "invalid_language", "allowed": ["pt", "ru", "en", "es"]}
+    # Ensure schema (notification_settings + inventory_window_days column)
+    from v2.services import ml_inventory_forecast as inv_svc
+    await inv_svc.ensure_schema(pool)
+
+    fields: list[tuple[str, Any]] = []
+    if body.notify_daily_sales is not None:
+        fields.append(("notify_daily_sales", bool(body.notify_daily_sales)))
+    if body.notify_acos_change is not None:
+        fields.append(("notify_acos_change", bool(body.notify_acos_change)))
+    if body.notify_ml_news is not None:
+        fields.append(("notify_ml_news", bool(body.notify_ml_news)))
+    if body.acos_threshold is not None:
+        fields.append(("acos_threshold", max(0.0, min(100.0, float(body.acos_threshold)))))
+    if body.language is not None:
+        fields.append(("language", body.language))
+    if body.inventory_window_days is not None:
+        fields.append(("inventory_window_days", int(body.inventory_window_days)))
+    if not fields:
+        return {"ok": True, "updated_fields": 0}
+
+    # Upsert: row may not exist yet for new users.
+    set_clause = ", ".join(f"{name} = ${i + 2}" for i, (name, _) in enumerate(fields))
+    values = [v for _, v in fields]
+    async with pool.acquire() as conn:
+        # Insert dummy row first if missing (unique on user_id)
+        await conn.execute(
+            "INSERT INTO notification_settings (user_id) VALUES ($1) "
+            "ON CONFLICT (user_id) DO NOTHING",
+            user.id,
+        )
+        await conn.execute(
+            f"UPDATE notification_settings SET {set_clause}, updated_at = NOW() WHERE user_id = $1",
+            user.id, *values,
+        )
+    return {"ok": True, "updated_fields": len(fields)}
+
+
 @router.post("/admin-alerts/test")
 async def admin_alerts_test(
     user: CurrentUser = Depends(current_user),
