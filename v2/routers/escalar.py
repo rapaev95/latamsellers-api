@@ -4554,14 +4554,17 @@ async def claim_render_preview(
     )
     import os as _os
 
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT enriched, raw, status FROM ml_user_claims
-             WHERE user_id = $1 AND claim_id = $2
-            """,
-            user.id, cid,
-        )
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT enriched, status FROM ml_user_claims
+                 WHERE user_id = $1 AND claim_id = $2
+                """,
+                user.id, cid,
+            )
+    except Exception as err:  # noqa: BLE001
+        return {"error": "db_query_failed", "detail": str(err)}
     if not row:
         return {"error": "claim_not_in_cache", "claim_id": cid}
 
@@ -4578,8 +4581,14 @@ async def claim_render_preview(
     actions = sorted(_seller_available_actions(enriched))
     app_base_url = _os.environ.get("APP_BASE_URL", "https://app.lsprofit.app")
 
-    text = _build_claim_card(enriched, summary=None, summary_lang="ru")
-    keyboard = _build_keyboard(cid, app_base_url, claim=enriched)
+    try:
+        text = _build_claim_card(enriched, summary=None, summary_lang="ru")
+    except Exception as err:  # noqa: BLE001
+        text = f"<card render failed: {err}>"
+    try:
+        keyboard = _build_keyboard(cid, app_base_url, claim=enriched)
+    except Exception as err:  # noqa: BLE001
+        keyboard = {"error": str(err)}
 
     return {
         "claim_id": cid,
@@ -4587,9 +4596,11 @@ async def claim_render_preview(
         "is_ml_resolved": is_resolved,
         "seller_available_actions": actions,
         "claim_status_in_cache": row["status"],
-        "card_text_preview": text[:1500],
+        "card_text_preview": text[:1500] if isinstance(text, str) else str(text),
         "keyboard": keyboard,
         "would_skip_ai_summary": is_resolved,
+        "enriched_keys_present": sorted(enriched.keys())[:30] if isinstance(enriched, dict) else None,
+        "enriched_messages_count": len(enriched.get("messages") or []) if isinstance(enriched, dict) else 0,
     }
 
 
