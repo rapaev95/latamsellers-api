@@ -321,8 +321,10 @@ async def _enrich_order_with_margin(
         return  # без pool не можем — graceful skip
     try:
         await breakeven_svc.ensure_schema(pool)
+        order_id_for_dedup = str(enriched.get("id") or "").strip() or None
         be_state = await breakeven_svc.add_sale_and_check_breakeven(
             pool, user_id, str(project), total_profit_var, sale_dt,
+            order_id=order_id_for_dedup,
         )
         if be_state:
             enriched["_breakeven"] = be_state

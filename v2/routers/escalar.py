@@ -4742,6 +4742,43 @@ class _AiQuestionProbeIn(__import__("pydantic").BaseModel):
     invoke: bool = False  # call OpenRouter (costs cents per call)
 
 
+@router.post("/breakeven/recompute")
+async def breakeven_recompute(
+    project: str = Query(..., description="Project id e.g. ARTHUR"),
+    month: Optional[str] = Query(None, description="YYYY-MM BRT; default current"),
+    backfill: bool = Query(True, description="First populate log from ml_user_orders"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Recovery — пересчитывает project_breakeven_state.cumulative.
+
+    flow:
+      1. (optional) backfill_log_from_orders — populate breakeven_sale_log
+         из ml_user_orders за месяц с margin recompute (per-order).
+      2. recompute_state_from_log — sum log → state.cumulative.
+
+    Используется когда cumulative завышено из-за исторических double-
+    increments до idempotency fix. Безопасный idempotent reset.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    from v2.services import ml_breakeven as breakeven_svc
+    await breakeven_svc.ensure_schema(pool)
+    if not month:
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        month = _dt.now(_tz(_td(hours=-3))).strftime("%Y-%m")
+
+    out: dict[str, Any] = {"project": project.upper(), "month": month}
+    if backfill:
+        out["backfill"] = await breakeven_svc.backfill_log_from_orders(
+            pool, user.id, project.upper(), month,
+        )
+    out["recompute"] = await breakeven_svc.recompute_state_from_log(
+        pool, user.id, project.upper(), month,
+    )
+    return out
+
+
 @router.get("/items/{mlb}/inventory-probe")
 async def inventory_probe(
     mlb: str,

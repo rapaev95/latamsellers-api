@@ -43,6 +43,23 @@ CREATE TABLE IF NOT EXISTS project_breakeven_state (
 );
 CREATE INDEX IF NOT EXISTS idx_breakeven_user_month
   ON project_breakeven_state(user_id, year_month DESC);
+
+-- Idempotency log: один order должен инкрементировать cumulative ровно
+-- один раз. Без этого replay-notice / backfill cron / live webhook все
+-- перекрываются и cumulative завышается. order_id уникален per user
+-- across все months (ML order ids глобально уникальны).
+CREATE TABLE IF NOT EXISTS breakeven_sale_log (
+  user_id INTEGER NOT NULL,
+  order_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  year_month TEXT NOT NULL,
+  profit_variable_brl NUMERIC NOT NULL,
+  sale_date TIMESTAMPTZ,
+  processed_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (user_id, order_id)
+);
+CREATE INDEX IF NOT EXISTS idx_breakeven_log_month
+  ON breakeven_sale_log(user_id, project_id, year_month);
 """
 
 
@@ -249,14 +266,21 @@ async def add_sale_and_check_breakeven(
     project_id: str,
     profit_variable_brl: float,
     sale_date: Optional[datetime] = None,
+    order_id: Optional[str] = None,
 ) -> dict:
     """Добавляет одну продажу: increment cumulative + sales_count.
+
+    **Idempotent by order_id** — replay-notice, backfill cron, и live webhook
+    могут вызвать эту функцию для одного и того же order'а. Без dedup'а
+    cumulative завышался. С order_id мы пишем в breakeven_sale_log с
+    ON CONFLICT DO NOTHING; если RETURNING пусто → already processed →
+    возвращаем current state без changes.
 
     Если cumulative впервые достиг target — set breakeven_reached_at.
     После break-even каждая variable_margin идёт в net_profit_after_breakeven.
 
     Returns: {target_total, cumulative, sales_count, breakeven_reached_at,
-             net_profit_after_breakeven, breakdown, just_reached}
+             net_profit_after_breakeven, breakdown, just_reached, deduplicated}
     """
     pid_upper = (project_id or "").upper().strip()
     if not pid_upper or profit_variable_brl is None:
@@ -269,14 +293,51 @@ async def add_sale_and_check_breakeven(
     target = float(state.get("target_total_brl") or 0.0)
     cumulative_before = float(state.get("cumulative_variable_margin_brl") or 0.0)
     breakeven_was = state.get("breakeven_reached_at")
-
+    sales_count_before = int(state.get("sales_count") or 0)
+    net_profit_before = float(state.get("net_profit_after_breakeven_brl") or 0.0)
     margin = float(profit_variable_brl)
-    cumulative_after = cumulative_before + margin
-    sales_count = int(state.get("sales_count") or 0) + 1
+    ym = _ym_brt(sale_date)
 
+    # Idempotency check via breakeven_sale_log. Без order_id скипаем
+    # dedup (в этом случае всё равно инкрементируем — для совместимости
+    # с callers которые ещё не передают order_id).
+    if order_id:
+        oid = str(order_id).strip()
+        async with pool.acquire() as conn:
+            inserted = await conn.fetchval(
+                """
+                INSERT INTO breakeven_sale_log
+                  (user_id, order_id, project_id, year_month,
+                   profit_variable_brl, sale_date)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (user_id, order_id) DO NOTHING
+                RETURNING 1
+                """,
+                user_id, oid, pid_upper, ym, round(margin, 2), sale_date,
+            )
+        if not inserted:
+            # Уже обработали этот order — возвращаем текущее состояние.
+            return {
+                "target_total": round(target, 2),
+                "cumulative": round(cumulative_before, 2),
+                "sales_count": sales_count_before,
+                "breakeven_reached_at": (
+                    breakeven_was.isoformat() if hasattr(breakeven_was, "isoformat")
+                    else breakeven_was
+                ),
+                "net_profit_after_breakeven": round(net_profit_before, 2),
+                "breakdown": state.get("target_breakdown") or {},
+                "just_reached": False,
+                "year_month": ym,
+                "project_id": pid_upper,
+                "deduplicated": True,
+            }
+
+    cumulative_after = cumulative_before + margin
+    sales_count = sales_count_before + 1
     just_reached = False
     new_breakeven_at = breakeven_was
-    net_profit_after = float(state.get("net_profit_after_breakeven_brl") or 0.0)
+    net_profit_after = net_profit_before
     if cumulative_after >= target and target > 0 and not breakeven_was:
         new_breakeven_at = datetime.now(timezone.utc).isoformat()
         just_reached = True
@@ -286,7 +347,6 @@ async def add_sale_and_check_breakeven(
         # Уже окупились — все следующие margin идут в net profit.
         net_profit_after += margin
 
-    ym = _ym_brt(sale_date)
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -313,4 +373,211 @@ async def add_sale_and_check_breakeven(
         "just_reached": just_reached,
         "year_month": ym,
         "project_id": pid_upper,
+        "deduplicated": False,
+    }
+
+
+async def backfill_log_from_orders(
+    pool: asyncpg.Pool, user_id: int, project_id: str, year_month: str,
+) -> dict:
+    """Recovery: populate breakeven_sale_log из ml_user_orders за месяц.
+
+    Идёт по orders за month BRT, для каждого order находит margin в
+    ml_item_margin_cache (по item_id), вызывает apply_hypothetical_price
+    с unit_price → получает profit_variable. INSERT в log с
+    ON CONFLICT DO NOTHING — идемпотентно.
+
+    Filter по project_id: пропускаем orders где margin.project ≠ project_id.
+
+    После этого recompute_state_from_log даст правильный cumulative.
+    """
+    import json as _json
+    from . import ml_item_margin as ml_margin_svc
+
+    pid_upper = (project_id or "").upper().strip()
+    try:
+        y_str, m_str = year_month.split("-")
+        y, m = int(y_str), int(m_str)
+    except (ValueError, AttributeError):
+        return {"error": "bad_year_month"}
+    import calendar
+    last_day = calendar.monthrange(y, m)[1]
+    start_brt = datetime(y, m, 1, tzinfo=BRT)
+    end_brt = datetime(y, m, last_day, 23, 59, 59, tzinfo=BRT)
+
+    inserted = 0
+    skipped_wrong_project = 0
+    skipped_no_margin = 0
+    skipped_no_item = 0
+    processed = 0
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT order_id, status, items, date_created
+              FROM ml_user_orders
+             WHERE user_id = $1
+               AND date_created BETWEEN $2 AND $3
+               AND status NOT IN ('cancelled', 'invalid')
+            """,
+            user_id, start_brt, end_brt,
+        )
+
+    for row in rows:
+        processed += 1
+        order_id = str(row["order_id"]) if row["order_id"] else None
+        if not order_id:
+            continue
+        items_raw = row["items"]
+        if isinstance(items_raw, str):
+            try:
+                items_raw = _json.loads(items_raw)
+            except Exception:  # noqa: BLE001
+                continue
+        if not isinstance(items_raw, list) or not items_raw:
+            skipped_no_item += 1
+            continue
+        first = items_raw[0]
+        item_id = str(first.get("mlb") or "").strip().upper()
+        try:
+            sale_price = float(first.get("unit_price") or 0)
+        except (TypeError, ValueError):
+            sale_price = 0.0
+        try:
+            qty = int(first.get("quantity") or 1)
+        except (TypeError, ValueError):
+            qty = 1
+        if not item_id or sale_price <= 0:
+            skipped_no_item += 1
+            continue
+
+        async with pool.acquire() as conn:
+            mrow = await conn.fetchrow(
+                """
+                SELECT payload FROM ml_item_margin_cache
+                 WHERE user_id = $1 AND item_id = $2 AND period_months = 3
+                """,
+                user_id, item_id,
+            )
+        if not mrow:
+            skipped_no_margin += 1
+            continue
+        payload = mrow["payload"]
+        if isinstance(payload, str):
+            try:
+                payload = _json.loads(payload)
+            except Exception:  # noqa: BLE001
+                skipped_no_margin += 1
+                continue
+        if not isinstance(payload, dict):
+            skipped_no_margin += 1
+            continue
+
+        cache_project = (payload.get("project") or "").upper().strip()
+        if cache_project != pid_upper:
+            skipped_wrong_project += 1
+            continue
+
+        try:
+            recomputed = ml_margin_svc.apply_hypothetical_price(payload, sale_price)
+            unit_pv = (recomputed.get("unit") or {}).get("profit_variable")
+            if unit_pv is None:
+                skipped_no_margin += 1
+                continue
+            total_pv = float(unit_pv) * qty
+        except Exception:  # noqa: BLE001
+            skipped_no_margin += 1
+            continue
+
+        # Insert into log idempotently.
+        async with pool.acquire() as conn:
+            ok = await conn.fetchval(
+                """
+                INSERT INTO breakeven_sale_log
+                  (user_id, order_id, project_id, year_month,
+                   profit_variable_brl, sale_date)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (user_id, order_id) DO NOTHING
+                RETURNING 1
+                """,
+                user_id, order_id, pid_upper, year_month,
+                round(total_pv, 2), row["date_created"],
+            )
+        if ok:
+            inserted += 1
+
+    return {
+        "user_id": user_id,
+        "project_id": pid_upper,
+        "year_month": year_month,
+        "orders_processed": processed,
+        "log_inserted": inserted,
+        "skipped_wrong_project": skipped_wrong_project,
+        "skipped_no_margin_cache": skipped_no_margin,
+        "skipped_no_item": skipped_no_item,
+    }
+
+
+async def recompute_state_from_log(
+    pool: asyncpg.Pool, user_id: int, project_id: str, year_month: str,
+) -> dict:
+    """Recovery: пересчитать project_breakeven_state.cumulative по факту из
+    breakeven_sale_log за месяц. Используется когда cumulative завышено
+    из-за исторических double-increments (до idempotency fix).
+
+    target_total и breakdown — НЕ трогаем (они вычисляются из P&L matrix
+    через get_or_init_state и по своему refresh-расписанию).
+    """
+    pid_upper = (project_id or "").upper().strip()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT COALESCE(SUM(profit_variable_brl), 0) AS sum_profit,
+                   COUNT(*) AS n_sales,
+                   MIN(sale_date) AS first_sale,
+                   MAX(sale_date) AS last_sale
+              FROM breakeven_sale_log
+             WHERE user_id = $1 AND project_id = $2 AND year_month = $3
+            """,
+            user_id, pid_upper, year_month,
+        )
+        sum_profit = float(row["sum_profit"] or 0.0)
+        n_sales = int(row["n_sales"] or 0)
+
+        # Получаем target из state (создаём если нет).
+        state = await get_or_init_state(pool, user_id, pid_upper)
+        target = float(state.get("target_total_brl") or 0.0)
+
+        breakeven_at = None
+        net_after = 0.0
+        if target > 0 and sum_profit >= target:
+            # Approximate: если cumulative >= target, ставим breakeven_at = NOW
+            # (точное время мы потеряли — без log-ordered scan).
+            breakeven_at = datetime.now(timezone.utc).isoformat()
+            net_after = max(0.0, sum_profit - target)
+
+        await conn.execute(
+            """
+            UPDATE project_breakeven_state
+               SET cumulative_variable_margin_brl = $4,
+                   sales_count = $5,
+                   breakeven_reached_at = $6::timestamptz,
+                   net_profit_after_breakeven_brl = $7,
+                   updated_at = NOW()
+             WHERE user_id = $1 AND project_id = $2 AND year_month = $3
+            """,
+            user_id, pid_upper, year_month,
+            round(sum_profit, 2), n_sales, breakeven_at,
+            round(net_after, 2),
+        )
+
+    return {
+        "user_id": user_id, "project_id": pid_upper, "year_month": year_month,
+        "target_total": round(target, 2),
+        "cumulative": round(sum_profit, 2),
+        "sales_count": n_sales,
+        "breakeven_reached_at": breakeven_at,
+        "net_profit_after_breakeven": round(net_after, 2),
+        "first_sale": row["first_sale"].isoformat() if row["first_sale"] else None,
+        "last_sale": row["last_sale"].isoformat() if row["last_sale"] else None,
     }
