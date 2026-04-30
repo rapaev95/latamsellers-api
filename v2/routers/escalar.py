@@ -2954,19 +2954,47 @@ async def orders_notice_from_webhook(
     topic = body.topic
     resource = body.resource
 
+    import logging as _lg
+    _log_n = _lg.getLogger("escalar.orders_notice")
+
     # Pre-enrich with cached unit margin (for orders_v2 / orders).
     # Mirrors ml_backfill._upsert_batch's logic.
+    enrichment_status = "skipped"
     if topic in ("orders_v2", "orders"):
         try:
             async with pool.acquire() as conn:
                 await ml_backfill_svc._enrich_order_with_margin(
                     conn, body.user_id, enriched, pool=pool,
                 )
-        except Exception as err:  # noqa: BLE001
-            import logging as _lg
-            _lg.getLogger("escalar.orders_notice").warning(
-                "enrich order margin failed: %s", err,
+            enrichment_status = (
+                "with_margin_breakeven" if (
+                    enriched.get("_margin") and enriched.get("_breakeven")
+                ) else (
+                    "with_margin" if enriched.get("_margin") else (
+                        "no_margin_in_cache" if not enriched.get("_margin") else "partial"
+                    )
+                )
             )
+        except Exception as err:  # noqa: BLE001
+            enrichment_status = f"exception:{err}"
+            _log_n.warning(
+                "enrich order margin failed user=%s resource=%s: %s",
+                body.user_id, resource, err,
+            )
+            try:
+                from v2.services import tg_admin_alerts as _alerts
+                await _alerts.send_admin_alert(
+                    title="Order enrichment exception",
+                    detail=(
+                        f"user={body.user_id} resource={resource}\n"
+                        f"exception: {err}"
+                    ),
+                    severity="error",
+                    service="escalar/orders/notice-from-webhook",
+                    deduplicate_key=f"order_enrich_exc:{type(err).__name__}",
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     try:
         notice = ml_normalize_svc.normalize_event(topic, resource, enriched)
@@ -2979,11 +3007,39 @@ async def orders_notice_from_webhook(
     except Exception as err:  # noqa: BLE001
         return {"ok": False, "error": f"upsert_failed: {err}", "notice": notice}
 
+    has_margin_block = bool(notice.get("description") and "Margem variável" in notice["description"])
+    _log_n.info(
+        "orders notice user=%s resource=%s enrichment=%s has_margin=%s tags=%s",
+        body.user_id, resource, enrichment_status, has_margin_block, notice.get("tags"),
+    )
+
+    # If we expected a margin block (item is in cache + sale_price>0) but it
+    # didn't end up in the rendered notice — that's a regression worth alerting.
+    if topic in ("orders_v2", "orders") and not has_margin_block:
+        try:
+            from v2.services import tg_admin_alerts as _alerts
+            await _alerts.send_admin_alert(
+                title="Order notice without margin block",
+                detail=(
+                    f"user={body.user_id} resource={resource}\n"
+                    f"enrichment={enrichment_status}\n"
+                    f"tags={notice.get('tags')}\n"
+                    f"Means: ml_item_margin_cache miss for item, OR no sale_price, OR normalize regression."
+                ),
+                severity="warn",
+                service="escalar/orders/notice-from-webhook",
+                deduplicate_key=f"order_no_margin:{enrichment_status}",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     return {
         "ok": True,
         "inserted": inserted,
         "notice_id": notice.get("notice_id"),
         "tags": notice.get("tags") or [],
+        "enrichment_status": enrichment_status,
+        "has_margin_block": has_margin_block,
     }
 
 
