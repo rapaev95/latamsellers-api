@@ -2343,6 +2343,7 @@ async def upload_inspect(
 
     if len(file_bytes) >= 4 and file_bytes[:4] == b"PK\x03\x04":
         import io as _io
+        import pandas as pd
         try:
             xl = pd.ExcelFile(_io.BytesIO(file_bytes))
         except Exception as err:  # noqa: BLE001
