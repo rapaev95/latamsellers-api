@@ -3101,6 +3101,26 @@ async def items_price_shift(
                 "old_price": base_price, "attempted_new_price": new_price,
                 "dyn_disabled": dyn_disabled}
 
+    # Audit price-shift event (sales TG button sup:/sdn:).
+    try:
+        from v2.services import escalar_audit as _audit
+        await _audit.log_event(
+            pool,
+            user_id=body.user_id,
+            action="price_raised" if body.delta_pct >= 0 else "price_lowered",
+            target_type="item",
+            target_id=mlb,
+            user_action="sale_price_shift",
+            metadata={
+                "old_price": base_price,
+                "new_price": new_price,
+                "delta_pct": float(body.delta_pct),
+                "dyn_disabled": dyn_disabled,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
     return {
         "ok": True,
         "item_id": mlb,
@@ -4090,6 +4110,34 @@ async def promotions_tg_action(
             "detail": r.text[:300],
             "raise": raise_info or None,
         }
+
+    # Audit: log the seller's choice + AI/promo metadata.
+    try:
+        from v2.services import escalar_audit as _audit
+        audit_action_map = {
+            "accept": "promo_accepted",
+            "accept_with_raise": "promo_accepted",
+            "reject": "promo_rejected",
+            "exit": "promo_rejected",
+            "raise_only": "price_raised",
+            "raise_with_disable_dyn": "dyn_pricing_off",
+            "reenable_dynamic_pricing": "dyn_pricing_on",
+        }
+        await _audit.log_event(
+            pool,
+            user_id=body.user_id,
+            action=audit_action_map.get(body.action or "", body.action or "promo"),
+            target_type="promotion",
+            target_id=f"{body.item_id}:{body.promotion_id}",
+            user_action=body.action,
+            metadata={
+                "promotion_type": offer.get("promotion_type"),
+                "deal_price": offer.get("deal_price"),
+                "raise_pct": raise_info.get("raise_pct") if isinstance(raise_info, dict) else None,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
     if body.action in ("accept", "accept_with_raise"):
         await ml_user_promotions_svc.mark_accepted(
@@ -5375,6 +5423,20 @@ async def photo_descriptions_get(
     from v2.services import ml_photo_descriptions as photo_svc
     descs = await photo_svc.get_descriptions_for_item(pool, user.id, mlb.upper())
     return {"item_id": mlb.upper(), "count": len(descs), "descriptions": descs}
+
+
+@router.get("/audit/me")
+async def audit_me(
+    days: int = Query(7, ge=1, le=90),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Returns escalar_audit summary за last N days. Action counts +
+    Q&A approve/edit/regen funnel + 30 most recent events."""
+    if pool is None:
+        return {"error": "no_db"}
+    from v2.services import escalar_audit as audit_svc
+    return await audit_svc.get_summary(pool, user.id, days=days)
 
 
 @router.get("/promo-analytics/me")

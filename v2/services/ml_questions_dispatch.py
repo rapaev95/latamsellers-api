@@ -411,7 +411,20 @@ async def _ai_suggest(
         except Exception:  # noqa: BLE001
             pass
         content = (data.get("choices") or [{}])[0].get("message", {}).get("content")
-        return content.strip() if isinstance(content, str) else None
+        result_text = content.strip() if isinstance(content, str) else None
+        # Audit log the suggestion event (audit funnel pairs this with
+        # downstream q_approved/q_edited/q_regenerated events).
+        try:
+            if result_text and user_id is not None and pool is not None:
+                from . import escalar_audit as _audit
+                await _audit.log_event(
+                    pool, user_id=user_id, action="ai_suggest_question",
+                    target_type="question", target_id=str(item_title or "")[:50],
+                    ai_response=result_text,
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        return result_text
     except Exception as err:  # noqa: BLE001
         log.exception("AI suggest failed: %s", err)
         return None
