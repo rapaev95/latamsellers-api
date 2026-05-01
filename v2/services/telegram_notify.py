@@ -24,22 +24,31 @@ def _escape(text: str) -> str:
     return (text or "").translate(_MD_ESCAPE)
 
 
-# Emoji per ML topic/category for quick visual scanning in Telegram.
-# Falls back to 🔔 when notice_id prefix or topic don't match anything known.
-_TOPIC_EMOJI = {
-    "orders_v2": "🛒",
-    "orders": "🛒",
-    "questions": "❓",
-    "claims": "⚠️",
-    "items": "📦",
-    "messages": "💬",
-    "invoices": "💰",
-    "payments": "💳",
-    "stock-locations": "📍",
-    "shipments": "🚚",
-    "fbm_stock_operations": "📦",
-    "post_purchase": "📬",
+# Emoji + type-tag per ML topic/category for quick visual scanning in
+# Telegram. User feedback: "когда листаю TG ленту — хочу понимать что
+# где и не теряться в куче уведомлений". Type tag rendered as
+# uppercase prefix [VENDA] / [PROMO] / [NOTÍCIA] etc — first thing eye
+# catches when scrolling.
+_TOPIC_META = {
+    # (emoji, type_tag_pt)
+    "orders_v2":             ("🛒", "VENDA"),
+    "orders":                ("🛒", "VENDA"),
+    "promotions":            ("🏷️", "PROMO"),
+    "questions":             ("❓", "PERGUNTA"),
+    "questions_v2":          ("❓", "PERGUNTA"),
+    "claims":                ("⚠️", "RECLAMAÇÃO"),
+    "items":                 ("📦", "ITEM"),
+    "messages":              ("💬", "MENSAGEM"),
+    "invoices":              ("💰", "FATURA"),
+    "payments":              ("💳", "PAGAMENTO"),
+    "stock-locations":       ("📍", "ESTOQUE"),
+    "shipments":             ("🚚", "ENVIO"),
+    "fbm_stock_operations":  ("📦", "ESTOQUE"),
+    "post_purchase":         ("📬", "POS-VENDA"),
 }
+
+# Legacy alias (some callers iterate emoji map).
+_TOPIC_EMOJI = {k: v[0] for k, v in _TOPIC_META.items()}
 
 
 def _topic_from_notice_id(notice_id: str) -> Optional[str]:
@@ -52,6 +61,24 @@ def _topic_from_notice_id(notice_id: str) -> Optional[str]:
 def _derive_emoji(topic: Optional[str], notice_id: str) -> str:
     key = (topic or _topic_from_notice_id(notice_id) or "").lower()
     return _TOPIC_EMOJI.get(key, "🔔")
+
+
+def _derive_meta(topic: Optional[str], notice_id: str, tags: Any = None) -> tuple[str, str]:
+    """Returns (emoji, type_tag_uppercase). Critical override: if tags
+    contains CRITICAL/STOCKOUT — switch to alarm prefix."""
+    key = (topic or _topic_from_notice_id(notice_id) or "").lower()
+    emoji, tag = _TOPIC_META.get(key, ("📢", "NOTÍCIA"))
+    if isinstance(tags, list):
+        tags_set = {str(t).upper() for t in tags if t}
+        if "CRITICAL" in tags_set or "STOCKOUT" in tags_set:
+            return ("🚨", "ALERTA")
+        if "NEWS" in tags_set:
+            return ("📢", "NOTÍCIA")
+    # ML platform notices (from /communications/notices) often arrive with
+    # numeric notice_id and no webhook topic (e.g. "24369"). Treat as news.
+    if not key and notice_id and notice_id.split(":", 1)[0].isdigit():
+        return ("📢", "NOTÍCIA")
+    return emoji, tag
 
 
 def _extract_ml_url(notice_id: str, topic: Optional[str]) -> Optional[str]:
@@ -233,11 +260,13 @@ def _format_message(
     topic: Optional[str] = None,
     raw: Any = None,
 ) -> str:
-    emoji = _derive_emoji(topic, notice_id)
+    emoji, type_tag = _derive_meta(topic, notice_id, tags)
     parts: list[str] = []
 
     header = label or (topic or "").replace("_", " ").title() or "Notificação"
-    parts.append(f"{emoji} *{_escape(header)}*")
+    # Format: 🛒 [VENDA] *Header* — type prefix lets seller scan TG feed
+    # at a glance and know what each notification is.
+    parts.append(f"{emoji} \\[{_escape(type_tag)}\\] *{_escape(header)}*")
 
     if description and description.strip() and description.strip() != header.strip():
         parts.append(_escape(description))

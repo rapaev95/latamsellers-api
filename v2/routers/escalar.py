@@ -5074,6 +5074,22 @@ async def breakeven_recompute(
     return out
 
 
+@router.post("/retirada-alerts/dispatch-now")
+async def retirada_alerts_dispatch_now(
+    days_back: int = Query(7, ge=1, le=30),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Manual trigger: scan retirada records за last N дней и алертит
+    о Descarte / Envio para o endereço. Same as daily 13:30 UTC cron.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    from v2.services import ml_retirada_alerts as retirada_svc
+    await retirada_svc.ensure_schema(pool)
+    return await retirada_svc.dispatch_retirada_alerts(pool, user.id, days_back)
+
+
 @router.post("/inventory-alerts/dispatch-now")
 async def inventory_alerts_dispatch_now(
     user: CurrentUser = Depends(current_user),

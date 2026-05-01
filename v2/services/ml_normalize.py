@@ -121,6 +121,32 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
         if pack_id:
             desc_lines.append(f"Pack #{pack_id}")
 
+        # Attribution — organic vs ads. ML order payload иногда включает:
+        #   - context.flow == 'mshop_advertising' → product ads
+        #   - tags array contains 'advertising' / 'meli_advertising' / similar
+        #   - mediations[].marketplace_promotional_offer для product ads
+        # Если нашли — пишем «📣 De Ads», иначе «🌱 Orgânica». Не показываем
+        # если данных недостаточно для вывода (NULL).
+        ctx_flow = ""
+        if isinstance(enriched.get("context"), dict):
+            ctx_flow = str(enriched["context"].get("flow") or "").lower()
+        order_tags = enriched.get("tags") or []
+        if isinstance(order_tags, list):
+            tags_lower = " ".join(str(t).lower() for t in order_tags if t)
+        else:
+            tags_lower = ""
+        is_ads = (
+            "advertising" in ctx_flow
+            or "advertising" in tags_lower
+            or "ads" in ctx_flow
+            or "promotional_offer" in tags_lower
+        )
+        if is_ads:
+            desc_lines.append("📣 *Vinda de Ads* (campanha pago)")
+        elif ctx_flow or tags_lower:
+            # У нас есть какой-то context => уверенно органика
+            desc_lines.append("🌱 *Vinda orgânica*")
+
         # Profit / margin block (когда _margin доступен из enricher).
         # Показываем VARIABLE margin (true per-sale) как primary — это
         # «стоит ли продавать ЭТУ единицу». Net margin (после overhead)

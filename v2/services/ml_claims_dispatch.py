@@ -582,15 +582,15 @@ def _build_claim_card(
     is_resolved = _is_ml_resolved(claim)
     if is_resolved:
         if summary_lang == "ru":
-            title = "ℹ️ *Жалоба решена ML — только проверь детали*"
+            title = "ℹ️ \\[RECLAMAÇÃO\\] *Жалоба решена ML — только проверь детали*"
         elif summary_lang == "en":
-            title = "ℹ️ *Claim resolved by ML — review only*"
+            title = "ℹ️ \\[RECLAMAÇÃO\\] *Claim resolved by ML — review only*"
         else:
-            title = "ℹ️ *Reclamação resolvida pelo ML — só conferir*"
+            title = "ℹ️ \\[RECLAMAÇÃO\\] *Reclamação resolvida pelo ML — só conferir*"
     elif needs_review:
-        title = "📦 *Devolução chegou — inspecionar*"
+        title = "📦 \\[RECLAMAÇÃO\\] *Devolução chegou — inspecionar*"
     else:
-        title = "⚠️ *Reclamação aberta — atender agora*"
+        title = "⚠️ \\[RECLAMAÇÃO\\] *Reclamação aberta — atender agora*"
 
     lines: list[str] = [title]
     lines.append("")

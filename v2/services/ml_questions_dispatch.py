@@ -418,7 +418,7 @@ async def _tg_send_question(
 ) -> Optional[str]:
     """Send a question card with action buttons. Returns tg message_id on success."""
     body_lines: list[str] = []
-    body_lines.append(f"❓ *Nova pergunta*")
+    body_lines.append(f"❓ \\[PERGUNTA\\] *Nova pergunta*")
     if item_title:
         body_lines.append(f"📦 {_esc(item_title)}")
     # SKU + item_id prominently — seller needs them to identify the product
@@ -528,7 +528,7 @@ async def _tg_send_reminder(
         pending_label = f"~{hours_pending // 24}d"
     else:
         pending_label = f"~{hours_pending // (24 * 30)}mo"
-    body_lines = [f"🔔 *LEMBRETE \\(sem resposta há {pending_label}\\)*"]
+    body_lines = [f"🔔 \\[PERGUNTA\\] *LEMBRETE \\(sem resposta há {pending_label}\\)*"]
     if item_title:
         body_lines.append(f"📦 {_esc(item_title)}")
     if buyer_nickname:

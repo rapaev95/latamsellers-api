@@ -284,7 +284,79 @@ async def detect_for_user(
     position_anomalies = await _detect_position_drops(pool, user_id)
     anomalies.extend(position_anomalies)
 
+    # 5. ads_no_sales — per item: ad_cost > threshold за last 7d AND
+    # 0 заказов attributed → seller тратит на рекламу впустую.
+    ads_no_sales = await _detect_ads_no_sales(pool, user_id)
+    anomalies.extend(ads_no_sales)
+
     return anomalies
+
+
+# Threshold for «реклама без продаж» alert — per-item ad spend over
+# the last 7 days that fires the alert when matched with 0 orders.
+ADS_NO_SALES_MIN_SPEND_BRL = float(os.environ.get("ADS_NO_SALES_MIN_SPEND_BRL", "30"))
+ADS_NO_SALES_WINDOW_DAYS = int(os.environ.get("ADS_NO_SALES_WINDOW_DAYS", "7"))
+
+
+async def _detect_ads_no_sales(
+    pool: asyncpg.Pool, user_id: int,
+) -> list[dict[str, Any]]:
+    """Per-item ads-without-sales detector. For each item where ad spend
+    over the last N days exceeded a minimum threshold (default R$30) but
+    zero orders were attributed → fire a `ads_no_sales` anomaly with the
+    item_id so the TG card can offer a Pause-campaign button.
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH spend AS (
+                    SELECT item_id,
+                           SUM(COALESCE(cost_brl, 0)) AS total_cost
+                      FROM ml_ad_campaign_metrics_daily
+                     WHERE user_id = $1
+                       AND day >= CURRENT_DATE - ($2::int * INTERVAL '1 day')
+                     GROUP BY item_id
+                    HAVING SUM(COALESCE(cost_brl, 0)) >= $3
+                ),
+                orders_count AS (
+                    SELECT items_unnest->>'mlb' AS item_id,
+                           COUNT(*) AS n_orders
+                      FROM ml_user_orders,
+                           jsonb_array_elements(items) AS items_unnest
+                     WHERE user_id = $1
+                       AND date_created >= NOW() - ($2::int * INTERVAL '1 day')
+                       AND status NOT IN ('cancelled', 'invalid')
+                     GROUP BY items_unnest->>'mlb'
+                )
+                SELECT s.item_id, s.total_cost, COALESCE(o.n_orders, 0) AS n_orders
+                  FROM spend s
+                  LEFT JOIN orders_count o ON o.item_id = s.item_id
+                 WHERE COALESCE(o.n_orders, 0) = 0
+                """,
+                user_id, ADS_NO_SALES_WINDOW_DAYS, ADS_NO_SALES_MIN_SPEND_BRL,
+            )
+    except Exception as err:  # noqa: BLE001
+        log.warning("ads_no_sales query user=%s failed (skipping): %s", user_id, err)
+        return out
+
+    for r in rows:
+        cost = float(r["total_cost"] or 0)
+        out.append({
+            "type": "ads_no_sales",
+            "severity": "critical" if cost > 100 else "warn",
+            "item_id": r["item_id"],
+            "metric_value": round(cost, 2),
+            "baseline_value": 0,
+            "delta_pct": None,
+            "message": (
+                f"Item {r['item_id']}: R$ {cost:.2f} de Ads em "
+                f"{ADS_NO_SALES_WINDOW_DAYS}d, 0 vendas attributed. "
+                f"Considere pausar campanha ou revisar palavras-chave."
+            ),
+        })
+    return out
 
 
 async def _detect_position_drops(
@@ -441,12 +513,14 @@ _TYPE_TITLE_RU = {
     "sales_drop": "Просадка продаж",
     "visits_drop": "Просадка визитов",
     "position_drop": "Падение позиции",
+    "ads_no_sales": "Реклама без продаж",
 }
 _TYPE_TITLE_PT = {
     "acos_spike": "Pico de ACOS",
     "sales_drop": "Queda de vendas",
     "visits_drop": "Queda de visitas",
     "position_drop": "Queda de posição",
+    "ads_no_sales": "Ads sem vendas",
 }
 
 
@@ -483,28 +557,65 @@ def _build_card(anomalies: list[dict[str, Any]], target_date: date, lang: str) -
     return "\n".join(lines).strip()
 
 
+def _build_anomalies_keyboard(anomalies: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """For ads_no_sales anomalies — link straight into ML Ads dashboard for
+    that item (one click = pause/edit campaign). Не делаем серверный pause
+    callback потому что:
+      1. ML pause endpoint требует campaign_id, не item_id (item может
+         входить в несколько campaigns).
+      2. Outage risk — лучше seller сам решит на ML interface, видя ROAS.
+      3. Кнопка-URL = простой UX.
+    """
+    rows: list[list[dict[str, Any]]] = []
+    seen: set[str] = set()
+    for a in anomalies:
+        if (a.get("anomaly_type") or a.get("type")) != "ads_no_sales":
+            continue
+        item_id = (a.get("item_id") or "").upper()
+        if not item_id or item_id in seen:
+            continue
+        seen.add(item_id)
+        rows.append([{
+            "text": f"🔗 Abrir Ads no ML — {item_id}",
+            "url": f"https://www.mercadolivre.com.br/anuncios/{item_id}/posicionamento",
+        }])
+    # Snooze button — seller признал alert и не хочет повторов сегодня.
+    if rows:
+        rows.append([{
+            "text": "🔕 Silenciar por 7d",
+            "callback_data": "ads_snooze:7",
+        }])
+    return {"inline_keyboard": rows} if rows else None
+
+
 async def _send_card(
     http: httpx.AsyncClient, bot_token: str, chat_id: str, text: str,
+    keyboard: Optional[dict[str, Any]] = None,
 ) -> Optional[str]:
     url = f"{TG_API_BASE}/bot{bot_token}/sendMessage"
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "MarkdownV2",
+        "disable_web_page_preview": True,
+    }
+    if keyboard:
+        payload["reply_markup"] = keyboard
     try:
-        r = await http.post(url, json={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "MarkdownV2",
-            "disable_web_page_preview": True,
-        }, timeout=15.0)
+        r = await http.post(url, json=payload, timeout=15.0)
         if r.status_code == 200:
             data = r.json() or {}
             return str((data.get("result") or {}).get("message_id") or "")
         log.warning("TG anomalies MD2 failed: %s %s", r.status_code, r.text[:200])
         # Plain text fallback
         plain = _strip_md2(text)
-        r2 = await http.post(url, json={
-            "chat_id": chat_id,
-            "text": plain,
+        plain_payload = {
+            "chat_id": chat_id, "text": plain,
             "disable_web_page_preview": True,
-        }, timeout=15.0)
+        }
+        if keyboard:
+            plain_payload["reply_markup"] = keyboard
+        r2 = await http.post(url, json=plain_payload, timeout=15.0)
         if r2.status_code == 200:
             data = r2.json() or {}
             return str((data.get("result") or {}).get("message_id") or "")
@@ -546,8 +657,11 @@ async def _dispatch_for_user(
         return {"detected": len(detected), "new": new_count, "sent": 0, "reason": "no_token"}
 
     text = _build_card(detected, target, (settings["language"] or "pt").lower())
+    keyboard = _build_anomalies_keyboard(detected)
     async with httpx.AsyncClient() as http:
-        msg_id = await _send_card(http, bot_token, str(settings["telegram_chat_id"]), text)
+        msg_id = await _send_card(
+            http, bot_token, str(settings["telegram_chat_id"]), text, keyboard,
+        )
 
     if msg_id:
         async with pool.acquire() as conn:

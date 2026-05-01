@@ -316,7 +316,7 @@ async def dispatch_inventory_alerts(
 
             if lang == "ru":
                 text = (
-                    f"⚠️ *Скоро закончится товар*\n\n"
+                    f"🚨 \\[ALERTA\\] *Скоро закончится товар*\n\n"
                     f"📦 {title_short}\n"
                     f"🆔 `{item_id}`\n\n"
                     f"Остаток: {stock} ед. · скорость: {avg:.1f}/день\n"
@@ -325,7 +325,7 @@ async def dispatch_inventory_alerts(
                 )
             elif lang == "en":
                 text = (
-                    f"⚠️ *Stock running out*\n\n"
+                    f"🚨 \\[ALERT\\] *Stock running out*\n\n"
                     f"📦 {title_short}\n"
                     f"🆔 `{item_id}`\n\n"
                     f"Stock: {stock} un. · pace: {avg:.1f}/day\n"
@@ -334,7 +334,7 @@ async def dispatch_inventory_alerts(
                 )
             else:
                 text = (
-                    f"⚠️ *Estoque acabando*\n\n"
+                    f"🚨 \\[ALERTA\\] *Estoque acabando*\n\n"
                     f"📦 {title_short}\n"
                     f"🆔 `{item_id}`\n\n"
                     f"Estoque: {stock} un. · ritmo: {avg:.1f}/dia\n"

@@ -299,6 +299,26 @@ async def _backfill_all_users_job() -> None:
         _ml_log.exception("ML backfill job failed: %s", err)
 
 
+async def _retirada_alerts_job() -> None:
+    """Daily Retirada Full alerts. New rows from Relatorio_Tarifas_Full_*.xlsx
+    (Descarte = critical, Envio para o endereço = informational) trigger
+    a one-shot TG alert per user per `Nº do custo`. 13:30 UTC = 10:30 BRT."""
+    try:
+        from v2.services import ml_retirada_alerts as retirada_svc
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("retirada alerts tick skipped: no DB pool")
+            return
+        result = await retirada_svc.dispatch_retirada_alerts_all_users(pool)
+        _ml_log.info(
+            "retirada alerts tick: users=%s checked=%s sent=%s skipped=%s",
+            result.get("users"), result.get("checked"),
+            result.get("sent"), result.get("skipped"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("retirada alerts job failed: %s", err)
+
+
 async def _photo_descriptions_auto_gen_job() -> None:
     """Daily auto-generate AI photo descriptions for items without them.
     Picks top-15 most-sold active items per user, throttles 4s per item.
@@ -912,6 +932,17 @@ async def _v2_startup() -> None:
         _inventory_alerts_job,
         CronTrigger(hour=12, minute=0, timezone="UTC"),
         id="inventory_alerts_daily",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Retirada Full alerts at 13:30 UTC = 10:30 BRT — после inventory_alerts
+    # (12:00). По Relatorio_Tarifas_Full_*.xlsx находит Descarte/Envio rows
+    # которые seller ещё не видел. Per-row dedup forever.
+    _ml_scheduler.add_job(
+        _retirada_alerts_job,
+        CronTrigger(hour=13, minute=30, timezone="UTC"),
+        id="retirada_alerts_daily",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
