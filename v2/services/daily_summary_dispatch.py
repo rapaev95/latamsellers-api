@@ -624,10 +624,12 @@ NARRATIVE_MODEL = "anthropic/claude-sonnet-4.5"
 
 
 async def _aggregate_extras(
-    pool: asyncpg.Pool, user_id: int, target_date: date,
+    pool: asyncpg.Pool, user_id: int, target_date: Optional[date],
 ) -> dict[str, int]:
     """Counts of new claims / unanswered questions / active promo candidates
     for the AI narrative. Failures fall back to zeros (narrative still useful)."""
+    if target_date is None:
+        target_date = _brt_yesterday()
     start_brt = datetime.combine(target_date, datetime.min.time(), tzinfo=BRT)
     end_brt = start_brt + timedelta(days=1)
     out = {

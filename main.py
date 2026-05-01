@@ -384,7 +384,11 @@ async def _refresh_promotions_job() -> None:
                 "SELECT user_id FROM ml_user_tokens WHERE access_token IS NOT NULL"
             )
         user_ids = [r["user_id"] for r in rows]
-        dispatch_limit = int(os.environ.get("PROMOTIONS_DISPATCH_LIMIT_PER_TICK", "15"))
+        # Lowered from 15 → 4 per tick: при 30-min interval это max 4 промо
+        # каждые полчаса, ~192/день. User feedback: "акции приходят кучей в
+        # один момент" — 15 был слишком жадный, при типичном ML refresh
+        # все 15 уезжали за один TG-tick (1 min). Spread держит ленту читабельной.
+        dispatch_limit = int(os.environ.get("PROMOTIONS_DISPATCH_LIMIT_PER_TICK", "4"))
         reminder_hours = float(os.environ.get("PROMOTIONS_REMINDER_HOURS", "24"))
         # Honour user alert preferences from onboarding wizard. Users who
         # explicitly disabled `promocoes` still get their cache refreshed
