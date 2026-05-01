@@ -5425,6 +5425,34 @@ async def photo_descriptions_get(
     return {"item_id": mlb.upper(), "count": len(descs), "descriptions": descs}
 
 
+@router.post("/ads-summary/dispatch-now")
+async def ads_summary_dispatch_now(
+    days: int = Query(14, ge=7, le=90),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Manual trigger ads recap. Sends per-campaign cards в TG (top 10 by
+    revenue last N days). Same logic as Monday 11:00 UTC cron."""
+    if pool is None:
+        return {"error": "no_db"}
+    from v2.services import ml_ads_summary as ads_svc
+    return await ads_svc.dispatch_for_user(pool, user.id, days=days)
+
+
+@router.get("/ads-summary/me")
+async def ads_summary_me(
+    days: int = Query(14, ge=7, le=90),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Per-campaign aggregated metrics для UI dashboard или JSON-debug."""
+    if pool is None:
+        return {"error": "no_db"}
+    from v2.services import ml_ads_summary as ads_svc
+    campaigns = await ads_svc.aggregate_per_campaign(pool, user.id, days=days)
+    return {"days": days, "count": len(campaigns), "campaigns": campaigns}
+
+
 @router.get("/audit/me")
 async def audit_me(
     days: int = Query(7, ge=1, le=90),

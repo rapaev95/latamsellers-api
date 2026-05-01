@@ -330,6 +330,24 @@ async def _ai_usage_admin_summary_job() -> None:
         _ml_log.exception("ai_usage admin summary job failed: %s", err)
 
 
+async def _ads_summary_job() -> None:
+    """Weekly Monday 11:00 UTC = 08:00 BRT — ads recap card per campaign
+    (top 10 by revenue, last 14d): spent / sold / revenue / ROAS / ROMI
+    + deep-link на ML Ads UI."""
+    try:
+        from v2.services import ml_ads_summary as ads_svc
+        pool = await get_pool()
+        if pool is None:
+            return
+        result = await ads_svc.dispatch_all_users(pool)
+        _ml_log.info(
+            "ads summary tick: users=%s campaigns=%s sent=%s",
+            result.get("users"), result.get("campaigns"), result.get("sent"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("ads summary job failed: %s", err)
+
+
 async def _retirada_alerts_job() -> None:
     """Daily Retirada Full alerts. New rows from Relatorio_Tarifas_Full_*.xlsx
     (Descarte = critical, Envio para o endereço = informational) trigger
@@ -995,6 +1013,17 @@ async def _v2_startup() -> None:
         _retirada_alerts_job,
         CronTrigger(hour=13, minute=30, timezone="UTC"),
         id="retirada_alerts_daily",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Weekly ads recap — Monday 11:00 UTC = 08:00 BRT. Per-campaign card
+    # с 14d метриками + кнопка-deeplink на ML Ads UI. (Phase 2 после ML
+    # Ads PUT API docs — добавлю budget/ROAS controls inline.)
+    _ml_scheduler.add_job(
+        _ads_summary_job,
+        CronTrigger(day_of_week="mon", hour=11, minute=0, timezone="UTC"),
+        id="ads_summary_weekly",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
