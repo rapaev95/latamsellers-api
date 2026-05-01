@@ -5425,6 +5425,127 @@ async def photo_descriptions_get(
     return {"item_id": mlb.upper(), "count": len(descs), "descriptions": descs}
 
 
+class _AdsCampaignUpdateIn(__import__("pydantic").BaseModel):
+    """Body для PUT /escalar/ads/campaigns/{id}/update.
+
+    Per Mercado Ads API docs all fields optional. ROAS target — there's
+    no `roas_target` field; ML использует `acos_target` (ROAS = 100/ACOS).
+    """
+    user_id: int
+    advertiser_id: int
+    site_id: str = "MLB"           # MLB / MLA / MLM etc
+    budget: Optional[float] = None         # daily budget BRL
+    status: Optional[str] = None           # 'active' | 'paused' | 'deleted'
+    acos_target: Optional[float] = None    # 3 < x < 500 (ROAS target = 100/x)
+    strategy: Optional[str] = None         # 'profitability' | 'increase' | 'visibility'
+    name: Optional[str] = None
+
+
+@router.post("/ads/campaigns/{campaign_id}/update")
+async def ads_update_campaign(
+    campaign_id: int,
+    body: _AdsCampaignUpdateIn,
+    pool=Depends(get_pool),
+):
+    """Server-to-server PUT against Mercado Ads. Called by Next.js TG
+    webhook callbacks (cbb:/cbr:/cbp:). Auth: no cookie — webhook validated
+    upstream. Token resolved via ml_oauth.
+
+    Per ML Ads API docs (file ADS-PRODUCT-ML.js):
+      PUT /marketplace/advertising/{SITE_ID}/product_ads/campaigns/{CID}
+      Headers: Authorization, api-version: 2, Content-Type: application/json
+      Body: {budget?, status?, acos_target? (3..500), strategy?, name?}
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    try:
+        token, _exp, _ = await ml_oauth_svc.get_valid_access_token(pool, body.user_id)
+    except ml_oauth_svc.MLRefreshError as err:
+        return {"error": "ml_oauth_required", "detail": str(err)}
+
+    payload: dict[str, Any] = {}
+    if body.budget is not None:
+        payload["budget"] = float(max(1.0, body.budget))  # ML enforces min budget
+    if body.status is not None:
+        if body.status not in ("active", "paused", "deleted"):
+            return {"error": "bad_status", "allowed": ["active", "paused", "deleted"]}
+        payload["status"] = body.status
+    if body.acos_target is not None:
+        clamped = max(3.1, min(499.0, float(body.acos_target)))
+        payload["acos_target"] = round(clamped, 2)
+    if body.strategy is not None:
+        if body.strategy.lower() not in ("profitability", "increase", "visibility"):
+            return {"error": "bad_strategy"}
+        payload["strategy"] = body.strategy.lower()
+    if body.name is not None:
+        payload["name"] = body.name[:60]
+    if not payload:
+        return {"error": "empty_payload"}
+
+    site_id = (body.site_id or "MLB").upper()
+    url = (
+        f"https://api.mercadolibre.com/marketplace/advertising/{site_id}"
+        f"/product_ads/campaigns/{campaign_id}"
+    )
+    async with httpx.AsyncClient() as http:
+        try:
+            r = await http.put(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "api-version": "2",
+                },
+                timeout=15.0,
+            )
+        except Exception as err:  # noqa: BLE001
+            return {"error": "ml_request_failed", "detail": str(err)}
+    if r.status_code >= 400:
+        return {
+            "error": "ml_update_rejected",
+            "status": r.status_code,
+            "detail": r.text[:500],
+            "attempted_payload": payload,
+        }
+    try:
+        body_resp = r.json()
+    except Exception:  # noqa: BLE001
+        body_resp = {}
+
+    # Refresh local cache: campaign row
+    try:
+        async with pool.acquire() as conn:
+            updates: list[str] = []
+            params: list[Any] = []
+            i = 1
+            if body.budget is not None:
+                updates.append(f"budget = ${i}")
+                params.append(payload["budget"])
+                i += 1
+            if body.status is not None:
+                updates.append(f"status = ${i}")
+                params.append(body.status)
+                i += 1
+            if body.acos_target is not None:
+                updates.append(f"roas_target = ${i}")  # legacy column name in our schema
+                params.append(payload["acos_target"])
+                i += 1
+            if updates:
+                params.extend([body.user_id, body.advertiser_id, campaign_id])
+                await conn.execute(
+                    f"UPDATE ml_ad_campaigns SET {', '.join(updates)}, "
+                    f"last_updated = NOW() WHERE user_id = ${i} AND "
+                    f"advertiser_id = ${i+1} AND campaign_id = ${i+2}",
+                    *params,
+                )
+    except Exception as err:  # noqa: BLE001
+        log = __import__("logging").getLogger(__name__)
+        log.debug("ads cache update failed: %s", err)
+
+    return {"ok": True, "applied": payload, "ml_response": body_resp}
+
+
 @router.post("/reconciliation/dispatch-now")
 async def reconciliation_dispatch_now(
     threshold: float = Query(50.0, ge=0, le=10000),

@@ -233,44 +233,65 @@ def _format_card(c: dict[str, Any], lang: str = "pt") -> tuple[str, dict[str, An
     if roas_target is not None:
         lines.append(f"🎯 {l_target}: {roas_target:.2f}x")
 
-    # Keyboard — все кнопки сейчас deep-linkи в ML Ads UI (Phase 2 → real
-    # PUT API когда docs придут). Группируем по rows: action-pairs.
+    # Real-action callback buttons — wired to Mercado Ads PUT API через
+    # FastAPI /escalar/ads/campaigns/{id}/update. callback payload:
+    #   cbb:{up|dn|min}:{advId}:{campId}:{currentBudget}
+    #   cbr:{up|dn}:{advId}:{campId}:{currentAcosTarget}
+    #   cbp:{pause|resume}:{advId}:{campId}
     cid = c["campaign_id"]
     aid = c["advertiser_id"]
     base_url = f"https://ads.mercadolivre.com.br/campaigns/{cid}"
-    edit_url = f"{base_url}/edit"
-    if lang == "ru":
-        btn_open = "🔗 Открыть в ML"
-        btn_budget = "💼 Бюджет"
-        btn_roas = "🎯 ROAS"
-        btn_pause = "🛑 Пауза"
-        btn_ads = "📑 Объявления"
-    elif lang == "en":
-        btn_open = "🔗 Open in ML"
-        btn_budget = "💼 Budget"
-        btn_roas = "🎯 ROAS"
-        btn_pause = "🛑 Pause"
-        btn_ads = "📑 Ads"
-    else:
-        btn_open = "🔗 Abrir no ML"
-        btn_budget = "💼 Orçamento"
-        btn_roas = "🎯 ROAS"
-        btn_pause = "🛑 Pausar"
-        btn_ads = "📑 Anúncios"
+    cur_budget = float(budget or 0)
+    cur_acos = float(roas_target or 0) if roas_target is not None else 0.0
+    is_paused = (c.get("status") or "").lower() == "paused"
 
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": btn_open, "url": base_url}],
-            [
-                {"text": btn_budget, "url": edit_url},
-                {"text": btn_roas, "url": edit_url},
-            ],
-            [
-                {"text": btn_pause, "url": base_url},
-                {"text": btn_ads, "url": f"{base_url}/ads"},
-            ],
-        ],
-    }
+    if lang == "ru":
+        btn_b_up = f"💼 +R$50"
+        btn_b_dn = f"💼 -R$50"
+        btn_b_min = "🛑 Бюджет=R$1"
+        btn_r_up = "🎯 ROAS +0.5"
+        btn_r_dn = "🎯 ROAS -0.5"
+        btn_pause = "▶️ Возобновить" if is_paused else "🛑 Пауза"
+        btn_open = "🔗 Открыть в ML"
+    elif lang == "en":
+        btn_b_up = f"💼 +R$50"
+        btn_b_dn = f"💼 -R$50"
+        btn_b_min = "🛑 Budget=R$1"
+        btn_r_up = "🎯 ROAS +0.5"
+        btn_r_dn = "🎯 ROAS -0.5"
+        btn_pause = "▶️ Resume" if is_paused else "🛑 Pause"
+        btn_open = "🔗 Open in ML"
+    else:
+        btn_b_up = f"💼 +R$50"
+        btn_b_dn = f"💼 -R$50"
+        btn_b_min = "🛑 Orçamento=R$1"
+        btn_r_up = "🎯 ROAS +0.5"
+        btn_r_dn = "🎯 ROAS -0.5"
+        btn_pause = "▶️ Retomar" if is_paused else "🛑 Pausar"
+        btn_open = "🔗 Abrir no ML"
+
+    pause_action = "resume" if is_paused else "pause"
+    rows: list[list[dict[str, Any]]] = []
+    # Budget controls
+    rows.append([
+        {"text": btn_b_dn, "callback_data": f"cbb:dn:{aid}:{cid}:{cur_budget:.2f}"},
+        {"text": btn_b_up, "callback_data": f"cbb:up:{aid}:{cid}:{cur_budget:.2f}"},
+    ])
+    rows.append([
+        {"text": btn_b_min, "callback_data": f"cbb:min:{aid}:{cid}:{cur_budget:.2f}"},
+    ])
+    # ROAS controls (only if acos_target known — иначе skip)
+    if cur_acos > 0:
+        rows.append([
+            {"text": btn_r_dn, "callback_data": f"cbr:dn:{aid}:{cid}:{cur_acos:.2f}"},
+            {"text": btn_r_up, "callback_data": f"cbr:up:{aid}:{cid}:{cur_acos:.2f}"},
+        ])
+    # Pause + ML link
+    rows.append([
+        {"text": btn_pause, "callback_data": f"cbp:{pause_action}:{aid}:{cid}"},
+        {"text": btn_open, "url": base_url},
+    ])
+    keyboard = {"inline_keyboard": rows}
     return "\n".join(lines), keyboard
 
 
