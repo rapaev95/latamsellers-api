@@ -4095,6 +4095,25 @@ async def promotions_tg_action(
         await ml_user_promotions_svc.mark_accepted(
             pool, body.user_id, body.item_id, body.promotion_id,
         )
+        # Open analytics window — track sales after accept vs before.
+        try:
+            from v2.services import ml_promo_analytics as _promo_a
+            disc = None
+            if offer.get("discount_percentage") is not None:
+                try:
+                    disc = float(offer["discount_percentage"])
+                except (TypeError, ValueError):
+                    disc = None
+            await _promo_a.record_acceptance(
+                pool, body.user_id, body.item_id, body.promotion_id,
+                promotion_type=offer.get("promotion_type"),
+                promotion_name=(offer.get("raw") or {}).get("name") if isinstance(offer.get("raw"), dict) else None,
+                deal_price=float(offer["deal_price"]) if offer.get("deal_price") is not None else None,
+                original_price=float(offer["original_price"]) if offer.get("original_price") is not None else None,
+                discount_pct=disc,
+            )
+        except Exception:  # noqa: BLE001
+            pass
     elif body.action in ("reject", "exit"):
         # exit на started SMART = effective dismiss. Помечаем строку чтобы
         # повторное TG-уведомление не приходило.
@@ -5356,6 +5375,34 @@ async def photo_descriptions_get(
     from v2.services import ml_photo_descriptions as photo_svc
     descs = await photo_svc.get_descriptions_for_item(pool, user.id, mlb.upper())
     return {"item_id": mlb.upper(), "count": len(descs), "descriptions": descs}
+
+
+@router.get("/promo-analytics/me")
+async def promo_analytics_me(
+    days: int = Query(90, ge=7, le=365),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Promotion outcomes за last N days. Returns top-3 winners + losers,
+    by_type breakdown, totals. Help seller decide which promo to accept
+    next time based on actual sales delta."""
+    if pool is None:
+        return {"error": "no_db"}
+    from v2.services import ml_promo_analytics as analytics
+    return await analytics.get_user_analytics(pool, user.id, days=days)
+
+
+@router.post("/promo-analytics/finalize-now")
+async def promo_analytics_finalize_now(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Manual trigger — finalize 14d windows для рядов прошедших cutoff.
+    Use this after testing to populate the analytics dashboard immediately."""
+    if pool is None:
+        return {"error": "no_db"}
+    from v2.services import ml_promo_analytics as analytics
+    return await analytics.finalize_due_outcomes(pool)
 
 
 @router.get("/ai-usage/me")

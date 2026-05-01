@@ -299,6 +299,23 @@ async def _backfill_all_users_job() -> None:
         _ml_log.exception("ML backfill job failed: %s", err)
 
 
+async def _promo_analytics_finalize_job() -> None:
+    """Daily 06:00 UTC = 03:00 BRT — finalize promotion outcome windows
+    older than 14d (compute treatment_revenue + delta vs baseline)."""
+    try:
+        from v2.services import ml_promo_analytics as analytics
+        pool = await get_pool()
+        if pool is None:
+            return
+        result = await analytics.finalize_due_outcomes(pool)
+        _ml_log.info(
+            "promo analytics finalize tick: considered=%s finalized=%s",
+            result.get("considered"), result.get("finalized"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("promo analytics finalize job failed: %s", err)
+
+
 async def _ai_usage_admin_summary_job() -> None:
     """Daily 22:00 UTC = 19:00 BRT — fires admin TG alert with last 24h
     OpenRouter spend (calls + tokens + R$). Helps catch runaway costs
@@ -946,6 +963,17 @@ async def _v2_startup() -> None:
         _inventory_alerts_job,
         CronTrigger(hour=12, minute=0, timezone="UTC"),
         id="inventory_alerts_daily",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Promo analytics finalize at 06:00 UTC = 03:00 BRT — closes 14d
+    # post-accept observation windows for accepted promotions, computes
+    # treatment_revenue and delta vs baseline.
+    _ml_scheduler.add_job(
+        _promo_analytics_finalize_job,
+        CronTrigger(hour=6, minute=0, timezone="UTC"),
+        id="promo_analytics_finalize_daily",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
