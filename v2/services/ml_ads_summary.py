@@ -36,8 +36,15 @@ async def aggregate_per_campaign(
       cost, clicks, prints, total_amount, direct_amount, indirect_amount,
       direct_units_quantity / units_quantity (orders).
     """
-    target_to = date.today()
-    target_from = target_to - timedelta(days=days)
+    # ML metrics обновляются ~10 AM BRT за prev день — данные «сегодня»
+    # обычно отсутствуют до этого момента. Используем yesterday как
+    # «recent point in time» — это также то что seller видит в Mercado
+    # Ads UI как «Ontem».
+    target_to = date.today() - timedelta(days=1)
+    target_from = target_to - timedelta(days=days - 1)
+    # Previous window для trend сравнения
+    prev_to = target_from - timedelta(days=1)
+    prev_from = prev_to - timedelta(days=days - 1)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -61,7 +68,7 @@ async def aggregate_per_campaign(
                  WHERE m.user_id = $1 AND m.date BETWEEN $2 AND $3
                  GROUP BY m.advertiser_id, m.campaign_id
             ),
-            today_agg AS (
+            yesterday_agg AS (
                 SELECT m.advertiser_id, m.campaign_id,
                        COALESCE(SUM((m.metrics->>'cost')::numeric), 0)            AS cost,
                        COALESCE(SUM((m.metrics->>'clicks')::int), 0)              AS clicks,
@@ -74,13 +81,28 @@ async def aggregate_per_campaign(
                   FROM ml_ad_campaign_metrics_daily m
                  WHERE m.user_id = $1 AND m.date = $3
                  GROUP BY m.advertiser_id, m.campaign_id
+            ),
+            prev_agg AS (
+                SELECT m.advertiser_id, m.campaign_id,
+                       COALESCE(SUM((m.metrics->>'cost')::numeric), 0)            AS cost,
+                       COALESCE(SUM((m.metrics->>'total_amount')::numeric), 0)    AS revenue,
+                       COALESCE(SUM(
+                         COALESCE((m.metrics->>'units_quantity')::int,
+                                  (m.metrics->>'direct_units_quantity')::int, 0)
+                       ), 0) AS units
+                  FROM ml_ad_campaign_metrics_daily m
+                 WHERE m.user_id = $1 AND m.date BETWEEN $4 AND $5
+                 GROUP BY m.advertiser_id, m.campaign_id
             )
             SELECT a.*,
-                   COALESCE(t.cost, 0)    AS today_cost,
-                   COALESCE(t.clicks, 0)  AS today_clicks,
-                   COALESCE(t.prints, 0)  AS today_prints,
-                   COALESCE(t.revenue, 0) AS today_revenue,
-                   COALESCE(t.units, 0)   AS today_units,
+                   COALESCE(t.cost, 0)    AS yest_cost,
+                   COALESCE(t.clicks, 0)  AS yest_clicks,
+                   COALESCE(t.prints, 0)  AS yest_prints,
+                   COALESCE(t.revenue, 0) AS yest_revenue,
+                   COALESCE(t.units, 0)   AS yest_units,
+                   COALESCE(p.cost, 0)    AS prev_cost,
+                   COALESCE(p.revenue, 0) AS prev_revenue,
+                   COALESCE(p.units, 0)   AS prev_units,
                    c.name, c.status, c.strategy, c.budget,
                    c.roas_target, c.product_id, c.cpc,
                    (SELECT COUNT(*) FROM ml_ad_ads ad
@@ -88,9 +110,12 @@ async def aggregate_per_campaign(
                        AND ad.advertiser_id = a.advertiser_id
                        AND ad.campaign_id = a.campaign_id) AS ads_count
               FROM agg a
-              LEFT JOIN today_agg t
+              LEFT JOIN yesterday_agg t
                 ON t.advertiser_id = a.advertiser_id
                AND t.campaign_id = a.campaign_id
+              LEFT JOIN prev_agg p
+                ON p.advertiser_id = a.advertiser_id
+               AND p.campaign_id = a.campaign_id
               LEFT JOIN ml_ad_campaigns c
                 ON c.user_id = $1
                AND c.advertiser_id = a.advertiser_id
@@ -98,7 +123,7 @@ async def aggregate_per_campaign(
              WHERE a.cost > 0 OR a.revenue > 0
              ORDER BY a.revenue DESC NULLS LAST, a.cost DESC NULLS LAST
             """,
-            user_id, target_from, target_to,
+            user_id, target_from, target_to, prev_from, prev_to,
         )
 
     out: list[dict[str, Any]] = []
@@ -106,16 +131,28 @@ async def aggregate_per_campaign(
         cost = float(r["cost"] or 0)
         revenue = float(r["revenue"] or 0)
         units = int(r["units"] or 0)
+        clicks = int(r["clicks"] or 0)
+        prints = int(r["prints"] or 0)
         roas = (revenue / cost) if cost > 0 else 0.0
         acos = (cost / revenue * 100) if revenue > 0 else 0.0
         romi = ((revenue - cost) / cost * 100) if cost > 0 else 0.0
-        # Today metrics
-        today_cost = float(r["today_cost"] or 0)
-        today_revenue = float(r["today_revenue"] or 0)
-        today_units = int(r["today_units"] or 0)
-        today_roas = (today_revenue / today_cost) if today_cost > 0 else 0.0
-        today_acos = (today_cost / today_revenue * 100) if today_revenue > 0 else 0.0
-        today_romi = ((today_revenue - today_cost) / today_cost * 100) if today_cost > 0 else 0.0
+        ctr = (clicks / prints * 100) if prints > 0 else 0.0
+        cr = (units / clicks * 100) if clicks > 0 else 0.0
+        cpc = (cost / clicks) if clicks > 0 else 0.0
+        # Yesterday metrics (ML обновляет ~10 AM BRT — за prev день)
+        yest_cost = float(r["yest_cost"] or 0)
+        yest_revenue = float(r["yest_revenue"] or 0)
+        yest_units = int(r["yest_units"] or 0)
+        yest_roas = (yest_revenue / yest_cost) if yest_cost > 0 else 0.0
+        yest_acos = (yest_cost / yest_revenue * 100) if yest_revenue > 0 else 0.0
+        yest_romi = ((yest_revenue - yest_cost) / yest_cost * 100) if yest_cost > 0 else 0.0
+        # Previous-window trend
+        prev_cost = float(r["prev_cost"] or 0)
+        prev_revenue = float(r["prev_revenue"] or 0)
+        prev_units = int(r["prev_units"] or 0)
+        delta_cost_pct = ((cost - prev_cost) / prev_cost * 100) if prev_cost > 0 else None
+        delta_revenue_pct = ((revenue - prev_revenue) / prev_revenue * 100) if prev_revenue > 0 else None
+        delta_units = units - prev_units
         out.append({
             "advertiser_id": int(r["advertiser_id"]),
             "campaign_id": int(r["campaign_id"]),
@@ -128,13 +165,23 @@ async def aggregate_per_campaign(
             "product_id": r["product_id"] or "PADS",
             # Window (default 14d)
             "cost_brl": round(cost, 2),
-            "clicks": int(r["clicks"] or 0),
-            "prints": int(r["prints"] or 0),
+            "clicks": clicks,
+            "prints": prints,
             "revenue_brl": round(revenue, 2),
             "units": units,
             "roas": round(roas, 2),
             "acos_pct": round(acos, 1),
             "romi_pct": round(romi, 1),
+            "ctr_pct": round(ctr, 2),
+            "cr_pct": round(cr, 1),
+            "cpc_brl": round(cpc, 2),
+            # Trend vs previous N days
+            "delta_cost_pct": round(delta_cost_pct, 1) if delta_cost_pct is not None else None,
+            "delta_revenue_pct": round(delta_revenue_pct, 1) if delta_revenue_pct is not None else None,
+            "delta_units": delta_units,
+            "prev_cost_brl": round(prev_cost, 2),
+            "prev_revenue_brl": round(prev_revenue, 2),
+            "prev_units": prev_units,
             # Today
             "today_cost_brl": round(today_cost, 2),
             "today_revenue_brl": round(today_revenue, 2),
@@ -187,58 +234,149 @@ def _esc_md(text: str) -> str:
     return out
 
 
+def _make_recommendation(c: dict[str, Any], lang: str) -> str:
+    """Rule-based короткий совет по метрикам кампании.
+
+    Логика:
+      - ROAS значительно выше target и budget регулярно «съедается» → suggest +budget
+      - ROMI > 100% AND lost-by-budget > 20% → ML могла бы показать больше но
+        не хватает бюджета → +budget
+      - ROMI < 0% AND ACOS > 50% → терять деньги → suggest снизить бюджет/раcs
+      - lost-by-rank > 50% → классификация низкая → не помогает budget,
+        нужен ad copy / лучшие ключевики
+      - delta_revenue < -30% AND delta_cost > 0 → негативный тренд при
+        стабильном бюджете → проверь акции конкурентов / category trends
+    """
+    romi = c.get("romi_pct") or 0
+    roas = c.get("roas") or 0
+    acos = c.get("acos_pct") or 0
+    roas_target = c.get("roas_target")
+    lost_budget = c.get("lost_share_budget_pct") or 0
+    lost_rank = c.get("lost_share_rank_pct") or 0
+    delta_rev = c.get("delta_revenue_pct")
+    delta_cost = c.get("delta_cost_pct")
+
+    if lang == "ru":
+        prefix = "💡 *Совет:* "
+    elif lang == "en":
+        prefix = "💡 *Tip:* "
+    else:
+        prefix = "💡 *Dica:* "
+
+    # 1. ROMI < 0 AND ACOS > 50 — кампания убыточная
+    if romi < 0 and acos > 50:
+        if lang == "ru":
+            return prefix + "*убыточно* — снизь бюджет до R$1 (история сохранится) или повысь ROAS-таргет."
+        if lang == "en":
+            return prefix + "*losing money* — drop budget to R$1 (history preserved) or raise ROAS target."
+        return prefix + "*perdendo dinheiro* — derrube o orçamento p/ R$1 (histórico preservado) ou suba ROAS target."
+
+    # 2. ROMI > 100 + lost by budget > 20 — недоинвестирована
+    if romi > 100 and lost_budget > 20:
+        if lang == "ru":
+            return prefix + f"высокая отдача *(ROMI {romi:.0f}%)*, но *{lost_budget:.0f}% показов терим из-за бюджета*. Подними бюджет на R$50."
+        if lang == "en":
+            return prefix + f"strong ROMI {romi:.0f}% but losing *{lost_budget:.0f}% impressions to budget*. Bump budget +R$50."
+        return prefix + f"ROMI alto *({romi:.0f}%)* mas perde *{lost_budget:.0f}%* de impressões por orçamento. Aumente orçamento +R$50."
+
+    # 3. lost_rank > 50 — слабая классификация, ad copy issue
+    if lost_rank > 50:
+        if lang == "ru":
+            return prefix + f"*{lost_rank:.0f}% показов терим из-за низкого ранга*. Бюджет не поможет — улучши описание/фото/ключевые слова."
+        if lang == "en":
+            return prefix + f"*Losing {lost_rank:.0f}% to ad rank*. Budget won't help — improve title/photos/keywords."
+        return prefix + f"*Perdendo {lost_rank:.0f}% de impressões por classificação*. Orçamento não vai ajudar — melhore título/fotos/palavras-chave."
+
+    # 4. ROAS заметно выше target — таргет можно поднять
+    if roas_target and roas > roas_target * 1.5 and roas_target > 0:
+        if lang == "ru":
+            return prefix + f"ROAS ({roas:.1f}x) сильно выше target ({roas_target:.1f}x). Подними target — будет больше показов и продаж."
+        if lang == "en":
+            return prefix + f"ROAS ({roas:.1f}x) far exceeds target ({roas_target:.1f}x). Raise target — more impressions/sales."
+        return prefix + f"ROAS ({roas:.1f}x) muito acima do target ({roas_target:.1f}x). Suba target — mais impressões/vendas."
+
+    # 5. Negative trend
+    if delta_rev is not None and delta_rev < -30 and (delta_cost or 0) > -10:
+        if lang == "ru":
+            return prefix + f"выручка упала на *{abs(delta_rev):.0f}%* vs пред. 14d при стабильном бюджете. Проверь акции конкурентов / тренды категории."
+        if lang == "en":
+            return prefix + f"revenue dropped *{abs(delta_rev):.0f}%* vs prev 14d with stable spend. Check competitor promos / category trends."
+        return prefix + f"receita caiu *{abs(delta_rev):.0f}%* vs 14d ant. com orçamento estável. Confira promos concorrentes / tendências da categoria."
+
+    # 6. Default — green, no action
+    return ""
+
+
 def _format_card(c: dict[str, Any], lang: str = "pt") -> tuple[str, dict[str, Any]]:
-    """Returns (text, keyboard) for one campaign — 2 sections (Hoje | 14d)."""
+    """Returns (text, keyboard) for one campaign — sections (Ontem | 14d
+    + trend + ratios + SoV)."""
     name_safe = _esc_md((c["name"] or "")[:60])
     # 14d
     cost = c["cost_brl"]; revenue = c["revenue_brl"]; units = c["units"]
     roas = c["roas"]; acos = c["acos_pct"]; romi = c["romi_pct"]
     ads_count = c["ads_count"]; clicks = c["clicks"]; prints = c["prints"]
+    ctr = c["ctr_pct"]; cr = c["cr_pct"]; cpc = c["cpc_brl"]
     budget = c["budget"]; roas_target = c["roas_target"]
-    # today
-    t_cost = c["today_cost_brl"]; t_rev = c["today_revenue_brl"]
-    t_units = c["today_units"]; t_roas = c["today_roas"]
-    t_acos = c["today_acos_pct"]; t_romi = c["today_romi_pct"]
-    t_clicks = c["today_clicks"]; t_prints = c["today_prints"]
+    # yesterday
+    y_cost = c["yest_cost_brl"]; y_rev = c["yest_revenue_brl"]
+    y_units = c["yest_units"]; y_roas = c["yest_roas"]
+    y_acos = c["yest_acos_pct"]; y_romi = c["yest_romi_pct"]
+    y_clicks = c["yest_clicks"]; y_prints = c["yest_prints"]
+    # trend
+    delta_cost = c.get("delta_cost_pct")
+    delta_rev = c.get("delta_revenue_pct")
+    delta_units = c.get("delta_units")
 
     health_emoji = "🟢" if romi > 30 else ("🟡" if romi > 0 else "🔴")
-    today_health = "🟢" if t_romi > 30 else ("🟡" if t_romi > 0 else ("🔴" if t_cost > 0 else "⚪"))
+    yest_health = "🟢" if y_romi > 30 else ("🟡" if y_romi > 0 else ("🔴" if y_cost > 0 else "⚪"))
+
+    def _delta_arrow(v: Optional[float]) -> str:
+        if v is None:
+            return ""
+        if v > 5:
+            return f" ↗ +{v:.0f}%"
+        if v < -5:
+            return f" ↘ {v:.0f}%"
+        return f" → {v:+.0f}%"
 
     if lang == "ru":
         title = f"📢 *РЕКЛАМА — {name_safe}*"
-        h_today = "📅 Сегодня:"; h_14d = "📊 За 14 дней:"
+        h_yest = "📅 Вчера:"; h_14d = "📊 За 14 дней:"
         l_spent = "Потрачено"; l_rev = "Выручка"; l_units = "Продаж"
-        l_imp = "Показы"; l_clk = "Клики"
         l_ads = "Объявлений"; l_budget = "Бюджет/день"
         l_target = "ROAS target"
-        no_today = "_Сегодня без активности._"
+        l_eff = "Эффективность"; l_trend = "Тренд vs пред. 14d"
+        l_cpc = "CPC"; l_ctr = "CTR"; l_cr = "Конверсия"
+        no_yest = "_Вчера без активности._"
     elif lang == "en":
         title = f"📢 *ADS — {name_safe}*"
-        h_today = "📅 Today:"; h_14d = "📊 Last 14d:"
+        h_yest = "📅 Yesterday:"; h_14d = "📊 Last 14d:"
         l_spent = "Spent"; l_rev = "Revenue"; l_units = "Orders"
-        l_imp = "Impressions"; l_clk = "Clicks"
         l_ads = "Ads"; l_budget = "Daily budget"
         l_target = "ROAS target"
-        no_today = "_No activity today._"
+        l_eff = "Efficiency"; l_trend = "Trend vs prev 14d"
+        l_cpc = "CPC"; l_ctr = "CTR"; l_cr = "CR"
+        no_yest = "_No activity yesterday._"
     else:
         title = f"📢 *ADS — {name_safe}*"
-        h_today = "📅 Hoje:"; h_14d = "📊 Últimos 14d:"
+        h_yest = "📅 Ontem:"; h_14d = "📊 Últimos 14d:"
         l_spent = "Gasto"; l_rev = "Receita"; l_units = "Pedidos"
-        l_imp = "Impressões"; l_clk = "Cliques"
         l_ads = "Anúncios"; l_budget = "Orçamento/dia"
         l_target = "ROAS target"
-        no_today = "_Sem atividade hoje._"
+        l_eff = "Eficiência"; l_trend = "Tendência vs 14d ant."
+        l_cpc = "CPC"; l_ctr = "CTR"; l_cr = "CR"
+        no_yest = "_Sem atividade ontem._"
 
     lines = [title, ""]
 
-    # Today block
-    lines.append(h_today)
-    if t_cost > 0 or t_rev > 0:
-        lines.append(f"  {l_spent}: {_money(t_cost)} · {l_rev}: {_money(t_rev)}")
-        lines.append(f"  {l_units}: {t_units} · 👁 {t_prints} · 🖱 {t_clicks}")
-        lines.append(f"  {today_health} ROMI *{t_romi:+.1f}%* · ROAS *{t_roas:.2f}x* · ACOS *{t_acos:.1f}%*")
+    # Yesterday block
+    lines.append(h_yest)
+    if y_cost > 0 or y_rev > 0:
+        lines.append(f"  {l_spent}: {_money(y_cost)} · {l_rev}: {_money(y_rev)}")
+        lines.append(f"  {l_units}: {y_units} · 👁 {y_prints} · 🖱 {y_clicks}")
+        lines.append(f"  {yest_health} ROMI *{y_romi:+.1f}%* · ROAS *{y_roas:.2f}x* · ACOS *{y_acos:.1f}%*")
     else:
-        lines.append(f"  {no_today}")
+        lines.append(f"  {no_yest}")
     lines.append("")
 
     # 14d block
@@ -246,6 +384,20 @@ def _format_card(c: dict[str, Any], lang: str = "pt") -> tuple[str, dict[str, An
     lines.append(f"  {l_spent}: {_money(cost)} · {l_rev}: {_money(revenue)}")
     lines.append(f"  {l_units}: {units} · 👁 {prints} · 🖱 {clicks}")
     lines.append(f"  {health_emoji} ROMI *{romi:+.1f}%* · ROAS *{roas:.2f}x* · ACOS *{acos:.1f}%*")
+    # Efficiency ratios
+    lines.append(f"  ⚡ {l_eff}: CPC {_money(cpc)} · CTR *{ctr:.2f}%* · {l_cr} *{cr:.1f}%*")
+
+    # Trend block — only if previous window had data
+    if delta_cost is not None or delta_rev is not None:
+        lines.append("")
+        lines.append(f"📈 *{l_trend}:*")
+        if delta_rev is not None:
+            lines.append(f"  {l_rev}:{_delta_arrow(delta_rev)}")
+        if delta_cost is not None:
+            lines.append(f"  {l_spent}:{_delta_arrow(delta_cost)}")
+        if delta_units is not None and (c.get("prev_units") or 0) > 0:
+            sign = "+" if (delta_units or 0) >= 0 else ""
+            lines.append(f"  {l_units}: {sign}{delta_units} ед.")
     lines.append("")
 
     # Settings
@@ -254,6 +406,12 @@ def _format_card(c: dict[str, Any], lang: str = "pt") -> tuple[str, dict[str, An
         lines.append(f"💼 {l_budget}: {_money(budget)}")
     if roas_target is not None:
         lines.append(f"🎯 {l_target}: {roas_target:.2f}x")
+
+    # AI recommendation block — short tactical hint based on metrics.
+    rec = _make_recommendation(c, lang)
+    if rec:
+        lines.append("")
+        lines.append(rec)
 
     # Share of Voice — «exibido vs concorrência»
     sov_show = c.get("impression_share_pct")
