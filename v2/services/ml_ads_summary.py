@@ -28,7 +28,9 @@ async def aggregate_per_campaign(
     pool: asyncpg.Pool, user_id: int, days: int = DEFAULT_WINDOW_DAYS,
 ) -> list[dict[str, Any]]:
     """Returns campaigns sorted by total_amount DESC for last N days,
-    enriched with ads count + budget + ROAS_target.
+    enriched with ads count + budget + ROAS_target. Each row contains
+    BOTH window metrics (cost/clicks/etc) AND today_* metrics for quick
+    today-vs-trend visualization.
 
     Metrics JSONB fields used (per ML Ads spec):
       cost, clicks, prints, total_amount, direct_amount, indirect_amount,
@@ -53,8 +55,27 @@ async def aggregate_per_campaign(
                   FROM ml_ad_campaign_metrics_daily m
                  WHERE m.user_id = $1 AND m.date BETWEEN $2 AND $3
                  GROUP BY m.advertiser_id, m.campaign_id
+            ),
+            today_agg AS (
+                SELECT m.advertiser_id, m.campaign_id,
+                       COALESCE(SUM((m.metrics->>'cost')::numeric), 0)            AS cost,
+                       COALESCE(SUM((m.metrics->>'clicks')::int), 0)              AS clicks,
+                       COALESCE(SUM((m.metrics->>'prints')::int), 0)              AS prints,
+                       COALESCE(SUM((m.metrics->>'total_amount')::numeric), 0)    AS revenue,
+                       COALESCE(SUM(
+                         COALESCE((m.metrics->>'units_quantity')::int,
+                                  (m.metrics->>'direct_units_quantity')::int, 0)
+                       ), 0) AS units
+                  FROM ml_ad_campaign_metrics_daily m
+                 WHERE m.user_id = $1 AND m.date = $3
+                 GROUP BY m.advertiser_id, m.campaign_id
             )
             SELECT a.*,
+                   COALESCE(t.cost, 0)    AS today_cost,
+                   COALESCE(t.clicks, 0)  AS today_clicks,
+                   COALESCE(t.prints, 0)  AS today_prints,
+                   COALESCE(t.revenue, 0) AS today_revenue,
+                   COALESCE(t.units, 0)   AS today_units,
                    c.name, c.status, c.strategy, c.budget,
                    c.roas_target, c.product_id, c.cpc,
                    (SELECT COUNT(*) FROM ml_ad_ads ad
@@ -62,6 +83,9 @@ async def aggregate_per_campaign(
                        AND ad.advertiser_id = a.advertiser_id
                        AND ad.campaign_id = a.campaign_id) AS ads_count
               FROM agg a
+              LEFT JOIN today_agg t
+                ON t.advertiser_id = a.advertiser_id
+               AND t.campaign_id = a.campaign_id
               LEFT JOIN ml_ad_campaigns c
                 ON c.user_id = $1
                AND c.advertiser_id = a.advertiser_id
@@ -80,6 +104,13 @@ async def aggregate_per_campaign(
         roas = (revenue / cost) if cost > 0 else 0.0
         acos = (cost / revenue * 100) if revenue > 0 else 0.0
         romi = ((revenue - cost) / cost * 100) if cost > 0 else 0.0
+        # Today metrics
+        today_cost = float(r["today_cost"] or 0)
+        today_revenue = float(r["today_revenue"] or 0)
+        today_units = int(r["today_units"] or 0)
+        today_roas = (today_revenue / today_cost) if today_cost > 0 else 0.0
+        today_acos = (today_cost / today_revenue * 100) if today_revenue > 0 else 0.0
+        today_romi = ((today_revenue - today_cost) / today_cost * 100) if today_cost > 0 else 0.0
         out.append({
             "advertiser_id": int(r["advertiser_id"]),
             "campaign_id": int(r["campaign_id"]),
@@ -90,6 +121,7 @@ async def aggregate_per_campaign(
             "roas_target": float(r["roas_target"]) if r["roas_target"] is not None else None,
             "ads_count": int(r["ads_count"] or 0),
             "product_id": r["product_id"] or "PADS",
+            # Window (default 14d)
             "cost_brl": round(cost, 2),
             "clicks": int(r["clicks"] or 0),
             "prints": int(r["prints"] or 0),
@@ -98,78 +130,145 @@ async def aggregate_per_campaign(
             "roas": round(roas, 2),
             "acos_pct": round(acos, 1),
             "romi_pct": round(romi, 1),
+            # Today
+            "today_cost_brl": round(today_cost, 2),
+            "today_revenue_brl": round(today_revenue, 2),
+            "today_units": today_units,
+            "today_clicks": int(r["today_clicks"] or 0),
+            "today_prints": int(r["today_prints"] or 0),
+            "today_roas": round(today_roas, 2),
+            "today_acos_pct": round(today_acos, 1),
+            "today_romi_pct": round(today_romi, 1),
         })
     return out
 
 
 def _ml_campaign_url(advertiser_id: int, campaign_id: int, product_id: str = "PADS") -> str:
     """Deep-link на campaign settings в Mercado Ads UI."""
-    # Both PADS (Product Ads) and BADS (Brand Ads) use the same URL
-    # template; ML routes by product_id internally.
     return f"https://ads.mercadolivre.com.br/campaigns/{campaign_id}"
 
 
+def _money(v: float) -> str:
+    """R$ X,XX in pt-BR convention."""
+    if v is None:
+        return "—"
+    return ("R$ " + f"{float(v):,.2f}").replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _esc_md(text: str) -> str:
+    """Escape Markdown (legacy, not MD2) reserved chars: _ * [ ] ( )"""
+    if not text:
+        return ""
+    out = text
+    for ch in ["_", "*", "[", "]", "`"]:
+        out = out.replace(ch, f"\\{ch}")
+    return out
+
+
 def _format_card(c: dict[str, Any], lang: str = "pt") -> tuple[str, dict[str, Any]]:
-    """Returns (text, keyboard) for one campaign."""
-    name = (c["name"] or "")[:60]
-    cost = c["cost_brl"]
-    revenue = c["revenue_brl"]
-    units = c["units"]
-    roas = c["roas"]
-    acos = c["acos_pct"]
-    romi = c["romi_pct"]
-    ads_count = c["ads_count"]
-    clicks = c["clicks"]
-    prints = c["prints"]
-    budget = c["budget"]
-    roas_target = c["roas_target"]
+    """Returns (text, keyboard) for one campaign — 2 sections (Hoje | 14d)."""
+    name_safe = _esc_md((c["name"] or "")[:60])
+    # 14d
+    cost = c["cost_brl"]; revenue = c["revenue_brl"]; units = c["units"]
+    roas = c["roas"]; acos = c["acos_pct"]; romi = c["romi_pct"]
+    ads_count = c["ads_count"]; clicks = c["clicks"]; prints = c["prints"]
+    budget = c["budget"]; roas_target = c["roas_target"]
+    # today
+    t_cost = c["today_cost_brl"]; t_rev = c["today_revenue_brl"]
+    t_units = c["today_units"]; t_roas = c["today_roas"]
+    t_acos = c["today_acos_pct"]; t_romi = c["today_romi_pct"]
+    t_clicks = c["today_clicks"]; t_prints = c["today_prints"]
 
     health_emoji = "🟢" if romi > 30 else ("🟡" if romi > 0 else "🔴")
+    today_health = "🟢" if t_romi > 30 else ("🟡" if t_romi > 0 else ("🔴" if t_cost > 0 else "⚪"))
+
     if lang == "ru":
-        title = f"📢 \\[РЕКЛАМА\\] *{name}*"
-        spent_lbl = "💸 Потрачено"
-        sold_lbl = "📦 Продаж"
-        rev_lbl = "💰 Выручка"
-        ads_lbl = "🎯 Объявлений"
-        budget_lbl = "💼 Бюджет/день"
+        title = f"📢 *РЕКЛАМА — {name_safe}*"
+        h_today = "📅 Сегодня:"; h_14d = "📊 За 14 дней:"
+        l_spent = "Потрачено"; l_rev = "Выручка"; l_units = "Продаж"
+        l_imp = "Показы"; l_clk = "Клики"
+        l_ads = "Объявлений"; l_budget = "Бюджет/день"
+        l_target = "ROAS target"
+        no_today = "_Сегодня без активности._"
     elif lang == "en":
-        title = f"📢 \\[ADS\\] *{name}*"
-        spent_lbl = "💸 Spent"
-        sold_lbl = "📦 Orders"
-        rev_lbl = "💰 Revenue"
-        ads_lbl = "🎯 Ads"
-        budget_lbl = "💼 Daily budget"
+        title = f"📢 *ADS — {name_safe}*"
+        h_today = "📅 Today:"; h_14d = "📊 Last 14d:"
+        l_spent = "Spent"; l_rev = "Revenue"; l_units = "Orders"
+        l_imp = "Impressions"; l_clk = "Clicks"
+        l_ads = "Ads"; l_budget = "Daily budget"
+        l_target = "ROAS target"
+        no_today = "_No activity today._"
     else:
-        title = f"📢 \\[ADS\\] *{name}*"
-        spent_lbl = "💸 Gasto"
-        sold_lbl = "📦 Pedidos"
-        rev_lbl = "💰 Receita"
-        ads_lbl = "🎯 Anúncios"
-        budget_lbl = "💼 Orçamento/dia"
+        title = f"📢 *ADS — {name_safe}*"
+        h_today = "📅 Hoje:"; h_14d = "📊 Últimos 14d:"
+        l_spent = "Gasto"; l_rev = "Receita"; l_units = "Pedidos"
+        l_imp = "Impressões"; l_clk = "Cliques"
+        l_ads = "Anúncios"; l_budget = "Orçamento/dia"
+        l_target = "ROAS target"
+        no_today = "_Sem atividade hoje._"
 
-    lines = [
-        title,
-        "",
-        f"{spent_lbl}: R$ {cost:.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
-        f"{rev_lbl}: R$ {revenue:.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
-        f"{sold_lbl}: {units} · 👁 {prints} · 🖱 {clicks}",
-        f"{ads_lbl}: {ads_count}",
-        "",
-        f"{health_emoji} ROMI *{romi:+.1f}%* · ROAS *{roas:.2f}x* · ACOS *{acos:.1f}%*",
-    ]
+    lines = [title, ""]
+
+    # Today block
+    lines.append(h_today)
+    if t_cost > 0 or t_rev > 0:
+        lines.append(f"  {l_spent}: {_money(t_cost)} · {l_rev}: {_money(t_rev)}")
+        lines.append(f"  {l_units}: {t_units} · 👁 {t_prints} · 🖱 {t_clicks}")
+        lines.append(f"  {today_health} ROMI *{t_romi:+.1f}%* · ROAS *{t_roas:.2f}x* · ACOS *{t_acos:.1f}%*")
+    else:
+        lines.append(f"  {no_today}")
+    lines.append("")
+
+    # 14d block
+    lines.append(h_14d)
+    lines.append(f"  {l_spent}: {_money(cost)} · {l_rev}: {_money(revenue)}")
+    lines.append(f"  {l_units}: {units} · 👁 {prints} · 🖱 {clicks}")
+    lines.append(f"  {health_emoji} ROMI *{romi:+.1f}%* · ROAS *{roas:.2f}x* · ACOS *{acos:.1f}%*")
+    lines.append("")
+
+    # Settings
+    lines.append(f"🎯 {l_ads}: {ads_count}")
     if budget is not None:
-        budget_str = f"R$ {budget:.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        lines.append(f"{budget_lbl}: {budget_str}")
+        lines.append(f"💼 {l_budget}: {_money(budget)}")
     if roas_target is not None:
-        lines.append(f"🎯 ROAS target: {roas_target:.2f}x")
+        lines.append(f"🎯 {l_target}: {roas_target:.2f}x")
 
-    # Single-row keyboard with deep-link to ML Ads campaign settings.
-    # Phase 2 после получения Mercado Ads PUT API docs — добавлю реальные
-    # кнопки budget +50 / -50 / set to 1 / ROAS step etc.
-    deep_link = _ml_campaign_url(c["advertiser_id"], c["campaign_id"], c["product_id"])
+    # Keyboard — все кнопки сейчас deep-linkи в ML Ads UI (Phase 2 → real
+    # PUT API когда docs придут). Группируем по rows: action-pairs.
+    cid = c["campaign_id"]
+    aid = c["advertiser_id"]
+    base_url = f"https://ads.mercadolivre.com.br/campaigns/{cid}"
+    edit_url = f"{base_url}/edit"
+    if lang == "ru":
+        btn_open = "🔗 Открыть в ML"
+        btn_budget = "💼 Бюджет"
+        btn_roas = "🎯 ROAS"
+        btn_pause = "🛑 Пауза"
+        btn_ads = "📑 Объявления"
+    elif lang == "en":
+        btn_open = "🔗 Open in ML"
+        btn_budget = "💼 Budget"
+        btn_roas = "🎯 ROAS"
+        btn_pause = "🛑 Pause"
+        btn_ads = "📑 Ads"
+    else:
+        btn_open = "🔗 Abrir no ML"
+        btn_budget = "💼 Orçamento"
+        btn_roas = "🎯 ROAS"
+        btn_pause = "🛑 Pausar"
+        btn_ads = "📑 Anúncios"
+
     keyboard = {
         "inline_keyboard": [
-            [{"text": "🔗 Abrir campanha no ML", "url": deep_link}],
+            [{"text": btn_open, "url": base_url}],
+            [
+                {"text": btn_budget, "url": edit_url},
+                {"text": btn_roas, "url": edit_url},
+            ],
+            [
+                {"text": btn_pause, "url": base_url},
+                {"text": btn_ads, "url": f"{base_url}/ads"},
+            ],
         ],
     }
     return "\n".join(lines), keyboard
