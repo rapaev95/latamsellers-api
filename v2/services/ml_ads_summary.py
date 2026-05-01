@@ -51,7 +51,12 @@ async def aggregate_per_campaign(
                        COALESCE(SUM(
                          COALESCE((m.metrics->>'units_quantity')::int,
                                   (m.metrics->>'direct_units_quantity')::int, 0)
-                       ), 0) AS units
+                       ), 0) AS units,
+                       -- Share of Voice family — average over the window
+                       AVG(NULLIF((m.metrics->>'impression_share')::numeric, 0))            AS impression_share_avg,
+                       AVG(NULLIF((m.metrics->>'top_impression_share')::numeric, 0))        AS top_impression_share_avg,
+                       AVG(NULLIF((m.metrics->>'lost_impression_share_by_budget')::numeric, 0)) AS lost_budget_avg,
+                       AVG(NULLIF((m.metrics->>'lost_impression_share_by_ad_rank')::numeric, 0)) AS lost_rank_avg
                   FROM ml_ad_campaign_metrics_daily m
                  WHERE m.user_id = $1 AND m.date BETWEEN $2 AND $3
                  GROUP BY m.advertiser_id, m.campaign_id
@@ -139,6 +144,23 @@ async def aggregate_per_campaign(
             "today_roas": round(today_roas, 2),
             "today_acos_pct": round(today_acos, 1),
             "today_romi_pct": round(today_romi, 1),
+            # Share of Voice (avg over window, percent units)
+            "impression_share_pct": (
+                round(float(r["impression_share_avg"] or 0) * 100, 1)
+                if r.get("impression_share_avg") is not None else None
+            ),
+            "top_impression_share_pct": (
+                round(float(r["top_impression_share_avg"] or 0) * 100, 1)
+                if r.get("top_impression_share_avg") is not None else None
+            ),
+            "lost_share_budget_pct": (
+                round(float(r["lost_budget_avg"] or 0) * 100, 1)
+                if r.get("lost_budget_avg") is not None else None
+            ),
+            "lost_share_rank_pct": (
+                round(float(r["lost_rank_avg"] or 0) * 100, 1)
+                if r.get("lost_rank_avg") is not None else None
+            ),
         })
     return out
 
@@ -232,6 +254,41 @@ def _format_card(c: dict[str, Any], lang: str = "pt") -> tuple[str, dict[str, An
         lines.append(f"💼 {l_budget}: {_money(budget)}")
     if roas_target is not None:
         lines.append(f"🎯 {l_target}: {roas_target:.2f}x")
+
+    # Share of Voice — «exibido vs concorrência»
+    sov_show = c.get("impression_share_pct")
+    sov_lost_budget = c.get("lost_share_budget_pct")
+    sov_lost_rank = c.get("lost_share_rank_pct")
+    sov_top = c.get("top_impression_share_pct")
+    if (sov_show is not None or sov_lost_budget is not None or sov_lost_rank is not None):
+        lines.append("")
+        if lang == "ru":
+            lines.append("📡 *Доля показов vs конкуренты:*")
+            if sov_show is not None:
+                lines.append(f"  • Показано: *{sov_show:.1f}%*"
+                             + (f" (топ-страница: {sov_top:.1f}%)" if sov_top is not None else ""))
+            if sov_lost_budget is not None:
+                lines.append(f"  • Не показано — бюджета не хватает: *{sov_lost_budget:.1f}%*")
+            if sov_lost_rank is not None:
+                lines.append(f"  • Не показано — низкий ранг: *{sov_lost_rank:.1f}%*")
+        elif lang == "en":
+            lines.append("📡 *Impression share vs competition:*")
+            if sov_show is not None:
+                lines.append(f"  • Shown: *{sov_show:.1f}%*"
+                             + (f" (top spot: {sov_top:.1f}%)" if sov_top is not None else ""))
+            if sov_lost_budget is not None:
+                lines.append(f"  • Lost (budget): *{sov_lost_budget:.1f}%*")
+            if sov_lost_rank is not None:
+                lines.append(f"  • Lost (ad rank): *{sov_lost_rank:.1f}%*")
+        else:
+            lines.append("📡 *Share of Voice vs concorrência:*")
+            if sov_show is not None:
+                lines.append(f"  • Exibido: *{sov_show:.1f}%*"
+                             + (f" (topo: {sov_top:.1f}%)" if sov_top is not None else ""))
+            if sov_lost_budget is not None:
+                lines.append(f"  • Não exibido — orçamento insuficiente: *{sov_lost_budget:.1f}%*")
+            if sov_lost_rank is not None:
+                lines.append(f"  • Não exibido — classificação: *{sov_lost_rank:.1f}%*")
 
     # Real-action callback buttons — wired to Mercado Ads PUT API через
     # FastAPI /escalar/ads/campaigns/{id}/update. callback payload:
