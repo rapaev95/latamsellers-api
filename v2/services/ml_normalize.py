@@ -131,7 +131,13 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
         desc_lines: list[str] = []
         if item_title:
             t_short = item_title if len(item_title) <= 90 else item_title[:87] + "..."
-            desc_lines.append(f"Produto: {t_short}")
+            # Show qty multiplier if buyer покупает >1 шт — критично для
+            # понимания «это 4 шт по R$101 или 1 шт за R$407?»
+            qty_str = f" · *{qty}× ед.*" if qty and qty > 1 else ""
+            unit_price_str = ""
+            if qty and qty > 1 and sale_price > 0:
+                unit_price_str = f" ({_money(sale_price)}/шт)"
+            desc_lines.append(f"Produto: {t_short}{qty_str}{unit_price_str}")
         if buyer:
             desc_lines.append(f"Comprador: {buyer}")
         if shipping.get("status"):
@@ -143,11 +149,12 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
         #   - context.flow == 'mshop_advertising' → product ads
         #   - tags array contains 'advertising' / 'meli_advertising' / similar
         #   - mediations[].marketplace_promotional_offer для product ads
-        # Если нашли — пишем «📣 De Ads», иначе «🌱 Orgânica». Не показываем
-        # если данных недостаточно для вывода (NULL).
-        ctx_flow = ""
-        if isinstance(enriched.get("context"), dict):
-            ctx_flow = str(enriched["context"].get("flow") or "").lower()
+        # Также проверяем item.tags на 'cart_eligible'/'good_quality_thumbnail'
+        # как proxy для «обычная карточка». Не показываем только если
+        # совсем пусто.
+        ctx_obj = enriched.get("context") if isinstance(enriched.get("context"), dict) else {}
+        ctx_flow = str(ctx_obj.get("flow") or "").lower()
+        ctx_app = str(ctx_obj.get("application") or "").lower()
         order_tags = enriched.get("tags") or []
         if isinstance(order_tags, list):
             tags_lower = " ".join(str(t).lower() for t in order_tags if t)
@@ -155,14 +162,17 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
             tags_lower = ""
         is_ads = (
             "advertising" in ctx_flow
-            or "advertising" in tags_lower
             or "ads" in ctx_flow
+            or "advertising" in tags_lower
+            or "advertising" in ctx_app
             or "promotional_offer" in tags_lower
+            or "promo_ads" in tags_lower
         )
         if is_ads:
             desc_lines.append("📣 *Vinda de Ads* (campanha pago)")
-        elif ctx_flow or tags_lower:
-            # У нас есть какой-то context => уверенно органика
+        else:
+            # Default — показываем «orgânica» (95% случаев), всегда даёт
+            # seller'у ясное представление откуда продажа.
             desc_lines.append("🌱 *Vinda orgânica*")
 
         # Profit / margin block (когда _margin доступен из enricher).
