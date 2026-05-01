@@ -178,6 +178,13 @@ async def _aggregate_user_metrics(
     # joins: position_history (latest per item across all tracked
     # keywords, INCLUDING found=false rows so we can say «item не
     # найден в топ-250 по X») + ml_ad_ads.
+    #
+    # Auto-enrol: items в top_items без position_history добавляем в
+    # очередь keyword tracking — seller жаловался «позиции не подтягиваются».
+    # Berremos primary keyword из title (первые 3-4 слова после «bolsa»/
+    # «mochila»/etc) — cron _dispatch_positions_refresh_job скоро
+    # подхватит и заполнит данные. На первой sale после release не будет
+    # data, но через 6 часов появится.
     enrich_mlbs = [it["mlb"] for it in (top_items + worst_items) if it.get("mlb")]
     if enrich_mlbs:
         async with pool.acquire() as conn:
@@ -212,6 +219,9 @@ async def _aggregate_user_metrics(
             for r in pos_rows
         }
         ads_map = {r["item_id"]: bool(r["ads_active"]) for r in ad_rows}
+        # Auto-enrol candidates: top-3 items без tracking → enqueue keyword
+        # из первых слов title для следующего positions cron.
+        auto_enrol_jobs: list[tuple[str, str]] = []
         for it in top_items + worst_items:
             mlb = it.get("mlb")
             if not mlb:
@@ -219,14 +229,49 @@ async def _aggregate_user_metrics(
             p = pos_map.get(mlb)
             it["position"] = p["position"] if p else None
             it["position_keyword"] = p["keyword"] if p else None
-            # `position_checked` = item HAS a position_history row, whether
-            # found or not. Renderer differentiates 3 states:
-            #   - never checked (no row): no SEO line
-            #   - checked + found:   🔍 ОРГАНИКА #N (kw)
-            #   - checked + not in scanned depth: 🔎 не найдена в топ-N
             it["position_checked"] = p is not None
             it["position_total"] = p.get("total_results") if p else None
             it["ads_active"] = ads_map.get(mlb, False)
+            # Auto-enrol: only top_items (revenue winners), no existing
+            # tracking, и есть title для extract keyword.
+            if (
+                p is None
+                and it in top_items
+                and (it.get("title") or "").strip()
+            ):
+                kw = _extract_main_keyword(it["title"])
+                if kw:
+                    auto_enrol_jobs.append((mlb, kw))
+        if auto_enrol_jobs:
+            async with pool.acquire() as conn:
+                # Создаём tracking_keywords если table существует. Не
+                # критично если нет — просто пропустим. Помечаем как
+                # auto-added чтобы seller мог их disable если хочет.
+                try:
+                    await conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS position_tracking_keywords (
+                          user_id INTEGER NOT NULL,
+                          item_id TEXT NOT NULL,
+                          keyword TEXT NOT NULL,
+                          source TEXT,
+                          created_at TIMESTAMPTZ DEFAULT NOW(),
+                          PRIMARY KEY (user_id, item_id, keyword)
+                        );
+                        """
+                    )
+                    for mlb, kw in auto_enrol_jobs:
+                        await conn.execute(
+                            """
+                            INSERT INTO position_tracking_keywords
+                              (user_id, item_id, keyword, source)
+                            VALUES ($1, $2, $3, 'auto_top_item')
+                            ON CONFLICT DO NOTHING
+                            """,
+                            user_id, mlb, kw,
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
 
     # 5. Conversion (orders / visits * 100)
     conversion_pct = (orders_count / visits * 100) if visits > 0 else 0.0
@@ -263,6 +308,33 @@ def _diff_pp(today: float, yesterday: float) -> float:
 
 
 # ── TG card builder ────────────────────────────────────────────────
+
+_KEYWORD_STOPWORDS = {
+    "para", "com", "sem", "de", "do", "da", "das", "dos",
+    "a", "o", "e", "em", "no", "na", "nos", "nas",
+    "preto", "preta", "branco", "branca", "azul", "vermelho",
+    "novo", "nova", "kit",
+}
+
+
+def _extract_main_keyword(title: str) -> str:
+    """Extract a 2-3 word search keyword from item title for auto-tracking.
+
+    Берёт первые 3 содержательных слова без stopwords/colors/sizes.
+    Title example: 'Bolsa Feminina Tiracolo Pequena De Couro' →
+    'bolsa feminina tiracolo'. Этого достаточно для tracking — точное
+    совпадение seller сам поправит через UI.
+    """
+    if not title:
+        return ""
+    import re as _re
+    # Lowercase, drop punctuation
+    cleaned = _re.sub(r"[^\w\s]", " ", title.lower()).strip()
+    words = [w for w in cleaned.split() if w and w not in _KEYWORD_STOPWORDS and not w.isdigit()]
+    if not words:
+        return ""
+    return " ".join(words[:3])
+
 
 def _fmt_brl(amount: float) -> str:
     """Format float as 'R$ 1.234,56' BRL convention.
