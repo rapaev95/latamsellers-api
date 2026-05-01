@@ -626,6 +626,64 @@ def _format_card(c: dict[str, Any], lang: str = "pt") -> tuple[str, dict[str, An
     return "\n".join(lines), keyboard
 
 
+async def aggregate_overall(
+    pool: asyncpg.Pool, user_id: int, days: int = DEFAULT_WINDOW_DAYS,
+) -> dict[str, Any]:
+    """Account-level totals across all campaigns + total seller revenue.
+
+    Returns: total_ad_cost, total_ad_revenue (ads-attributed), total_revenue
+    (вся выручка seller'а — orgáncic + ads), drr_overall (= ad_cost /
+    total_revenue * 100), roas_overall (ads-attributed ROAS).
+    """
+    target_to = date.today() - timedelta(days=1)
+    target_from = target_to - timedelta(days=days - 1)
+    async with pool.acquire() as conn:
+        ad_row = await conn.fetchrow(
+            """
+            SELECT COALESCE(SUM((m.metrics->>'cost')::numeric), 0)         AS cost,
+                   COALESCE(SUM((m.metrics->>'total_amount')::numeric), 0) AS ad_revenue,
+                   COALESCE(SUM(
+                     COALESCE((m.metrics->>'units_quantity')::int, 0)
+                   ), 0) AS ad_units
+              FROM ml_ad_campaign_metrics_daily m
+             WHERE m.user_id = $1 AND m.date BETWEEN $2 AND $3
+            """,
+            user_id, target_from, target_to,
+        )
+        rev_row = await conn.fetchrow(
+            """
+            SELECT COALESCE(SUM(COALESCE((it->>'revenue')::numeric, 0)), 0) AS total_revenue,
+                   COUNT(DISTINCT o.order_id) AS orders_count
+              FROM ml_user_orders o,
+                   jsonb_array_elements(o.items) AS it
+             WHERE o.user_id = $1
+               AND o.date_created >= $2::timestamp
+               AND o.date_created < ($3::date + interval '1 day')
+               AND o.status NOT IN ('cancelled', 'invalid')
+            """,
+            user_id, target_from, target_to,
+        )
+    ad_cost = float(ad_row["cost"] or 0)
+    ad_revenue = float(ad_row["ad_revenue"] or 0)
+    total_revenue = float(rev_row["total_revenue"] or 0)
+    return {
+        "days": days,
+        "total_ad_cost": round(ad_cost, 2),
+        "total_ad_revenue": round(ad_revenue, 2),
+        "total_revenue": round(total_revenue, 2),
+        "orders_count": int(rev_row["orders_count"] or 0),
+        "drr_overall_pct": (
+            round(ad_cost / total_revenue * 100, 1) if total_revenue > 0 else None
+        ),
+        "roas_overall": (
+            round(ad_revenue / ad_cost, 2) if ad_cost > 0 else 0.0
+        ),
+        "acos_overall_pct": (
+            round(ad_cost / ad_revenue * 100, 1) if ad_revenue > 0 else 0.0
+        ),
+    }
+
+
 async def dispatch_for_user(
     pool: asyncpg.Pool, user_id: int, days: int = DEFAULT_WINDOW_DAYS,
 ) -> dict[str, int]:
@@ -654,17 +712,57 @@ async def dispatch_for_user(
 
     import asyncio as _asyncio
     sent = 0
+    # Account-level totals — header shows them so seller сразу видит
+    # ДРР по всему аккаунту, не только per-campaign.
+    overall = await aggregate_overall(pool, user_id, days=days)
     async with httpx.AsyncClient(timeout=15.0) as http:
-        # Send overview header first
-        header = {
-            "ru": f"📊 *Сводка рекламы за {days}d* — топ {len(campaigns[:MAX_CAMPAIGNS_IN_TG])} РК",
-            "en": f"📊 *Ads recap last {days}d* — top {len(campaigns[:MAX_CAMPAIGNS_IN_TG])}",
-            "pt": f"📊 *Recap Ads {days}d* — top {len(campaigns[:MAX_CAMPAIGNS_IN_TG])}",
-        }.get(lang, f"📊 *Recap Ads {days}d*")
+        # Build header with overall metrics
+        top_n = len(campaigns[:MAX_CAMPAIGNS_IN_TG])
+        ad_cost = overall["total_ad_cost"]
+        ad_rev = overall["total_ad_revenue"]
+        total_rev = overall["total_revenue"]
+        drr = overall["drr_overall_pct"]
+        roas = overall["roas_overall"]
+        if drr is not None:
+            drr_emoji = "🟢" if drr <= 15 else ("🟡" if drr <= 30 else "🔴")
+        else:
+            drr_emoji = "⚪"
+        if lang == "ru":
+            header_lines = [
+                f"📊 *Сводка рекламы за {days}d* — топ {top_n} РК",
+                "",
+                f"💰 Общая выручка: *{_money(total_rev)}*",
+                f"📢 Потрачено на рекламу: *{_money(ad_cost)}*",
+                f"📦 Атрибутированная выручка: {_money(ad_rev)} (ROAS {roas:.2f}x)",
+                f"{drr_emoji} *ДРР всего: {f'{drr:.1f}%' if drr is not None else '—'}* "
+                f"(доля рекламы в общей выручке)",
+            ]
+        elif lang == "en":
+            header_lines = [
+                f"📊 *Ads recap last {days}d* — top {top_n}",
+                "",
+                f"💰 Total revenue: *{_money(total_rev)}*",
+                f"📢 Ad spend: *{_money(ad_cost)}*",
+                f"📦 Attributed revenue: {_money(ad_rev)} (ROAS {roas:.2f}x)",
+                f"{drr_emoji} *Ad-share-of-revenue: {f'{drr:.1f}%' if drr is not None else '—'}*",
+            ]
+        else:
+            header_lines = [
+                f"📊 *Recap Ads {days}d* — top {top_n}",
+                "",
+                f"💰 Receita total: *{_money(total_rev)}*",
+                f"📢 Gasto em Ads: *{_money(ad_cost)}*",
+                f"📦 Receita atribuída: {_money(ad_rev)} (ROAS {roas:.2f}x)",
+                f"{drr_emoji} *Ad-share-of-revenue: {f'{drr:.1f}%' if drr is not None else '—'}*",
+            ]
         try:
             await http.post(
                 f"{TG_API_BASE}/bot{bot_token}/sendMessage",
-                json={"chat_id": chat_id, "text": header, "parse_mode": "Markdown"},
+                json={
+                    "chat_id": chat_id,
+                    "text": "\n".join(header_lines),
+                    "parse_mode": "Markdown",
+                },
             )
             await _asyncio.sleep(0.4)
         except Exception:  # noqa: BLE001
