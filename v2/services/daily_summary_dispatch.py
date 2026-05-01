@@ -309,6 +309,7 @@ def _build_card(
     yesterday: dict[str, Any],
     lang: str,
     app_url: str,
+    extras: Optional[dict[str, int]] = None,
 ) -> str:
     target = date.fromisoformat(today["date"])
     label = _date_label(target, lang)
@@ -463,6 +464,25 @@ def _build_card(
             if seo_line:
                 lines.append(seo_line)
 
+    # Dynamic Pricing automation count — сколько объявлений под ML
+    # автоматическим управлением цены (tag dynamic_standard_price).
+    # Полезно seller'у: если много, и ACOS просел — скорее всего ML
+    # снизил цены реагируя на конкурентов.
+    if extras:
+        n_dyn = int(extras.get("items_with_dyn_pricing") or 0)
+        n_total = int(extras.get("active_items_total") or 0)
+        if n_dyn > 0:
+            lines.append("")
+            if lang == "ru":
+                pct_str = f" \\({n_dyn * 100 // max(n_total, 1)}%\\)" if n_total else ""
+                lines.append(f"⚙️ *ML авто\\-цена:* {n_dyn} из {n_total}{pct_str}")
+            elif lang == "en":
+                pct_str = f" \\({n_dyn * 100 // max(n_total, 1)}%\\)" if n_total else ""
+                lines.append(f"⚙️ *ML auto\\-price:* {n_dyn}/{n_total}{pct_str}")
+            else:
+                pct_str = f" \\({n_dyn * 100 // max(n_total, 1)}%\\)" if n_total else ""
+                lines.append(f"⚙️ *Precificação ML:* {n_dyn}/{n_total}{pct_str}")
+
     return "\n".join(lines)
 
 
@@ -575,15 +595,16 @@ async def _dispatch_for_user(
         return {"sent": 0, "reason": "no_activity"}
 
     app_base = os.environ.get("APP_BASE_URL", "https://app.lsprofit.app")
-    text = _build_card(today_metrics, yesterday_metrics, lang, app_base)
+    # Aggregate extras first so card can include items_with_dyn_pricing
+    # row alongside the metric breakdown.
+    extras = await _aggregate_extras(pool, user_id, target_date)
+    text = _build_card(today_metrics, yesterday_metrics, lang, app_base, extras=extras)
     if len(text) > 4000:
         text = text[:3990] + "…"
     keyboard = _build_keyboard(app_base, lang)
 
     # AI narrative briefing — short human-friendly summary BEFORE the
-    # detailed metric card. Aggregates extras (claims/questions/promos)
-    # the rule-based card doesn't surface, sends as separate first message.
-    extras = await _aggregate_extras(pool, user_id, target_date)
+    # detailed metric card. Reuses extras already aggregated above.
     async with httpx.AsyncClient() as http:
         narrative = await _build_ai_narrative(
             http, today_metrics, yesterday_metrics, extras, lang,
@@ -635,6 +656,7 @@ async def _aggregate_extras(
     out = {
         "new_claims": 0, "open_claims_total": 0,
         "unanswered_questions": 0, "promo_candidates": 0,
+        "active_items_total": 0, "items_with_dyn_pricing": 0,
     }
     try:
         async with pool.acquire() as conn:
@@ -659,6 +681,23 @@ async def _aggregate_extras(
                 "AND dismissed_at IS NULL",
                 user_id,
             ) or 0)
+            # Items with ML Dynamic Pricing tag — seller often не знает
+            # сколько у него под автоматикой ML; показываем X из Y total.
+            # Tag: 'dynamic_standard_price' в raw.tags JSONB.
+            out["active_items_total"] = int(await conn.fetchval(
+                "SELECT COUNT(*) FROM ml_user_items WHERE user_id = $1 "
+                "AND COALESCE(status, 'active') = 'active'",
+                user_id,
+            ) or 0)
+            out["items_with_dyn_pricing"] = int(await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM ml_user_items
+                 WHERE user_id = $1
+                   AND COALESCE(status, 'active') = 'active'
+                   AND raw -> 'tags' ? 'dynamic_standard_price'
+                """,
+                user_id,
+            ) or 0)
     except Exception as err:  # noqa: BLE001
         log.debug("aggregate_extras failed user=%s: %s", user_id, err)
     return out
@@ -677,13 +716,17 @@ Formato OBRIGATÓRIO:
 📊 *Hoje:* <1 frase com vendas + receita + delta vs ontem>
 {extras_lines_format}
 
+⚙️ *Precificação ML:* <X de Y anúncios sob automação ML — só se X > 0>
+
 ✅ *Foco para amanhã:*
 • <ação 1 — verbo no imperativo>
 • <ação 2 — apenas se realmente prioritária>
 
 REGRAS:
-- Total ≤ 500 caracteres.
+- Total ≤ 600 caracteres.
 - NÃO repita números que já estão no card detalhado (que vai logo depois).
+- Linha "Precificação ML" — pular se 0 anúncios sob automação.
+- Se ML autoprice é > 50% dos anúncios E ACOS hoje pior que ontem — sugira revisar.
 - Se não houve atividade — diga isso direto, sem fluff.
 - Use markdown simples (negrito *texto*) para Telegram.
 - NÃO inventar — só usar números fornecidos."""
@@ -707,7 +750,10 @@ def _build_narrative_prompt_inputs(
         f"  • Reclamações novas hoje: {extras.get('new_claims', 0)}\n"
         f"  • Reclamações abertas total: {extras.get('open_claims_total', 0)}\n"
         f"  • Perguntas não respondidas: {extras.get('unanswered_questions', 0)}\n"
-        f"  • Candidatos de promoção pendentes: {extras.get('promo_candidates', 0)}"
+        f"  • Candidatos de promoção pendentes: {extras.get('promo_candidates', 0)}\n"
+        f"AUTOMAÇÃO DE PREÇOS (Precificação Dinâmica do ML):\n"
+        f"  • {extras.get('items_with_dyn_pricing', 0)} de "
+        f"{extras.get('active_items_total', 0)} anúncios ativos sob ML autoprice"
     )
 
 
