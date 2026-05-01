@@ -221,15 +221,15 @@ async def aggregate_per_campaign(
             "prev_cost_brl": round(prev_cost, 2),
             "prev_revenue_brl": round(prev_revenue, 2),
             "prev_units": prev_units,
-            # Today
-            "today_cost_brl": round(today_cost, 2),
-            "today_revenue_brl": round(today_revenue, 2),
-            "today_units": today_units,
-            "today_clicks": int(r["today_clicks"] or 0),
-            "today_prints": int(r["today_prints"] or 0),
-            "today_roas": round(today_roas, 2),
-            "today_acos_pct": round(today_acos, 1),
-            "today_romi_pct": round(today_romi, 1),
+            # Yesterday
+            "yest_cost_brl": round(yest_cost, 2),
+            "yest_revenue_brl": round(yest_revenue, 2),
+            "yest_units": yest_units,
+            "yest_clicks": int(r["yest_clicks"] or 0),
+            "yest_prints": int(r["yest_prints"] or 0),
+            "yest_roas": round(yest_roas, 2),
+            "yest_acos_pct": round(yest_acos, 1),
+            "yest_romi_pct": round(yest_romi, 1),
             # Share of Voice (avg over window, percent units)
             "impression_share_pct": (
                 round(float(r["impression_share_avg"] or 0) * 100, 1)
