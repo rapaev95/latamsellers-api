@@ -108,7 +108,46 @@ async def aggregate_per_campaign(
                    (SELECT COUNT(*) FROM ml_ad_ads ad
                      WHERE ad.user_id = $1
                        AND ad.advertiser_id = a.advertiser_id
-                       AND ad.campaign_id = a.campaign_id) AS ads_count
+                       AND ad.campaign_id = a.campaign_id) AS ads_count,
+                   -- Average ml_item_quality.score across all ads in this campaign.
+                   -- Items без quality row пропускаются (LEFT JOIN + NULL filter).
+                   (SELECT AVG(q.score)
+                      FROM ml_ad_ads ad
+                      JOIN ml_item_quality q
+                        ON q.user_id = ad.user_id AND q.item_id = ad.item_id
+                     WHERE ad.user_id = $1
+                       AND ad.advertiser_id = a.advertiser_id
+                       AND ad.campaign_id = a.campaign_id
+                       AND q.score IS NOT NULL) AS avg_quality_score,
+                   (SELECT COUNT(*)
+                      FROM ml_ad_ads ad
+                      JOIN ml_item_quality q
+                        ON q.user_id = ad.user_id AND q.item_id = ad.item_id
+                     WHERE ad.user_id = $1
+                       AND ad.advertiser_id = a.advertiser_id
+                       AND ad.campaign_id = a.campaign_id
+                       AND q.score IS NOT NULL) AS quality_sample_n,
+                   -- Total revenue (включая органик) от ВСЕХ items
+                   -- которые рекламируются в этой кампании. Period =
+                   -- target_from..target_to (window). ДРР = ad_cost
+                   -- / items_total_revenue × 100. Это «реальный»
+                   -- impact рекламы — даже органические продажи этих
+                   -- items посчитаны (поскольку ads подняли видимость).
+                   (SELECT COALESCE(SUM(
+                            CASE WHEN it->>'mlb' IN (
+                                 SELECT ad.item_id FROM ml_ad_ads ad
+                                  WHERE ad.user_id = $1
+                                    AND ad.advertiser_id = a.advertiser_id
+                                    AND ad.campaign_id = a.campaign_id
+                            ) THEN COALESCE((it->>'revenue')::numeric, 0) ELSE 0 END
+                          ), 0)
+                      FROM ml_user_orders o,
+                           jsonb_array_elements(o.items) AS it
+                     WHERE o.user_id = $1
+                       AND o.date_created >= $2::timestamp
+                       AND o.date_created < ($3::date + interval '1 day')
+                       AND o.status NOT IN ('cancelled', 'invalid')
+                   ) AS items_total_revenue
               FROM agg a
               LEFT JOIN yesterday_agg t
                 ON t.advertiser_id = a.advertiser_id
@@ -208,6 +247,19 @@ async def aggregate_per_campaign(
                 round(float(r["lost_rank_avg"] or 0) * 100, 1)
                 if r.get("lost_rank_avg") is not None else None
             ),
+            # Listing quality across all ads in this campaign
+            "avg_quality_score": (
+                round(float(r["avg_quality_score"]), 1)
+                if r.get("avg_quality_score") is not None else None
+            ),
+            "quality_sample_n": int(r["quality_sample_n"] or 0),
+            # Items total revenue (organic + ads) для ДРР calculation
+            "items_total_revenue_brl": round(float(r["items_total_revenue"] or 0), 2),
+            "drr_pct": (
+                round(float(r["cost"] or 0) / float(r["items_total_revenue"]) * 100, 1)
+                if r["items_total_revenue"] and float(r["items_total_revenue"]) > 0
+                else None
+            ),
         })
     return out
 
@@ -255,6 +307,8 @@ def _make_recommendation(c: dict[str, Any], lang: str) -> str:
     lost_rank = c.get("lost_share_rank_pct") or 0
     delta_rev = c.get("delta_revenue_pct")
     delta_cost = c.get("delta_cost_pct")
+    avg_q = c.get("avg_quality_score")
+    sample_n = c.get("quality_sample_n") or 0
 
     if lang == "ru":
         prefix = "💡 *Совет:* "
@@ -270,6 +324,22 @@ def _make_recommendation(c: dict[str, Any], lang: str) -> str:
         if lang == "en":
             return prefix + "*losing money* — drop budget to R$1 (history preserved) or raise ROAS target."
         return prefix + "*perdendo dinheiro* — derrube o orçamento p/ R$1 (histórico preservado) ou suba ROAS target."
+
+    # 1.5. Low listing quality — даже идеальный budget/ROAS не помогут если
+    # карточки слабые. ML понижает ad rank, CPC растёт, ROAS падает.
+    if avg_q is not None and avg_q < 75 and sample_n > 0:
+        if lang == "ru":
+            return prefix + f"*качество объявлений {avg_q:.0f}%* — слабые карточки тянут CPC вверх, ROAS вниз. Улучши заголовок/фото/атрибуты."
+        if lang == "en":
+            return prefix + f"*listing quality {avg_q:.0f}%* — weak ads push CPC up, ROAS down. Fix titles/photos/attributes."
+        return prefix + f"*qualidade dos anúncios {avg_q:.0f}%* — anúncios fracos sobem CPC e baixam ROAS. Melhore títulos/fotos/atributos."
+
+    if avg_q is not None and avg_q < 90 and sample_n > 0:
+        if lang == "ru":
+            return prefix + f"качество объявлений *{avg_q:.0f}%* (стоит >90%). Подтяни описание/фото для роста CTR."
+        if lang == "en":
+            return prefix + f"listing quality *{avg_q:.0f}%* (target >90%). Polish descriptions/photos for higher CTR."
+        return prefix + f"qualidade dos anúncios *{avg_q:.0f}%* (alvo >90%). Melhore descrições/fotos para subir CTR."
 
     # 2. ROMI > 100 + lost by budget > 20 — недоинвестирована
     if romi > 100 and lost_budget > 20:
@@ -406,6 +476,52 @@ def _format_card(c: dict[str, Any], lang: str = "pt") -> tuple[str, dict[str, An
         lines.append(f"💼 {l_budget}: {_money(budget)}")
     if roas_target is not None:
         lines.append(f"🎯 {l_target}: {roas_target:.2f}x")
+
+    # Average listing quality across ads in the campaign
+    avg_q = c.get("avg_quality_score")
+    sample_n = c.get("quality_sample_n") or 0
+    if avg_q is not None and sample_n > 0:
+        if avg_q >= 90:
+            q_emoji = "🟢"
+        elif avg_q >= 75:
+            q_emoji = "🟡"
+        else:
+            q_emoji = "🔴"
+        if lang == "ru":
+            lines.append(f"{q_emoji} Качество объявлений (avg): *{avg_q:.0f}%* ({sample_n} объяв.)")
+        elif lang == "en":
+            lines.append(f"{q_emoji} Avg listing quality: *{avg_q:.0f}%* ({sample_n} ads)")
+        else:
+            lines.append(f"{q_emoji} Qualidade média dos anúncios: *{avg_q:.0f}%* ({sample_n} anúncios)")
+
+    # ДРР — Доля Рекламных Расходов = ad_cost / total_items_revenue × 100
+    # Включает органические продажи рекламируемых items (ads увеличили
+    # видимость → часть «органик» тоже от рекламы).
+    drr = c.get("drr_pct")
+    items_total_rev = c.get("items_total_revenue_brl") or 0
+    if drr is not None and items_total_rev > 0:
+        # Color: ДРР > 50% — красный (большая часть выручки уходит в рекламу)
+        if drr <= 15:
+            drr_emoji = "🟢"
+        elif drr <= 30:
+            drr_emoji = "🟡"
+        else:
+            drr_emoji = "🔴"
+        if lang == "ru":
+            lines.append(
+                f"{drr_emoji} ДРР: *{drr:.1f}%* "
+                f"(карточки за 14d принесли {_money(items_total_rev)})"
+            )
+        elif lang == "en":
+            lines.append(
+                f"{drr_emoji} Ad-share-of-revenue: *{drr:.1f}%* "
+                f"(items earned {_money(items_total_rev)} in 14d)"
+            )
+        else:
+            lines.append(
+                f"{drr_emoji} Ad-share-of-revenue: *{drr:.1f}%* "
+                f"(anúncios geraram {_money(items_total_rev)} em 14d)"
+            )
 
     # AI recommendation block — short tactical hint based on metrics.
     rec = _make_recommendation(c, lang)
