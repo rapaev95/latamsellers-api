@@ -5425,6 +5425,22 @@ async def photo_descriptions_get(
     return {"item_id": mlb.upper(), "count": len(descs), "descriptions": descs}
 
 
+@router.post("/reconciliation/dispatch-now")
+async def reconciliation_dispatch_now(
+    threshold: float = Query(50.0, ge=0, le=10000),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Manual trigger weekly reconciliation. Compares fatura ML vs bank_tx
+    и Full Express CSV vs bank_tx за last month + MTD. Если delta > R$X
+    → admin TG alert. Per-month dedup в reconciliation_alert_log.
+    """
+    if pool is None:
+        return {"error": "no_db"}
+    from v2.services import ml_reconciliation_alerts as recon_svc
+    return await recon_svc.reconcile_for_user(pool, user.id, threshold_brl=threshold)
+
+
 @router.post("/ads-summary/dispatch-now")
 async def ads_summary_dispatch_now(
     days: int = Query(14, ge=7, le=90),

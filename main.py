@@ -330,6 +330,25 @@ async def _ai_usage_admin_summary_job() -> None:
         _ml_log.exception("ai_usage admin summary job failed: %s", err)
 
 
+async def _reconciliation_job() -> None:
+    """Weekly Monday 14 UTC = 11 BRT — compare fatura ML vs bank_tx и
+    Full Express CSV vs bank_tx за last completed month + current MTD.
+    Если расхождение > R$50 → admin TG alert per project per source.
+    Idempotent через reconciliation_alert_log (per project/month/source)."""
+    try:
+        from v2.services import ml_reconciliation_alerts as recon_svc
+        pool = await get_pool()
+        if pool is None:
+            return
+        result = await recon_svc.reconcile_all_users(pool)
+        _ml_log.info(
+            "reconciliation tick: users=%s alerts=%s",
+            result.get("users"), result.get("alerts"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("reconciliation job failed: %s", err)
+
+
 async def _ads_summary_job() -> None:
     """Weekly Monday 11:00 UTC = 08:00 BRT — ads recap card per campaign
     (top 10 by revenue, last 14d): spent / sold / revenue / ROAS / ROMI
@@ -1013,6 +1032,17 @@ async def _v2_startup() -> None:
         _retirada_alerts_job,
         CronTrigger(hour=13, minute=30, timezone="UTC"),
         id="retirada_alerts_daily",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Weekly reconciliation — Monday 14:00 UTC = 11:00 BRT. Detects
+    # mismatches: fatura ML totals vs bank_tx[mercadolivre] и Full Express
+    # CSV vs bank_tx[fulfillment]. Alert admin TG если delta > R$50.
+    _ml_scheduler.add_job(
+        _reconciliation_job,
+        CronTrigger(day_of_week="mon", hour=14, minute=0, timezone="UTC"),
+        id="reconciliation_weekly",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
