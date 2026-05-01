@@ -170,9 +170,27 @@ async def generate_descriptions_for_item(
                 )
             except Exception:  # noqa: BLE001
                 pass
+            try:
+                from . import ai_usage_tracker as _tracker
+                await _tracker.log_call(
+                    pool, user_id=user_id, service="photo-descriptions/generate",
+                    model=PHOTO_DESC_MODEL, response_data=None, status_code=r.status_code,
+                    metadata={"item_id": item_id, "pics_count": len(to_process)},
+                )
+            except Exception:  # noqa: BLE001
+                pass
             return {"generated": 0, "cached": len(cached_ids), "skipped": len(to_process),
                     "model": PHOTO_DESC_MODEL, "error": f"openrouter_{r.status_code}"}
         data = r.json()
+        try:
+            from . import ai_usage_tracker as _tracker
+            await _tracker.log_call(
+                pool, user_id=user_id, service="photo-descriptions/generate",
+                model=PHOTO_DESC_MODEL, response_data=data, status_code=200,
+                metadata={"item_id": item_id, "pics_count": len(to_process)},
+            )
+        except Exception:  # noqa: BLE001
+            pass
         content = (data.get("choices") or [{}])[0].get("message", {}).get("content")
         if not isinstance(content, str) or not content.strip():
             return {"generated": 0, "cached": len(cached_ids), "skipped": len(to_process),

@@ -314,6 +314,8 @@ async def _ai_suggest(
     context_block: Optional[str] = None,
     picture_urls: Optional[list[str]] = None,
     photo_descriptions_block: Optional[str] = None,
+    pool: Optional[asyncpg.Pool] = None,
+    user_id: Optional[int] = None,
 ) -> Optional[str]:
     """Generate AI suggestion. Multimodal: passes up to 6 product photos to
     Claude as image_url blocks alongside the textual product context. Without
@@ -390,8 +392,24 @@ async def _ai_suggest(
                 )
             except Exception as err:  # noqa: BLE001
                 log.debug("admin alert failed: %s", err)
+            try:
+                from . import ai_usage_tracker as _tracker
+                await _tracker.log_call(
+                    pool, user_id=user_id, service="questions/ai-suggest",
+                    model=LLM_MODEL, response_data=None, status_code=r.status_code,
+                )
+            except Exception:  # noqa: BLE001
+                pass
             return None
         data = r.json()
+        try:
+            from . import ai_usage_tracker as _tracker
+            await _tracker.log_call(
+                pool, user_id=user_id, service="questions/ai-suggest",
+                model=LLM_MODEL, response_data=data, status_code=200,
+            )
+        except Exception:  # noqa: BLE001
+            pass
         content = (data.get("choices") or [{}])[0].get("message", {}).get("content")
         return content.strip() if isinstance(content, str) else None
     except Exception as err:  # noqa: BLE001
@@ -709,6 +727,7 @@ async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int) -> dict[str, int]
                 http, text, item_title, ctx_block,
                 picture_urls=picture_urls,
                 photo_descriptions_block=photo_descs_block,
+                pool=pool, user_id=user_id,
             ) or "(falha ao gerar sugestão; responda manualmente)"
 
             msg_id = await _tg_send_question(

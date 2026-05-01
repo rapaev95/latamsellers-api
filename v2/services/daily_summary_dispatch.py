@@ -608,6 +608,7 @@ async def _dispatch_for_user(
     async with httpx.AsyncClient() as http:
         narrative = await _build_ai_narrative(
             http, today_metrics, yesterday_metrics, extras, lang,
+            pool=pool, user_id=user_id,
         )
         if narrative:
             try:
@@ -763,6 +764,8 @@ async def _build_ai_narrative(
     yesterday: dict[str, Any],
     extras: dict[str, int],
     language: str,
+    pool: Optional[asyncpg.Pool] = None,
+    user_id: Optional[int] = None,
 ) -> Optional[str]:
     """Returns formatted briefing text, or None if disabled / OpenRouter
     failure (caller falls back to silent — rule-based card still goes)."""
@@ -806,8 +809,24 @@ async def _build_ai_narrative(
                 )
             except Exception:  # noqa: BLE001
                 pass
+            try:
+                from . import ai_usage_tracker as _tracker
+                await _tracker.log_call(
+                    pool, user_id=user_id, service="daily-summary/narrative",
+                    model=NARRATIVE_MODEL, response_data=None, status_code=r.status_code,
+                )
+            except Exception:  # noqa: BLE001
+                pass
             return None
         data = r.json()
+        try:
+            from . import ai_usage_tracker as _tracker
+            await _tracker.log_call(
+                pool, user_id=user_id, service="daily-summary/narrative",
+                model=NARRATIVE_MODEL, response_data=data, status_code=200,
+            )
+        except Exception:  # noqa: BLE001
+            pass
         content = (data.get("choices") or [{}])[0].get("message", {}).get("content")
         return content.strip() if isinstance(content, str) else None
     except Exception as err:  # noqa: BLE001

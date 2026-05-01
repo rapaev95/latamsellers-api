@@ -484,6 +484,8 @@ async def _summarize_complaint(
     target_lang: str = "ru",
     product_price: Optional[float] = None,
     product_currency: str = "BRL",
+    pool: Optional[asyncpg.Pool] = None,
+    user_id: Optional[int] = None,
 ) -> Optional[str]:
     """Use OpenRouter (same model as ml_questions_dispatch) to produce a 2-4
     bullet summary of the buyer's claim message in the seller's language.
@@ -541,8 +543,24 @@ async def _summarize_complaint(
                 )
             except Exception as err:  # noqa: BLE001
                 log.debug("admin alert failed: %s", err)
+            try:
+                from . import ai_usage_tracker as _tracker
+                await _tracker.log_call(
+                    pool, user_id=user_id, service="claims/summarize_complaint",
+                    model=LLM_MODEL, response_data=None, status_code=r.status_code,
+                )
+            except Exception:  # noqa: BLE001
+                pass
             return None
         data = r.json()
+        try:
+            from . import ai_usage_tracker as _tracker
+            await _tracker.log_call(
+                pool, user_id=user_id, service="claims/summarize_complaint",
+                model=LLM_MODEL, response_data=data, status_code=200,
+            )
+        except Exception:  # noqa: BLE001
+            pass
         content = (data.get("choices") or [{}])[0].get("message", {}).get("content")
         text = content.strip() if isinstance(content, str) else None
         if text and not text.startswith("•"):
@@ -1131,6 +1149,7 @@ async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int, app_base_url: str
                         summary = await _summarize_complaint(
                             http, complaint, summary_lang,
                             product_price=price_f,
+                            pool=pool, user_id=user_id,
                         )
                         if summary:
                             async with pool.acquire() as conn:

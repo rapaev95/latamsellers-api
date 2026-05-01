@@ -5358,6 +5358,45 @@ async def photo_descriptions_get(
     return {"item_id": mlb.upper(), "count": len(descs), "descriptions": descs}
 
 
+@router.get("/ai-usage/me")
+async def ai_usage_me(
+    days: int = Query(7, ge=1, le=90),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Per-user OpenRouter usage за last N days. Calls / tokens / cost
+    breakdown по services (questions/claims/news/narrative/photo) и
+    moderation hours."""
+    if pool is None:
+        return {"error": "no_db"}
+    from v2.services import ai_usage_tracker as tracker
+    return await tracker.get_usage_summary(pool, user.id, days=days)
+
+
+@router.get("/ai-usage/admin-all")
+async def ai_usage_admin_all(
+    days: int = Query(7, ge=1, le=90),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Super-admin only — across all users. Auth via LS_ADMIN_TG_CHAT_IDS
+    env (same as admin alerts)."""
+    if pool is None:
+        return {"error": "no_db"}
+    import os as _os
+    admin_ids = _os.environ.get("LS_ADMIN_TG_CHAT_IDS", "").split(",")
+    admin_ids = {c.strip() for c in admin_ids if c.strip()}
+    async with pool.acquire() as conn:
+        chat_id = await conn.fetchval(
+            "SELECT telegram_chat_id FROM notification_settings WHERE user_id = $1",
+            user.id,
+        )
+    if str(chat_id or "") not in admin_ids:
+        return {"error": "not_super_admin"}
+    from v2.services import ai_usage_tracker as tracker
+    return await tracker.get_usage_summary(pool, user_id=None, days=days)
+
+
 @router.get("/notifications/me")
 async def notifications_me_get(
     user: CurrentUser = Depends(current_user),

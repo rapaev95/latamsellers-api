@@ -299,6 +299,20 @@ async def _backfill_all_users_job() -> None:
         _ml_log.exception("ML backfill job failed: %s", err)
 
 
+async def _ai_usage_admin_summary_job() -> None:
+    """Daily 22:00 UTC = 19:00 BRT — fires admin TG alert with last 24h
+    OpenRouter spend (calls + tokens + R$). Helps catch runaway costs
+    early (Sonnet vision на photo descriptions может неожиданно вырасти)."""
+    try:
+        from v2.services import ai_usage_tracker as tracker
+        pool = await get_pool()
+        if pool is None:
+            return
+        await tracker.dispatch_daily_admin_summary(pool)
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("ai_usage admin summary job failed: %s", err)
+
+
 async def _retirada_alerts_job() -> None:
     """Daily Retirada Full alerts. New rows from Relatorio_Tarifas_Full_*.xlsx
     (Descarte = critical, Envio para o endereço = informational) trigger
@@ -932,6 +946,16 @@ async def _v2_startup() -> None:
         _inventory_alerts_job,
         CronTrigger(hour=12, minute=0, timezone="UTC"),
         id="inventory_alerts_daily",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # AI usage admin summary at 22:00 UTC = 19:00 BRT — last 24h spend
+    # totals/by-service to super-admin TG. One row in admin chat per day.
+    _ml_scheduler.add_job(
+        _ai_usage_admin_summary_job,
+        CronTrigger(hour=22, minute=0, timezone="UTC"),
+        id="ai_usage_admin_summary_daily",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

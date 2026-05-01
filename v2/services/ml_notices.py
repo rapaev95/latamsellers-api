@@ -185,6 +185,8 @@ async def _make_news_digest(
     label: str,
     description: str,
     language: str = "pt",
+    pool: asyncpg.Pool | None = None,
+    user_id: int | None = None,
 ) -> str | None:
     """Run Claude Sonnet 4.5 over a raw ML notice → short actionable briefing.
 
@@ -230,8 +232,24 @@ async def _make_news_digest(
                 )
             except Exception:  # noqa: BLE001
                 pass
+            try:
+                from . import ai_usage_tracker as _tracker
+                await _tracker.log_call(
+                    pool, user_id=user_id, service="news/digest",
+                    model=NEWS_DIGEST_MODEL, response_data=None, status_code=r.status_code,
+                )
+            except Exception:  # noqa: BLE001
+                pass
             return None
         data = r.json()
+        try:
+            from . import ai_usage_tracker as _tracker
+            await _tracker.log_call(
+                pool, user_id=user_id, service="news/digest",
+                model=NEWS_DIGEST_MODEL, response_data=data, status_code=200,
+            )
+        except Exception:  # noqa: BLE001
+            pass
         content = (data.get("choices") or [{}])[0].get("message", {}).get("content")
         return content.strip() if isinstance(content, str) else None
     except Exception as err:  # noqa: BLE001
@@ -451,6 +469,7 @@ async def _dispatch_to_telegram(
         ):
             digest = await _make_news_digest(
                 http, row["label"] or "", row["description"] or "", language,
+                pool=pool, user_id=user_id,
             )
             if digest:
                 description_to_use = digest
