@@ -374,29 +374,104 @@ async def _enrich_order_with_margin(
 
     # Paused-with-stock — товары которые юзер либо сам поставил на паузу,
     # либо ML модерация, но stock реально есть. Это «мёртвый Full капитал»
-    # без трафика. В TG показываем top-3 + ссылку на UI-страничку
-    # /escalar/activate/{id} — там cookie-auth → кнопка «Ativar» → POST
-    # /escalar/items/{id}/activate (как все остальные endpoint'ы).
+    # без трафика.
+    #
+    # User feedback: list повторялся в КАЖДОЙ продаже + showed items
+    # которые user уже активировал (cache stale). Два fix'а:
+    #   1. Live batch verify статуса через GET /items?ids=... (top-5
+    #      candidates → keep only тех кто реально paused в ML).
+    #   2. Per-day dedup через paused_alert_log — один item не показывается
+    #      повторно в течение 24h.
     try:
         import os as _os_pws
         _app_base_pws = _os_pws.environ.get("APP_BASE_URL", "https://app.lsprofit.app").rstrip("/")
+        # ensure dedup log table
         async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paused_alert_log (
+                  user_id INTEGER NOT NULL,
+                  item_id TEXT NOT NULL,
+                  alerted_at TIMESTAMPTZ DEFAULT NOW(),
+                  PRIMARY KEY (user_id, item_id)
+                );
+                """
+            )
             paused_rows = await conn.fetch(
                 """
-                SELECT item_id, available_quantity, sold_quantity, title
-                  FROM ml_user_items
-                 WHERE user_id = $1
-                   AND status = 'paused'
-                   AND available_quantity > 0
-                 ORDER BY available_quantity DESC, sold_quantity DESC
-                 LIMIT 3
+                SELECT i.item_id, i.available_quantity, i.sold_quantity, i.title
+                  FROM ml_user_items i
+                  LEFT JOIN paused_alert_log p
+                    ON p.user_id = i.user_id AND p.item_id = i.item_id
+                 WHERE i.user_id = $1
+                   AND i.status = 'paused'
+                   AND i.available_quantity > 0
+                   AND (p.alerted_at IS NULL
+                        OR p.alerted_at < NOW() - INTERVAL '24 hours')
+                 ORDER BY i.available_quantity DESC, i.sold_quantity DESC
+                 LIMIT 5
                 """,
                 user_id,
             )
         if paused_rows:
+            # Live batch verify status — cache может быть устаревшим (24h
+            # sync), пользователь мог уже активировать через UI.
+            candidate_ids = [str(r["item_id"]) for r in paused_rows]
+            confirmed_paused: set[str] = set()
+            try:
+                from . import ml_oauth as _oauth
+                token, _exp, _ = await _oauth.get_valid_access_token(pool, user_id)
+                import httpx
+                async with httpx.AsyncClient() as _http:
+                    ids_param = ",".join(candidate_ids[:5])
+                    url = (
+                        f"https://api.mercadolibre.com/items"
+                        f"?ids={ids_param}&attributes=id,status"
+                    )
+                    r = await _http.get(
+                        url,
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=10.0,
+                    )
+                    if r.status_code < 400:
+                        live_data = r.json() or []
+                        live_active_ids: set[str] = set()
+                        for entry in live_data:
+                            body = (entry or {}).get("body") or entry
+                            if not isinstance(body, dict):
+                                continue
+                            iid = str(body.get("id") or "")
+                            if not iid:
+                                continue
+                            live_status = str(body.get("status") or "").lower()
+                            if live_status == "paused":
+                                confirmed_paused.add(iid.upper())
+                            elif live_status == "active":
+                                live_active_ids.add(iid.upper())
+                        # Sync cache: items которые seller уже активировал
+                        # → update ml_user_items.status чтобы будущие
+                        # запросы не извлекали их.
+                        if live_active_ids:
+                            async with pool.acquire() as _conn2:
+                                await _conn2.execute(
+                                    """
+                                    UPDATE ml_user_items
+                                       SET status = 'active'
+                                     WHERE user_id = $1
+                                       AND item_id = ANY($2::text[])
+                                    """,
+                                    user_id, list(live_active_ids),
+                                )
+            except Exception as err:  # noqa: BLE001
+                log.debug("paused-with-stock live verify failed: %s", err)
+                # Fallback — без live check используем cache statuses
+                confirmed_paused = {str(r["item_id"]).upper() for r in paused_rows}
+
             paused_list: list[dict] = []
             for pr in paused_rows:
-                pid = str(pr["item_id"])
+                pid = str(pr["item_id"]).upper()
+                if pid not in confirmed_paused:
+                    continue
                 paused_list.append({
                     "item_id": pid,
                     "stock": int(pr["available_quantity"] or 0),
@@ -404,7 +479,24 @@ async def _enrich_order_with_margin(
                     "title": pr["title"] or "",
                     "activate_url": f"{_app_base_pws}/escalar/activate/{pid}",
                 })
-            enriched["_paused_with_stock"] = paused_list
+                if len(paused_list) >= 3:
+                    break
+
+            if paused_list:
+                # Mark as alerted — UPSERT alerted_at = NOW() для каждого
+                # показанного item, чтобы 24h dedup сработал.
+                async with pool.acquire() as conn:
+                    for p in paused_list:
+                        await conn.execute(
+                            """
+                            INSERT INTO paused_alert_log (user_id, item_id, alerted_at)
+                            VALUES ($1, $2, NOW())
+                            ON CONFLICT (user_id, item_id) DO UPDATE
+                              SET alerted_at = NOW()
+                            """,
+                            user_id, p["item_id"],
+                        )
+                enriched["_paused_with_stock"] = paused_list
     except Exception as err:  # noqa: BLE001
         log.debug("paused-with-stock enrich failed: %s", err)
 
