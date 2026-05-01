@@ -330,9 +330,16 @@ async def send_notice(
     # Filter cancelled/invalid orders — TG-noise. Запись в ml_notices остаётся
     # для аналитики, но в Telegram не отправляется.
     tags = notice.get("tags") or []
-    if isinstance(tags, list) and "CANCELLED" in tags:
-        log.info("send_notice skipping cancelled %s", notice.get("notice_id"))
-        return False
+    if isinstance(tags, list):
+        if "CANCELLED" in tags:
+            log.info("send_notice skipping cancelled %s", notice.get("notice_id"))
+            return False
+        # SKIP_TG = enrichment failure (R$ 0,00 unknown placeholder).
+        # БД row остаётся, TG молчит. Backfill сcron часто такие видит для
+        # старых orders где ML вернул empty payload.
+        if "SKIP_TG" in tags:
+            log.info("send_notice skipping enrichment-failed %s", notice.get("notice_id"))
+            return False
 
     label = notice.get("label") or ""
     description = notice.get("description") or ""

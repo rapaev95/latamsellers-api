@@ -2955,6 +2955,10 @@ class _ItemPriceShiftIn(__import__("pydantic").BaseModel):
     # пользователь думает в терминах sale_price которую он только что увидел.
     base: Optional[str] = "sale"
     sale_price: Optional[float] = None  # обязательно если base="sale"
+    # Если true — сначала DELETE pricing-automation для item, потом PUT
+    # /items {price}. Используется когда predыдущий вызов вернул
+    # needs_dyn_confirm и user подтвердил через TG-кнопку sdyn:.
+    disable_dyn: Optional[bool] = False
 
 
 @router.post("/items/price-shift")
@@ -3009,8 +3013,65 @@ async def items_price_shift(
         return {"error": "non_positive_price",
                 "base_price": base_price, "attempted": new_price}
 
-    try:
-        async with httpx.AsyncClient() as http:
+    dyn_disabled = False
+    async with httpx.AsyncClient() as http:
+        # Optional preflight: disable Dynamic Pricing if user confirmed via
+        # TG button. Saves prev rule into ml_user_pricing_history.
+        if body.disable_dyn:
+            try:
+                gar = await http.get(
+                    f"https://api.mercadolibre.com/pricing-automation/items/{mlb}/automation",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=15.0,
+                )
+                if gar.status_code == 200:
+                    cur_auto = gar.json() or {}
+                    rule = (cur_auto.get("item_rule") or {}).get("rule_id") or "INT_EXT"
+                    try:
+                        min_p = float(cur_auto.get("min_price") or 0)
+                    except (TypeError, ValueError):
+                        min_p = 0.0
+                    try:
+                        max_p = float(cur_auto.get("max_price") or 0)
+                    except (TypeError, ValueError):
+                        max_p = 0.0
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS ml_user_pricing_history (
+                              user_id INTEGER NOT NULL,
+                              item_id TEXT NOT NULL,
+                              rule_id TEXT,
+                              min_price NUMERIC,
+                              max_price NUMERIC,
+                              raw JSONB,
+                              disabled_at TIMESTAMPTZ DEFAULT NOW()
+                            );
+                            """
+                        )
+                        await conn.execute(
+                            """
+                            INSERT INTO ml_user_pricing_history
+                              (user_id, item_id, rule_id, min_price, max_price, raw)
+                            VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                            """,
+                            body.user_id, mlb, rule, min_p, max_p,
+                            json.dumps(cur_auto, default=str),
+                        )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                dr = await http.delete(
+                    f"https://api.mercadolibre.com/pricing-automation/items/{mlb}/automation",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=15.0,
+                )
+                if dr.status_code in (200, 204, 404):
+                    dyn_disabled = True
+            except Exception as err:  # noqa: BLE001
+                return {"error": "ml_dyn_disable_failed", "detail": str(err)}
+
+        try:
             pr = await http.put(
                 item_url,
                 json={"price": new_price},
@@ -3020,12 +3081,25 @@ async def items_price_shift(
                 },
                 timeout=15.0,
             )
-    except Exception as err:  # noqa: BLE001
-        return {"error": "ml_price_update_failed", "detail": str(err)}
+        except Exception as err:  # noqa: BLE001
+            return {"error": "ml_price_update_failed", "detail": str(err)}
     if pr.status_code >= 400:
+        # Detect Dynamic Pricing block — return needs_dyn_confirm so TG
+        # webhook can render confirmation prompt instead of an error toast.
+        if pr.status_code == 400 and "item.price.not_modifiable" in (pr.text or ""):
+            return {
+                "ok": False,
+                "needs_dyn_confirm": True,
+                "reason": "dynamic_pricing_active",
+                "item_id": mlb,
+                "old_price": base_price,
+                "attempted_new_price": new_price,
+                "delta_pct": float(body.delta_pct),
+            }
         return {"error": "ml_price_update_rejected",
                 "status": pr.status_code, "detail": pr.text[:300],
-                "old_price": base_price, "attempted_new_price": new_price}
+                "old_price": base_price, "attempted_new_price": new_price,
+                "dyn_disabled": dyn_disabled}
 
     return {
         "ok": True,
@@ -3034,6 +3108,7 @@ async def items_price_shift(
         "new_price": new_price,
         "delta_pct": float(body.delta_pct),
         "base": body.base or "sale",
+        "dyn_disabled": dyn_disabled,
     }
 
 
@@ -3200,7 +3275,23 @@ async def orders_notice_from_webhook(
 
     # If we expected a margin block (item is in cache + sale_price>0) but it
     # didn't end up in the rendered notice — that's a regression worth alerting.
-    if topic in ("orders_v2", "orders") and not has_margin_block:
+    # Skip if cancelled (no margin expected) or if status was missing
+    # entirely (enrichment failure, not regression).
+    notice_tags_for_alert = notice.get("tags") or []
+    if isinstance(notice_tags_for_alert, list):
+        notice_tags_set = {str(t).upper() for t in notice_tags_for_alert}
+    else:
+        notice_tags_set = set()
+    skip_alert = (
+        "CANCELLED" in notice_tags_set
+        or "INVALID" in notice_tags_set
+        or enrichment_status == "no_margin_in_cache"  # known cause, no need to alert
+    )
+    if (
+        topic in ("orders_v2", "orders")
+        and not has_margin_block
+        and not skip_alert
+    ):
         try:
             from v2.services import tg_admin_alerts as _alerts
             await _alerts.send_admin_alert(
@@ -3208,7 +3299,7 @@ async def orders_notice_from_webhook(
                 detail=(
                     f"user={body.user_id} resource={resource}\n"
                     f"enrichment={enrichment_status}\n"
-                    f"tags={notice.get('tags')}\n"
+                    f"tags={notice_tags_for_alert}\n"
                     f"Means: ml_item_margin_cache miss for item, OR no sale_price, OR normalize regression."
                 ),
                 severity="warn",

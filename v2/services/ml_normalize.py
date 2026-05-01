@@ -48,6 +48,24 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
     if topic in ("orders_v2", "orders"):
         total = enriched.get("total_amount") or enriched.get("paid_amount") or enriched.get("transaction_amount")
         status = str(enriched.get("status") or "unknown")
+        # Enrichment failure: ML API вернул empty/partial payload и у нас
+        # нет ни items, ни buyer, ни total. Backfill cron часто такой видит
+        # для очень старых orders. Возвращаем placeholder со SKIP_TG тэгом
+        # — TG не отправит, БД-запись остаётся для аналитики.
+        items_check = enriched.get("order_items") or enriched.get("items") or []
+        if (
+            status.lower() == "unknown"
+            and (not total or float(total or 0) == 0)
+            and not items_check
+        ):
+            return {
+                **base,
+                "label": f"Pedido placeholder (sem dados)",
+                "description": "Enrichment não retornou order details (ML API empty/stale).",
+                "from_date": enriched.get("date_created") or enriched.get("last_updated"),
+                "tags": ["ORDERS", "SKIP_TG", "ENRICHMENT_FAILED"],
+                "actions": [],
+            }
         # Skip cancelled/invalid — это не реальная продажа, бесполезный TG-noise.
         # ml_notices хранит запись для аналитики, но label/description короткий
         # без кнопок (telegram_notify не отправит keyboard если sale_price = 0).
