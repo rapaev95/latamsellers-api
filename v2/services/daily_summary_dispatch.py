@@ -50,7 +50,9 @@ BRT = timezone(timedelta(hours=-3))
 
 _MD_ESCAPE = str.maketrans({c: f"\\{c}" for c in r"_*[]()~`>#+-=|{}.!"})
 _MD_CODE_ESCAPE = str.maketrans({"`": "\\`", "\\": "\\\\"})
-_MD2_UNESCAPE_RE = re.compile(r"\\([_*\[\]()~`>#+\-=|{}.!\\])")
+# Plain-text fallback: strip *all* MD2 escapes including legacy \$ from
+# pre-fix _fmt_brl (now removed).
+_MD2_UNESCAPE_RE = re.compile(r"\\([_*\[\]()~`>#+\-=|{}.!\\$])")
 
 
 def _esc(text: Any) -> str:
@@ -263,13 +265,17 @@ def _diff_pp(today: float, yesterday: float) -> float:
 # ── TG card builder ────────────────────────────────────────────────
 
 def _fmt_brl(amount: float) -> str:
-    """Format float as 'R$ 1.234,56' BRL convention."""
+    """Format float as 'R$ 1.234,56' BRL convention.
+
+    NB: '$' is NOT a Telegram MD2 reserved char (per Bot API spec the
+    escape list is only _*[]()~`>#+-=|{}.!). Раньше escape был — это
+    давало seller'у визуальный мусор «R\\$» в plain-fallback. Убираем."""
     if amount == 0:
-        return "R\\$ 0"
+        return "R$ 0"
     s = f"{amount:,.2f}"
     # ML/BR convention: thousand=',' → '.'; decimal='.' → ','. Two-step swap.
     s = s.replace(",", "X").replace(".", ",").replace("X", ".")
-    return f"R\\$ {s}"
+    return f"R$ {s}"
 
 
 def _fmt_int(n: int) -> str:
