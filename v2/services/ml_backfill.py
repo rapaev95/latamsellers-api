@@ -328,6 +328,27 @@ async def _enrich_order_with_margin(
         )
         if be_state:
             enriched["_breakeven"] = be_state
+            # Workaround для устаревшего ml_user_items.available_quantity:
+            # cache синкается раз в 24ч, поэтому 2 продажи подряд показывают
+            # одинаковый stock. Декрементируем cache на qty при first-time
+            # обработке order'а (deduplicated=False — видим этот order
+            # впервые в breakeven_sale_log). Live ML API заменит этот
+            # workaround когда мы интегрируем /full-fulfillment-stock.
+            if not be_state.get("deduplicated") and order_id_for_dedup and qty > 0:
+                try:
+                    async with pool.acquire() as inv_conn:
+                        await inv_conn.execute(
+                            """
+                            UPDATE ml_user_items
+                               SET available_quantity = GREATEST(
+                                     COALESCE(available_quantity, 0) - $3, 0
+                                   )
+                             WHERE user_id = $1 AND item_id = $2
+                            """,
+                            user_id, item_id, qty,
+                        )
+                except Exception as err:  # noqa: BLE001
+                    log.debug("stock decrement failed item=%s: %s", item_id, err)
     except Exception as err:  # noqa: BLE001
         log.debug("breakeven update failed for project=%s: %s", project, err)
 
