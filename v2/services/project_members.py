@@ -519,6 +519,51 @@ async def accept_invitation(
     }
 
 
+# ── Effective tiers (paywall inheritance) ────────────────────────────────
+
+
+async def get_effective_tiers(pool: asyncpg.Pool, user_id: int) -> list[str]:
+    """All paywall tiers this user effectively has access to.
+
+    Effective = own user.tiers ∪ tiers inherited from project memberships
+    (the inviter/owner of each project the user is a member of contributes
+    their tiers to the member's effective set).
+
+    Rationale: an invited collaborator should see the paywall-gated sections
+    that the project owner has paid for. Without inheritance the invited user
+    has tiers=[] and PaywallGate blocks them out of every section, making
+    the team feature useless.
+
+    Note: this is a paywall-feature gate, not a data-scope gate. Owner-only
+    data filters (uploads.user_id, etc.) still restrict what the member
+    actually sees inside a section.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            WITH own_tiers AS (
+              SELECT jsonb_array_elements_text(COALESCE(tiers, '[]'::jsonb)) AS t
+                FROM users
+               WHERE id = $1
+            ),
+            inherited AS (
+              SELECT jsonb_array_elements_text(COALESCE(u.tiers, '[]'::jsonb)) AS t
+                FROM project_members m
+                JOIN users u ON u.id = m.invited_by
+               WHERE m.user_id = $1 AND m.accepted_at IS NOT NULL
+            )
+            SELECT DISTINCT t FROM (
+              SELECT t FROM own_tiers
+              UNION ALL
+              SELECT t FROM inherited
+            ) AS combined
+             WHERE t IS NOT NULL AND t <> ''
+            """,
+            user_id,
+        )
+    return [r["t"] for r in rows]
+
+
 # ── Permission helpers ───────────────────────────────────────────────────
 
 

@@ -106,12 +106,32 @@ def _is_admin(user: CurrentUser) -> bool:
 
 def require_tier(tier: str):
     """FastAPI dependency factory enforcing a per-feature tier.
-    Admins bypass; non-tiered users get 403 with a paywall payload."""
-    async def _dep(user: CurrentUser = Depends(current_user)) -> CurrentUser:
+    Admins bypass; non-tiered users get 403 with a paywall payload.
+
+    Inherits tiers via project memberships: a user who's been invited to a
+    project owned by someone with `tier` also passes. Falls back to own
+    tiers only if the membership lookup hiccups.
+    """
+    async def _dep(
+        user: CurrentUser = Depends(current_user),
+        pool=Depends(get_pool),
+    ) -> CurrentUser:
         if _is_admin(user):
             return user
         if tier in user.tiers:
             return user
+        if pool is not None:
+            try:
+                # Late import — project_members imports asyncpg-typed pool;
+                # avoids circular dep at module load.
+                from v2.services import project_members as _pm_svc
+                effective = await _pm_svc.get_effective_tiers(pool, user.id)
+                if tier in effective:
+                    return user
+            except Exception:
+                # If membership query fails, deny just like before — caller
+                # already saw the bare tier check fail.
+                pass
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "tier_required", "tier": tier},
