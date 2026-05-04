@@ -28,26 +28,21 @@ log = logging.getLogger("ml-ads")
 
 ML_BASE = "https://api.mercadolibre.com"
 
-# One canonical metric list for all queries — keep every column populated so
-# the cache matches what the docs promise, regardless of which UI tab the
-# user opens next.
-#
-# Share-of-voice family (impression_share/top_*/lost_*/acos_benchmark) are
-# available на campaign Detail endpoint (single campaign GET) per file
-# ADS-PRODUCT-ML.js line 351. Bulk campaigns endpoint may reject some of
-# these — keep them в FULL list, ML просто опустит unknown в response.
+# One canonical metric list for /campaigns/search и /campaigns/{id} с
+# aggregation_type=DAILY. Оба за кулисами идут в `campaigns_metrics`
+# endpoint, который НЕ принимает SoV-семейство (impression_share/top_*/
+# lost_*/acos_benchmark) — ML возвращает 400 «Field IMPRESSION_SHARE not
+# allowed at endpoint campaigns_metrics», даже несмотря на то что доки
+# (ADS-PRODUCT-ML.js:351) их обещают для Campaign Detail. SoV доступен
+# только на single-campaign GET без DAILY aggregation — отдельный
+# fetcher на будущее, если понадобится; пока summary рисует SoV-секцию
+# null'ами и UI их не показывает.
 ML_METRICS_FULL = ",".join([
     "clicks", "prints", "ctr", "cost", "cpc", "acos", "roas", "cvr", "sov",
     "direct_amount", "indirect_amount", "total_amount",
     "direct_units_quantity", "indirect_units_quantity", "units_quantity",
     "direct_items_quantity", "indirect_items_quantity", "advertising_items_quantity",
     "organic_units_quantity", "organic_units_amount", "organic_items_quantity",
-    # Share of Voice / impression-share family — для seller'ского UI
-    # «exibido vs concorrência / não exibido por orçamento / não exibido
-    # por classificação». ML returns 0..1 fractions (we render as %).
-    "impression_share", "top_impression_share",
-    "lost_impression_share_by_budget", "lost_impression_share_by_ad_rank",
-    "acos_benchmark",
 ])
 
 # Ad-level response drops ctr/cvr/roas/sov — keeping its list separate avoids
