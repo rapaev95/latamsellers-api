@@ -599,3 +599,70 @@ def can_delete_record(
     if record_created_at is None:
         return False
     return record_created_at >= eff
+
+
+async def enforce_caller_can_delete(
+    pool: asyncpg.Pool,
+    *,
+    caller_id: int,
+    caller_role: str,
+    record_owner_id: Optional[int],
+    record_project_name: Optional[str],
+    record_created_at: Optional[datetime],
+) -> None:
+    """Generic delete-time gate for project-scoped records (uploads,
+    manual_usd_inflows, planned_payments, …). Raises HTTPException if the
+    caller is not allowed to delete this record. Returns None on success.
+
+    Decision tree:
+      1. Caller is the record owner (record_owner_id == caller_id) → allow.
+      2. Caller is admin/superadmin → allow.
+      3. Record has no project_name (legacy) → only owner could delete it
+         (covered by #1) — anyone else gets 403.
+      4. Caller is a member of the record's project:
+         a. role=viewer → 403 (viewer is read-only).
+         b. role=analyst/admin → check effective_from cut-off.
+      5. Caller has no relationship to the record → 403.
+
+    Raising here (instead of returning bool) keeps route handlers compact —
+    the handler only writes the happy path after `await enforce_caller_can_delete(...)`.
+    """
+    from fastapi import HTTPException, status
+
+    # 1. Owner bypass.
+    if record_owner_id is not None and record_owner_id == caller_id:
+        return
+
+    # 2. Admin / superadmin bypass.
+    if caller_role in ("admin", "superadmin"):
+        return
+
+    # 3. Legacy record (no project) — non-owners cannot touch it.
+    if not record_project_name:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "not_authorized", "reason": "legacy_record_no_project"},
+        )
+
+    # 4. Member path.
+    membership = await get_membership(pool, caller_id, record_project_name)
+    if membership is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "not_a_project_member", "project": record_project_name},
+        )
+    if membership["role"] == "viewer":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "viewer_cannot_delete"},
+        )
+    if not can_delete_record(record_created_at, membership):
+        eff = membership.get("effective_from")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "before_membership_cutoff",
+                "effective_from": eff.isoformat() if eff else None,
+                "record_created_at": record_created_at.isoformat() if record_created_at else None,
+            },
+        )

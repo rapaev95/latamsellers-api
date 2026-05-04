@@ -1666,22 +1666,47 @@ async def delete_upload(
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ) -> dict[str, Any]:
-    """Delete a single upload row owned by the caller."""
+    """Delete a single upload row.
+
+    Authz: owners (uploads.user_id == caller) and admins always pass. Project
+    members of the upload's project pass if their role is at least analyst
+    AND the upload was created on/after their effective_from cut-off. See
+    project_members.enforce_caller_can_delete for the full decision tree.
+    """
     if pool is None:
         raise HTTPException(status_code=503, detail="db_unavailable")
 
     from v2.legacy.reports import invalidate_vendas_cache, invalidate_mlb_to_sku_index
+    from v2.services import project_members as pm_svc
 
-    # Peek at source_key before delete so we know whether to invalidate vendas cache.
-    target = await uploads_storage.get_file(pool, user.id, upload_id)
-    ok = await uploads_storage.delete_file(pool, user.id, upload_id)
+    # Load the row first — the authz check needs owner_id, project_name and
+    # created_at, not just an existence probe.
+    target = await uploads_storage.get_file_by_id(pool, upload_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="upload_not_found")
+
+    # Raises 403 with a structured detail if the caller can't delete this row.
+    await pm_svc.enforce_caller_can_delete(
+        pool,
+        caller_id=user.id,
+        caller_role=user.role,
+        record_owner_id=target.user_id,
+        record_project_name=target.project_name,
+        record_created_at=target.created_at,
+    )
+
+    ok = await uploads_storage.delete_file_by_id(pool, upload_id)
     if not ok:
         raise HTTPException(status_code=404, detail="upload_not_found")
 
-    if target is not None and target.source_key == "vendas_ml":
-        invalidate_vendas_cache(user.id)
-    if target is not None and target.source_key in ("vendas_ml", "stock_full"):
-        invalidate_mlb_to_sku_index(user.id)
+    # Invalidate caches under the OWNER's id, not the caller — caches key by
+    # the user_id that originally produced the upload, so a member's delete
+    # must clear the owner's cache too.
+    cache_user = target.user_id if target.user_id is not None else user.id
+    if target.source_key == "vendas_ml":
+        invalidate_vendas_cache(cache_user)
+    if target.source_key in ("vendas_ml", "stock_full"):
+        invalidate_mlb_to_sku_index(cache_user)
 
     return {"deleted": True}
 
