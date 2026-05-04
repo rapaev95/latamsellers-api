@@ -196,6 +196,68 @@ async def list_sources(pool: asyncpg.Pool, user_id: int) -> dict[str, int]:
     return {r["source_key"] or "": int(r["n"]) for r in rows}
 
 
+async def list_sources_for_project(
+    pool: asyncpg.Pool, user_ids: list[int], project_name: str,
+) -> dict[str, int]:
+    """Count of files per source_key, scoped to `project_name` and any of
+    `user_ids`. Used by team members reading the project owner's uploads."""
+    if not user_ids:
+        return {}
+    await ensure_project_name_column(pool)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT source_key, COUNT(*) AS n
+            FROM uploads
+            WHERE user_id = ANY($1::int[])
+              AND project_name = $2
+              AND file_bytes IS NOT NULL
+            GROUP BY source_key
+            """,
+            user_ids, project_name,
+        )
+    return {r["source_key"] or "": int(r["n"]) for r in rows}
+
+
+async def fetch_files_for_project(
+    pool: asyncpg.Pool,
+    user_ids: list[int],
+    source_key: str,
+    project_name: str,
+) -> list[StoredFile]:
+    """Files for `(source_key, project_name)` owned by any of `user_ids`."""
+    if not user_ids:
+        return []
+    await ensure_project_name_column(pool)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, filename, source_key, content_sha256,
+                   file_bytes, created_at, project_name
+              FROM uploads
+             WHERE user_id = ANY($1::int[])
+               AND source_key = $2
+               AND project_name = $3
+               AND file_bytes IS NOT NULL
+             ORDER BY created_at DESC
+            """,
+            user_ids, source_key, project_name,
+        )
+    return [
+        StoredFile(
+            id=r["id"],
+            user_id=r["user_id"],
+            filename=r["filename"] or "",
+            source_key=r["source_key"] or "",
+            content_sha256=r["content_sha256"] or "",
+            file_bytes=bytes(r["file_bytes"]) if r["file_bytes"] is not None else b"",
+            created_at=r["created_at"],
+            project_name=r["project_name"],
+        )
+        for r in rows
+    ]
+
+
 async def delete_file(pool: asyncpg.Pool, user_id: int, upload_id: int) -> bool:
     """Delete a single upload row owned by `user_id`. Returns True if deleted.
 

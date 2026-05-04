@@ -1477,15 +1477,55 @@ def list_upload_sources(user: CurrentUser = Depends(current_user)) -> dict[str, 
 
 @router.get("/uploads", response_model=UploadsListOut)
 async def list_uploads(
+    project: Optional[str] = Query(None, description="Filter to a single project; "
+                                                       "team members see the project owner's uploads"),
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ) -> dict[str, Any]:
-    """List per-user uploads grouped by source_key, newest first within group."""
+    """List uploads grouped by source_key, newest first within group.
+
+    Without `project`: returns the caller's own uploads (legacy behaviour).
+    With `project`: returns uploads tagged with that project_name owned by
+    anyone whose data is visible to the caller within the project — that
+    is, the caller themselves plus the inviter(s) for accepted memberships.
+    """
     if pool is None:
         raise HTTPException(status_code=503, detail="db_unavailable")
 
+    project_filter = (project or "").strip() or None
+
+    if project_filter:
+        from v2.services import project_members as pm_svc
+        user_ids = await pm_svc.get_visible_user_ids(pool, user.id, project_filter)
+        source_counts = await uploads_storage.list_sources_for_project(
+            pool, user_ids, project_filter,
+        )
+        groups: list[dict[str, Any]] = []
+        total = 0
+        for source_key, count in sorted(source_counts.items()):
+            files = await uploads_storage.fetch_files_for_project(
+                pool, user_ids, source_key, project_filter,
+            )
+            items = [
+                {
+                    "id": f.id,
+                    "filename": f.filename,
+                    "size_bytes": len(f.file_bytes),
+                    "created_at": f.created_at.isoformat() if f.created_at else "",
+                }
+                for f in files
+            ]
+            groups.append({
+                "source_key": source_key or "",
+                "count": count,
+                "items": items,
+            })
+            total += count
+        return {"sources": groups, "total_count": total}
+
+    # Default — owner-only scope
     source_counts = await uploads_storage.list_sources(pool, user.id)
-    groups: list[dict[str, Any]] = []
+    groups = []
     total = 0
     for source_key, count in sorted(source_counts.items()):
         files = await uploads_storage.fetch_files_by_source(pool, user.id, source_key)

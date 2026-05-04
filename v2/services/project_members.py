@@ -522,6 +522,44 @@ async def accept_invitation(
 # ── Effective tiers (paywall inheritance) ────────────────────────────────
 
 
+async def get_visible_user_ids(
+    pool: asyncpg.Pool, caller_id: int, project_name: str,
+) -> list[int]:
+    """Whose data is visible to `caller_id` within `project_name`.
+
+    Always includes the caller's own user_id. If the caller is an accepted
+    member of the project, also includes every owner who invited them
+    (project_members.invited_by). Members can in theory be invited by
+    multiple owners to the same project key — we return all distinct
+    inviter ids.
+
+    Used by read-routes that want to scope queries to "rows visible to me
+    within this project" — e.g. `WHERE user_id = ANY($visible_ids)`.
+
+    Caller-only result (no membership) is intentional — non-members and
+    non-owners get just their own uploads; the existing user_id-scoping
+    keeps tenant isolation.
+    """
+    visible: list[int] = [caller_id]
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT invited_by
+              FROM project_members
+             WHERE user_id = $1
+               AND project_name = $2
+               AND accepted_at IS NOT NULL
+               AND invited_by IS NOT NULL
+            """,
+            caller_id, project_name,
+        )
+    for r in rows:
+        owner_id = r["invited_by"]
+        if owner_id and owner_id not in visible:
+            visible.append(owner_id)
+    return visible
+
+
 async def get_effective_tiers(pool: asyncpg.Pool, user_id: int) -> list[str]:
     """All paywall tiers this user effectively has access to.
 
