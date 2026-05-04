@@ -3129,10 +3129,31 @@ async def delete_manual_inflow(
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ) -> dict[str, Any]:
-    """Delete a manual inflow by id (caller must own it)."""
+    """Delete a manual inflow by id.
+
+    Authz: owners and admins always pass. Project members of the inflow's
+    project pass if their role is at least analyst AND the row was created
+    on/after their effective_from cut-off (project_members.enforce_caller_can_delete).
+    """
     if pool is None:
         raise HTTPException(status_code=503, detail="db_unavailable")
-    ok = await manual_inflows_svc.delete(pool, inflow_id=inflow_id, user_id=user.id)
+
+    from v2.services import project_members as pm_svc
+
+    target = await manual_inflows_svc.get_by_id(pool, inflow_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="inflow_not_found")
+
+    await pm_svc.enforce_caller_can_delete(
+        pool,
+        caller_id=user.id,
+        caller_role=user.role,
+        record_owner_id=target.user_id,
+        record_project_name=target.project_name,
+        record_created_at=target.created_at,
+    )
+
+    ok = await manual_inflows_svc.delete_by_id(pool, inflow_id)
     if not ok:
         raise HTTPException(status_code=404, detail="inflow_not_found")
     return {"deleted": True, "id": inflow_id}

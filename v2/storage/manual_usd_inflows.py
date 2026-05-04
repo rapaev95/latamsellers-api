@@ -48,6 +48,7 @@ class ManualInflow:
     note: str
     created_at: datetime
     updated_at: datetime
+    project_name: Optional[str] = None  # NULL = legacy row, owner-only
 
 
 _CREATE_STATEMENTS = [
@@ -60,11 +61,15 @@ _CREATE_STATEMENTS = [
       brl_paid NUMERIC(15, 2) NOT NULL CHECK (brl_paid > 0),
       source TEXT NOT NULL DEFAULT 'Manual',
       note TEXT NOT NULL DEFAULT '',
+      project_name TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
     """,
+    # Lazy add for tables that pre-date the project_name column.
+    "ALTER TABLE manual_usd_inflows ADD COLUMN IF NOT EXISTS project_name TEXT",
     "CREATE INDEX IF NOT EXISTS idx_manual_usd_inflows_user_date ON manual_usd_inflows(user_id, date DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_manual_usd_inflows_project ON manual_usd_inflows(project_name, user_id) WHERE project_name IS NOT NULL",
 ]
 
 
@@ -88,6 +93,7 @@ def _row_to_dataclass(row: asyncpg.Record) -> ManualInflow:
         note=row["note"] or "",
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        project_name=row["project_name"] if "project_name" in row.keys() else None,
     )
 
 
@@ -98,7 +104,7 @@ async def list_for_user(pool: asyncpg.Pool, user_id: int) -> list[ManualInflow]:
         rows = await conn.fetch(
             """
             SELECT id, user_id, date, usd_received, brl_paid, source, note,
-                   created_at, updated_at
+                   project_name, created_at, updated_at
             FROM manual_usd_inflows
             WHERE user_id = $1
             ORDER BY date DESC, id DESC
@@ -106,6 +112,24 @@ async def list_for_user(pool: asyncpg.Pool, user_id: int) -> list[ManualInflow]:
             user_id,
         )
     return [_row_to_dataclass(r) for r in rows]
+
+
+async def get_by_id(pool: asyncpg.Pool, inflow_id: int) -> Optional[ManualInflow]:
+    """Fetch by id without owner filter. Caller MUST verify authz before
+    acting on the row. Used by delete handlers that need the row's
+    user_id + project_name + created_at to run project-membership checks."""
+    await ensure_schema(pool)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, user_id, date, usd_received, brl_paid, source, note,
+                   project_name, created_at, updated_at
+            FROM manual_usd_inflows
+            WHERE id = $1
+            """,
+            inflow_id,
+        )
+    return _row_to_dataclass(row) if row else None
 
 
 async def create(
@@ -117,24 +141,28 @@ async def create(
     brl_paid: float,
     source: str,
     note: str = "",
+    project_name: Optional[str] = None,
 ) -> ManualInflow:
     """Insert and return the freshly-stored row.
 
     Caller is responsible for sanity-checking inputs (rate band, future-date
     guard) — that's enforced at the endpoint level so backend logic stays
     simple. Database CHECK constraints catch only zero/negative amounts.
+
+    `project_name` (optional) tags the row to a project so invited team
+    members can see it. NULL keeps the legacy owner-only behavior.
     """
     await ensure_schema(pool)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO manual_usd_inflows
-              (user_id, date, usd_received, brl_paid, source, note)
-            VALUES ($1, $2, $3, $4, $5, $6)
+              (user_id, date, usd_received, brl_paid, source, note, project_name)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id, user_id, date, usd_received, brl_paid, source, note,
-                      created_at, updated_at
+                      project_name, created_at, updated_at
             """,
-            user_id, date, usd_received, brl_paid, source, note,
+            user_id, date, usd_received, brl_paid, source, note, project_name,
         )
     return _row_to_dataclass(row)
 
@@ -165,7 +193,7 @@ async def update(
                    updated_at = NOW()
              WHERE id = $1 AND user_id = $2
             RETURNING id, user_id, date, usd_received, brl_paid, source, note,
-                      created_at, updated_at
+                      project_name, created_at, updated_at
             """,
             inflow_id, user_id, date, usd_received, brl_paid, source, note,
         )
@@ -173,11 +201,28 @@ async def update(
 
 
 async def delete(pool: asyncpg.Pool, *, inflow_id: int, user_id: int) -> bool:
-    """Delete by (id, user_id). Returns True if a row was removed."""
+    """Delete by (id, user_id). Returns True if a row was removed.
+
+    Owner-only path. For project-member deletes (caller != owner), use
+    delete_by_id() after running project_members.enforce_caller_can_delete
+    at the route level.
+    """
     await ensure_schema(pool)
     async with pool.acquire() as conn:
         res = await conn.execute(
             "DELETE FROM manual_usd_inflows WHERE id = $1 AND user_id = $2",
             inflow_id, user_id,
+        )
+    return res.endswith(" 1")
+
+
+async def delete_by_id(pool: asyncpg.Pool, inflow_id: int) -> bool:
+    """Delete by id only — caller MUST have already verified authz.
+    Returns True if a row was removed."""
+    await ensure_schema(pool)
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "DELETE FROM manual_usd_inflows WHERE id = $1",
+            inflow_id,
         )
     return res.endswith(" 1")
