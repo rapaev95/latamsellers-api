@@ -1,8 +1,8 @@
 """Project ACL — invite team members to specific projects with a role.
 
 Two tables:
-  escalar_project_members  — accepted memberships (user_id × project_name × role)
-  escalar_invitations      — pending email invitations with one-time token
+  project_members      — accepted memberships (user_id × project_name × role)
+  project_invitations  — pending email invitations with one-time token
 
 Roles: owner | admin | analyst | viewer
   owner    — full access, only the user who registered the project (implicit)
@@ -14,7 +14,18 @@ Owner-membership is implicit: the user who created/uploaded a project is its
 owner; we do NOT insert a row for the owner. Membership rows describe added
 collaborators only.
 
+`effective_from` — the cut-off timestamp for delete operations. A non-owner
+member can only delete uploads/records whose `created_at >= effective_from`.
+Set to `accepted_at` on accept; nullable for legacy rows (NULL = no cut-off,
+member can delete anything within their role).
+
 Token format: 32 url-safe bytes (43 chars), single-use, expires in 7 days.
+
+Migration history:
+  v1: tables `escalar_project_members` + `escalar_invitations`
+  v2: renamed to `project_members` + `project_invitations`,
+      added `effective_from` column.
+  ensure_schema() handles the rename idempotently — safe to run repeatedly.
 """
 from __future__ import annotations
 
@@ -31,9 +42,49 @@ ROLE_ORDER = ["viewer", "analyst", "admin", "owner"]
 INVITE_TTL_DAYS = 7
 TOKEN_BYTES = 32
 
-_CREATE_STATEMENTS = [
+# ── Migration: rename old tables, add effective_from ──────────────────────
+# Each statement is idempotent. `to_regclass` returns NULL if the relation
+# doesn't exist, so we can branch without EXCEPTION blocks.
+_MIGRATION_STATEMENTS = [
+    # 1. Rename project_members table if it still has the old escalar-prefixed name.
     """
-    CREATE TABLE IF NOT EXISTS escalar_project_members (
+    DO $migrate$
+    BEGIN
+      IF to_regclass('public.escalar_project_members') IS NOT NULL THEN
+        IF to_regclass('public.project_members') IS NOT NULL THEN
+          RAISE EXCEPTION 'Both escalar_project_members and project_members exist; manual merge required';
+        END IF;
+        ALTER TABLE escalar_project_members RENAME TO project_members;
+      END IF;
+    END
+    $migrate$;
+    """,
+    # 2. Rename invitations table.
+    """
+    DO $migrate$
+    BEGIN
+      IF to_regclass('public.escalar_invitations') IS NOT NULL THEN
+        IF to_regclass('public.project_invitations') IS NOT NULL THEN
+          RAISE EXCEPTION 'Both escalar_invitations and project_invitations exist; manual merge required';
+        END IF;
+        ALTER TABLE escalar_invitations RENAME TO project_invitations;
+      END IF;
+    END
+    $migrate$;
+    """,
+    # 3. Rename old indexes to match new table prefix (no-op if they already
+    # have the new name — IF EXISTS handles that without EXCEPTION blocks).
+    "ALTER INDEX IF EXISTS idx_escalar_members_user RENAME TO idx_project_members_user",
+    "ALTER INDEX IF EXISTS idx_escalar_members_project RENAME TO idx_project_members_project",
+    "ALTER INDEX IF EXISTS idx_escalar_invites_email_pending RENAME TO idx_project_invites_email_pending",
+    "ALTER INDEX IF EXISTS idx_escalar_invites_inviter RENAME TO idx_project_invites_inviter",
+    "ALTER INDEX IF EXISTS idx_escalar_invites_token RENAME TO idx_project_invites_token",
+]
+
+_CREATE_STATEMENTS = [
+    # Create with new names if absent (fresh installs).
+    """
+    CREATE TABLE IF NOT EXISTS project_members (
       id SERIAL PRIMARY KEY,
       user_id INTEGER NOT NULL,
       project_name TEXT NOT NULL,
@@ -41,15 +92,25 @@ _CREATE_STATEMENTS = [
       invited_by INTEGER,
       invited_at TIMESTAMPTZ DEFAULT NOW(),
       accepted_at TIMESTAMPTZ,
+      effective_from TIMESTAMPTZ,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW(),
       UNIQUE(user_id, project_name)
     )
     """,
-    "CREATE INDEX IF NOT EXISTS idx_escalar_members_user ON escalar_project_members(user_id)",
-    "CREATE INDEX IF NOT EXISTS idx_escalar_members_project ON escalar_project_members(project_name)",
+    # Add column for tables that existed before the migration introduced it.
+    "ALTER TABLE project_members ADD COLUMN IF NOT EXISTS effective_from TIMESTAMPTZ",
+    # Backfill: legacy rows get effective_from = accepted_at so existing
+    # members can delete anything they could before the schema change.
     """
-    CREATE TABLE IF NOT EXISTS escalar_invitations (
+    UPDATE project_members
+       SET effective_from = accepted_at
+     WHERE effective_from IS NULL AND accepted_at IS NOT NULL
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_project_members_user ON project_members(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_project_members_project ON project_members(project_name)",
+    """
+    CREATE TABLE IF NOT EXISTS project_invitations (
       id SERIAL PRIMARY KEY,
       email TEXT NOT NULL,
       project_name TEXT NOT NULL,
@@ -63,15 +124,23 @@ _CREATE_STATEMENTS = [
       revoked_at TIMESTAMPTZ
     )
     """,
-    "CREATE INDEX IF NOT EXISTS idx_escalar_invites_email_pending ON escalar_invitations(lower(email)) WHERE used_at IS NULL AND revoked_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_escalar_invites_inviter ON escalar_invitations(invited_by)",
-    "CREATE INDEX IF NOT EXISTS idx_escalar_invites_token ON escalar_invitations(token)",
+    "CREATE INDEX IF NOT EXISTS idx_project_invites_email_pending ON project_invitations(lower(email)) WHERE used_at IS NULL AND revoked_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_project_invites_inviter ON project_invitations(invited_by)",
+    "CREATE INDEX IF NOT EXISTS idx_project_invites_token ON project_invitations(token)",
 ]
 
 
 async def ensure_schema(pool: asyncpg.Pool) -> None:
-    for stmt in _CREATE_STATEMENTS:
-        async with pool.acquire() as conn:
+    """Idempotent: runs migrations first, then ensures fresh schema exists.
+
+    Safe to call from startup AND per-endpoint (belt-and-suspenders pattern):
+    every statement uses IF NOT EXISTS / IF EXISTS or branches on to_regclass(),
+    so repeated calls do nothing on a fully-migrated database.
+    """
+    async with pool.acquire() as conn:
+        for stmt in _MIGRATION_STATEMENTS:
+            await conn.execute(stmt)
+        for stmt in _CREATE_STATEMENTS:
             await conn.execute(stmt)
 
 
@@ -102,9 +171,9 @@ async def list_members(
         rows = await conn.fetch(
             f"""
             SELECT m.id, m.user_id, m.project_name, m.role,
-                   m.invited_by, m.invited_at, m.accepted_at,
+                   m.invited_by, m.invited_at, m.accepted_at, m.effective_from,
                    u.email, u.name
-              FROM escalar_project_members m
+              FROM project_members m
               LEFT JOIN users u ON u.id = m.user_id
               {where}
              ORDER BY m.project_name, m.role, m.accepted_at DESC NULLS LAST, m.id
@@ -122,6 +191,7 @@ async def list_members(
             "role": r["role"],
             "invited_at": r["invited_at"].isoformat() if r["invited_at"] else None,
             "accepted_at": r["accepted_at"].isoformat() if r["accepted_at"] else None,
+            "effective_from": r["effective_from"].isoformat() if r["effective_from"] else None,
         })
     return out
 
@@ -133,9 +203,10 @@ async def list_my_memberships(
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT m.id, m.project_name, m.role, m.invited_at, m.accepted_at,
+            SELECT m.id, m.project_name, m.role,
+                   m.invited_at, m.accepted_at, m.effective_from,
                    u.email AS owner_email, u.name AS owner_name
-              FROM escalar_project_members m
+              FROM project_members m
               LEFT JOIN users u ON u.id = m.invited_by
              WHERE m.user_id = $1 AND m.accepted_at IS NOT NULL
              ORDER BY m.project_name
@@ -151,6 +222,7 @@ async def list_my_memberships(
             "owner_name": r["owner_name"] or "",
             "invited_at": r["invited_at"].isoformat() if r["invited_at"] else None,
             "accepted_at": r["accepted_at"].isoformat() if r["accepted_at"] else None,
+            "effective_from": r["effective_from"].isoformat() if r["effective_from"] else None,
         }
         for r in rows
     ]
@@ -163,7 +235,7 @@ async def update_role(
     async with pool.acquire() as conn:
         result = await conn.execute(
             """
-            UPDATE escalar_project_members
+            UPDATE project_members
                SET role = $1, updated_at = NOW()
              WHERE id = $2 AND invited_by = $3
             """,
@@ -178,7 +250,7 @@ async def remove_member(
     async with pool.acquire() as conn:
         result = await conn.execute(
             """
-            DELETE FROM escalar_project_members
+            DELETE FROM project_members
              WHERE id = $1 AND invited_by = $2
             """,
             member_id, owner_user_id,
@@ -196,12 +268,42 @@ async def get_user_role_for_project(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT role FROM escalar_project_members
+            SELECT role FROM project_members
              WHERE user_id = $1 AND project_name = $2 AND accepted_at IS NOT NULL
             """,
             user_id, project_name,
         )
     return row["role"] if row else None
+
+
+async def get_membership(
+    pool: asyncpg.Pool, user_id: int, project_name: str,
+) -> Optional[dict[str, Any]]:
+    """Full membership row for a user/project, or None.
+    Used by delete-time gates that need both `role` and `effective_from`.
+    Returns only accepted memberships."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, user_id, project_name, role,
+                   invited_by, invited_at, accepted_at, effective_from
+              FROM project_members
+             WHERE user_id = $1 AND project_name = $2 AND accepted_at IS NOT NULL
+            """,
+            user_id, project_name,
+        )
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "user_id": row["user_id"],
+        "project_name": row["project_name"],
+        "role": row["role"],
+        "invited_by": row["invited_by"],
+        "invited_at": row["invited_at"],
+        "accepted_at": row["accepted_at"],
+        "effective_from": row["effective_from"],
+    }
 
 
 # ── Invitations ──────────────────────────────────────────────────────────
@@ -215,7 +317,7 @@ async def list_pending_invitations(
             """
             SELECT id, email, project_name, role, token,
                    created_at, expires_at, used_at, revoked_at
-              FROM escalar_invitations
+              FROM project_invitations
              WHERE invited_by = $1 AND used_at IS NULL AND revoked_at IS NULL
                AND expires_at > NOW()
              ORDER BY created_at DESC
@@ -260,7 +362,7 @@ async def create_invitation(
         # Same-project + same-email + still active → reuse
         existing = await conn.fetchrow(
             """
-            SELECT id, token, expires_at FROM escalar_invitations
+            SELECT id, token, expires_at FROM project_invitations
              WHERE invited_by = $1
                AND lower(email) = $2
                AND project_name = $3
@@ -285,7 +387,7 @@ async def create_invitation(
         token = _gen_token()
         row = await conn.fetchrow(
             """
-            INSERT INTO escalar_invitations
+            INSERT INTO project_invitations
               (email, project_name, role, token, invited_by, expires_at)
             VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING id, expires_at
@@ -310,7 +412,7 @@ async def revoke_invitation(
     async with pool.acquire() as conn:
         result = await conn.execute(
             """
-            UPDATE escalar_invitations
+            UPDATE project_invitations
                SET revoked_at = NOW()
              WHERE id = $1 AND invited_by = $2
                AND used_at IS NULL AND revoked_at IS NULL
@@ -329,7 +431,7 @@ async def get_invitation_by_token(
             SELECT i.id, i.email, i.project_name, i.role, i.token,
                    i.invited_by, i.expires_at, i.used_at, i.revoked_at,
                    u.email AS inviter_email, u.name AS inviter_name
-              FROM escalar_invitations i
+              FROM project_invitations i
               LEFT JOIN users u ON u.id = i.invited_by
              WHERE i.token = $1
             """,
@@ -364,6 +466,10 @@ async def accept_invitation(
       - invitation exists, not used, not revoked, not expired
       - email match (case-insensitive) — invited email must equal user's email
     Then upserts a member row and marks the invitation used.
+
+    Sets `effective_from = NOW()` — this is the cut-off the delete-time gate
+    uses to decide if the member can remove a given record (uploads/entries
+    older than this stay read-only for the member).
     """
     inv = await get_invitation_by_token(pool, token)
     if not inv:
@@ -383,20 +489,22 @@ async def accept_invitation(
         async with conn.transaction():
             await conn.execute(
                 """
-                INSERT INTO escalar_project_members
-                  (user_id, project_name, role, invited_by, invited_at, accepted_at)
-                VALUES ($1, $2, $3, $4, NOW(), NOW())
+                INSERT INTO project_members
+                  (user_id, project_name, role, invited_by,
+                   invited_at, accepted_at, effective_from)
+                VALUES ($1, $2, $3, $4, NOW(), NOW(), NOW())
                 ON CONFLICT (user_id, project_name)
                 DO UPDATE SET role = EXCLUDED.role,
                               invited_by = EXCLUDED.invited_by,
                               accepted_at = NOW(),
+                              effective_from = NOW(),
                               updated_at = NOW()
                 """,
                 accepting_user_id, inv["project_name"], inv["role"], inv["invited_by"],
             )
             await conn.execute(
                 """
-                UPDATE escalar_invitations
+                UPDATE project_invitations
                    SET used_at = NOW(), used_by_user_id = $1
                  WHERE id = $2
                 """,
@@ -411,7 +519,7 @@ async def accept_invitation(
     }
 
 
-# ── Permission helper ────────────────────────────────────────────────────
+# ── Permission helpers ───────────────────────────────────────────────────
 
 
 def role_has_at_least(role: Optional[str], minimum: str) -> bool:
@@ -423,3 +531,26 @@ def role_has_at_least(role: Optional[str], minimum: str) -> bool:
         return ROLE_ORDER.index(role) >= ROLE_ORDER.index(minimum)
     except ValueError:
         return False
+
+
+def can_delete_record(
+    record_created_at: Optional[datetime],
+    membership: Optional[dict[str, Any]],
+) -> bool:
+    """True if a member with this membership row can delete a record created at
+    `record_created_at`. Owners (membership=None) bypass — they can always delete.
+
+    Rule: members can only delete records created at or after their
+    `effective_from`. NULL effective_from means no cut-off (legacy rows).
+    NULL record_created_at conservatively returns False.
+    """
+    # Owner / no membership row passed = caller is the owner (implicit).
+    if membership is None:
+        return True
+    eff = membership.get("effective_from")
+    if eff is None:
+        # Legacy member without cut-off — same behavior as before this feature.
+        return True
+    if record_created_at is None:
+        return False
+    return record_created_at >= eff
