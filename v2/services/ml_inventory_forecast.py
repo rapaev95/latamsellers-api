@@ -67,6 +67,38 @@ async def _get_window_days(pool: asyncpg.Pool, user_id: int) -> int:
     return DEFAULT_WINDOW_DAYS
 
 
+async def _get_stock_full_for_mlb(
+    pool: asyncpg.Pool, user_id: int, item_id: str,
+) -> Optional[int]:
+    """Lookup physical Full stock for a given MLB from user's latest
+    stock_full XLSX upload. Returns None if no upload exists or MLB not
+    found in any SKU entry. ML /items API returns "allocated" stock
+    (133 for MLB6143605452) which is per-listing share; the physical
+    report shows actual warehouse total (172) shared across listings.
+
+    User explicitly requested «руководствуемся отчётом физическим» —
+    if a stock_full report is uploaded, it takes priority over /items
+    API value. Falls back to API only when no report exists.
+    """
+    try:
+        from v2.parsers import db_loader as _db_loader
+        stock_full_map = await _db_loader.load_user_stock_full(pool, user_id)
+        if not stock_full_map:
+            return None
+        # MLB ids in our DB are "MLB6143605452"; in stock_full they're bare
+        # "6143605452" (or pipe-joined "6143605452 | 6143748308" for shared listings).
+        item_id_bare = item_id.replace("MLB", "").strip()
+        for entry in stock_full_map.values():
+            mlb_field = (getattr(entry, "mlb", "") or "")
+            mlb_list = [m.strip() for m in mlb_field.split("|") if m.strip()]
+            if item_id_bare in mlb_list:
+                return int(getattr(entry, "total", 0) or 0)
+        return None
+    except Exception as err:  # noqa: BLE001
+        log.debug("stock_full lookup failed for %s: %s", item_id, err)
+        return None
+
+
 async def _get_stock(
     pool: asyncpg.Pool,
     user_id: int,
@@ -75,11 +107,24 @@ async def _get_stock(
 ) -> tuple[Optional[int], Optional[str]]:
     """Returns (stock_int, variation_label).
 
+    Stock source priority:
+      1. Physical stock_full XLSX (user-uploaded report) — covers shared
+         listings/inventory pool correctly. Used only when variation_id
+         not supplied (report не хранит per-variation breakdown).
+      2. ml_user_items.available_quantity — from ML /items API (per-listing
+         allocation, undercounts shared-inventory listings).
+
     If variation_id is provided, drills into ml_user_items.raw.variations[]
     and returns the matched variation's available_quantity + a short
     label derived from variation attributes. Falls back to item-level
     available_quantity if variation not found in cached raw.
     """
+    # Physical Full report takes priority for item-level lookups (no variation).
+    if not variation_id:
+        physical = await _get_stock_full_for_mlb(pool, user_id, item_id)
+        if physical is not None:
+            return physical, None
+
     try:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
