@@ -445,6 +445,28 @@ async def _dispatch_to_telegram(
             user_id,
         )
 
+        # Bulk-suppress «empty» order notices — те у которых raw payload
+        # пришёл от ML без total_amount/status/items (mid-fetch race,
+        # webhook fired до того как ML записал order в свою БД, или сейчас
+        # уже мёртвый ID). Без этого guard'а они уезжают в TG как
+        # «Новая продажа R$ 0,00 — unknown» без полезной инфы.
+        # Инцидент 2026-05-13: после 5-дневного scheduler stall сразу 42
+        # таких row'а разом долетели до TG.
+        await conn.execute(
+            """
+            UPDATE ml_notices
+               SET telegram_sent_at = NOW()
+             WHERE user_id = $1
+               AND telegram_sent_at IS NULL
+               AND topic IN ('orders_v2', 'orders')
+               AND (raw->>'total_amount' IS NULL OR (raw->>'total_amount')::float = 0)
+               AND (raw->>'status' IS NULL OR raw->>'status' = '' OR lower(raw->>'status') = 'unknown')
+               AND jsonb_array_length(coalesce((raw->'order_items')::jsonb, '[]'::jsonb)) = 0
+               AND jsonb_array_length(coalesce((raw->'items')::jsonb, '[]'::jsonb)) = 0
+            """,
+            user_id,
+        )
+
         pending_rows = await conn.fetch(
             """
             SELECT notice_id, label, description, actions, tags, topic, raw,
