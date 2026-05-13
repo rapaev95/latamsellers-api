@@ -258,6 +258,108 @@ async def remove_member(
     return {"removed": result.endswith(" 1"), "id": member_id}
 
 
+async def list_memberships_for_user(
+    pool: asyncpg.Pool, user_id: int,
+) -> list[dict[str, Any]]:
+    """All accepted memberships for a user (admin-facing — no inviter filter).
+
+    Different from `list_my_memberships`: this one is for showing an arbitrary
+    user's project access on the admin page, so we don't care who invited them.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, project_name, role,
+                   invited_by, invited_at, accepted_at, effective_from
+              FROM project_members
+             WHERE user_id = $1 AND accepted_at IS NOT NULL
+             ORDER BY project_name
+            """,
+            user_id,
+        )
+    return [
+        {
+            "id": r["id"],
+            "project_name": r["project_name"],
+            "role": r["role"],
+            "invited_by": r["invited_by"],
+            "invited_at": r["invited_at"].isoformat() if r["invited_at"] else None,
+            "accepted_at": r["accepted_at"].isoformat() if r["accepted_at"] else None,
+            "effective_from": r["effective_from"].isoformat() if r["effective_from"] else None,
+        }
+        for r in rows
+    ]
+
+
+async def admin_grant_membership(
+    pool: asyncpg.Pool, *, target_user_id: int, project_name: str,
+    role: str, granted_by_admin_id: int,
+) -> dict[str, Any]:
+    """Direct grant by an admin — skips the invitation flow.
+
+    Upserts on (user_id, project_name): inserts a new accepted row, or updates
+    the role on the existing row. `accepted_at` and `effective_from` set to NOW
+    so the user immediately gets the access and can delete records created from
+    this point forward.
+    """
+    project_norm = (project_name or "").strip()
+    role_norm = _normalize_role(role)
+    if not project_norm:
+        return {"error": "project_required"}
+    if role_norm == "owner":
+        return {"error": "cannot_grant_as_owner"}
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO project_members
+                (user_id, project_name, role, invited_by,
+                 invited_at, accepted_at, effective_from)
+            VALUES ($1, $2, $3, $4, NOW(), NOW(), NOW())
+            ON CONFLICT (user_id, project_name) DO UPDATE
+              SET role = EXCLUDED.role,
+                  accepted_at = COALESCE(project_members.accepted_at, EXCLUDED.accepted_at),
+                  effective_from = COALESCE(project_members.effective_from, EXCLUDED.effective_from),
+                  updated_at = NOW()
+            RETURNING id, user_id, project_name, role,
+                      invited_by, invited_at, accepted_at, effective_from
+            """,
+            int(target_user_id), project_norm, role_norm, int(granted_by_admin_id),
+        )
+    return {
+        "id": row["id"],
+        "user_id": row["user_id"],
+        "project_name": row["project_name"],
+        "role": row["role"],
+        "invited_by": row["invited_by"],
+        "invited_at": row["invited_at"].isoformat() if row["invited_at"] else None,
+        "accepted_at": row["accepted_at"].isoformat() if row["accepted_at"] else None,
+        "effective_from": row["effective_from"].isoformat() if row["effective_from"] else None,
+    }
+
+
+async def admin_revoke_membership(
+    pool: asyncpg.Pool, *, target_user_id: int, project_name: str,
+) -> dict[str, Any]:
+    """Admin-side membership delete by (user_id, project_name).
+
+    Bypasses the inviter check that `remove_member` enforces — admin can drop
+    any membership regardless of who originally invited the user.
+    """
+    project_norm = (project_name or "").strip()
+    if not project_norm:
+        return {"error": "project_required"}
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            DELETE FROM project_members
+             WHERE user_id = $1 AND project_name = $2
+            """,
+            int(target_user_id), project_norm,
+        )
+    return {"removed": result.endswith(" 1"), "user_id": target_user_id, "project_name": project_norm}
+
+
 async def get_user_role_for_project(
     pool: asyncpg.Pool, user_id: int, project_name: str,
 ) -> Optional[str]:

@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from v2.db import get_pool
 from v2.deps import CurrentUser, require_admin
+from v2.services import project_members as project_members_svc
 from v2.storage import users_admin_storage as store
 
 
@@ -24,6 +25,11 @@ router = APIRouter(
 
 # ── Schemas ────────────────────────────────────────────────────────────────
 
+class ProjectMembershipOut(BaseModel):
+    project_name: str
+    role: str
+
+
 class UserOut(BaseModel):
     id: int
     email: str
@@ -32,6 +38,7 @@ class UserOut(BaseModel):
     tiers: list[str] = Field(default_factory=list)
     blocked: bool = False
     created_at: Optional[str] = None
+    projects: list[ProjectMembershipOut] = Field(default_factory=list)
 
 
 class UsersListOut(BaseModel):
@@ -51,6 +58,15 @@ class TierIn(BaseModel):
     tier: str
 
 
+class ProjectGrantIn(BaseModel):
+    project_name: str
+    role: str = "viewer"  # viewer | analyst | admin
+
+
+class ProjectRevokeIn(BaseModel):
+    project_name: str
+
+
 # ── Routes ─────────────────────────────────────────────────────────────────
 
 @router.get("", response_model=UsersListOut)
@@ -67,6 +83,19 @@ async def list_users_endpoint(
     return await store.list_users(
         pool, q=q, role=role, tier=tier, blocked=blocked, limit=limit, offset=offset,
     )
+
+
+# NOTE: must come BEFORE `/{user_id}` — otherwise FastAPI matches the dynamic
+# segment first and tries to parse "projects" as an int (422).
+@router.get("/projects/all")
+async def list_all_projects_endpoint(pool=Depends(get_pool)) -> dict[str, Any]:
+    """All known project_name values in the system (from uploads + memberships).
+
+    Used by the admin UI dropdown when granting project access.
+    """
+    await project_members_svc.ensure_schema(pool)
+    names = await store.list_distinct_projects(pool)
+    return {"items": names, "total": len(names)}
 
 
 @router.get("/{user_id}", response_model=UserOut)
@@ -125,3 +154,55 @@ async def revoke_tier_endpoint(
     if row is None:
         raise HTTPException(status_code=404, detail="user_not_found")
     return row
+
+
+# ── Project memberships (direct admin grant, no invitation) ───────────────
+
+
+@router.post("/{user_id}/projects/grant", response_model=UserOut)
+async def grant_project_endpoint(
+    user_id: int,
+    body: ProjectGrantIn,
+    actor: CurrentUser = Depends(require_admin),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Direct grant: admin attaches the user to a project with a role.
+
+    Skips the invitation flow — useful when superadmin sets up access without
+    asking the user to click an email link.
+    """
+    await project_members_svc.ensure_schema(pool)
+    result = await project_members_svc.admin_grant_membership(
+        pool,
+        target_user_id=user_id,
+        project_name=body.project_name,
+        role=body.role,
+        granted_by_admin_id=actor.id,
+    )
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
+    row = await store.get_user(pool, user_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="user_not_found")
+    return row
+
+
+@router.post("/{user_id}/projects/revoke", response_model=UserOut)
+async def revoke_project_endpoint(
+    user_id: int,
+    body: ProjectRevokeIn,
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Drop the user's membership in a project — regardless of who invited them."""
+    await project_members_svc.ensure_schema(pool)
+    result = await project_members_svc.admin_revoke_membership(
+        pool, target_user_id=user_id, project_name=body.project_name,
+    )
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
+    row = await store.get_user(pool, user_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="user_not_found")
+    return row
+
+

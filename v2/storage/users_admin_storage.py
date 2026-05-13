@@ -28,7 +28,30 @@ def _parse_tiers(raw: Any) -> list[str]:
     return [str(x) for x in (v or []) if isinstance(x, str)]
 
 
+def _parse_projects(raw: Any) -> list[dict[str, str]]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        try:
+            v = json.loads(raw)
+        except (ValueError, TypeError):
+            return []
+    else:
+        v = raw
+    out: list[dict[str, str]] = []
+    for item in (v or []):
+        if isinstance(item, dict) and item.get("project_name"):
+            out.append({
+                "project_name": str(item["project_name"]),
+                "role": str(item.get("role") or "viewer"),
+            })
+    return out
+
+
 def _row_to_dict(row: asyncpg.Record) -> dict[str, Any]:
+    # `projects` is only present on rows from list_users / get_user, not on
+    # rows returned by grant_tier / revoke_tier (those don't aggregate).
+    has_projects = "projects" in row.keys()
     return {
         "id": row["id"],
         "email": row["email"],
@@ -37,15 +60,30 @@ def _row_to_dict(row: asyncpg.Record) -> dict[str, Any]:
         "tiers": _parse_tiers(row["tiers"]),
         "blocked": bool(row["blocked"]),
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "projects": _parse_projects(row["projects"]) if has_projects else [],
     }
 
 
-_SELECT_COLS = """
+# Subquery aggregates a user's accepted project memberships into a single
+# JSONB array — one row per user even when they're in many projects.
+_PROJECTS_SUBQUERY = """
+    COALESCE((
+        SELECT jsonb_agg(
+                 jsonb_build_object('project_name', pm.project_name, 'role', pm.role)
+                 ORDER BY pm.project_name
+               )
+          FROM project_members pm
+         WHERE pm.user_id = users.id AND pm.accepted_at IS NOT NULL
+    ), '[]'::jsonb) AS projects
+"""
+
+_SELECT_COLS = f"""
     id, email, name,
     COALESCE(role, 'user')       AS role,
     COALESCE(tiers, '[]'::jsonb) AS tiers,
     COALESCE(blocked, false)     AS blocked,
-    created_at
+    created_at,
+    {_PROJECTS_SUBQUERY}
 """
 
 
@@ -179,6 +217,30 @@ async def grant_tier(pool: asyncpg.Pool, user_id: int, tier: str) -> Optional[di
             json.dumps([tier]),
         )
     return _row_to_dict(row) if row else None
+
+
+async def list_distinct_projects(pool: asyncpg.Pool) -> list[str]:
+    """All project_name values known to the system, deduplicated and sorted.
+
+    Pulls from both `uploads` (someone has data for the project) and
+    `project_members` (someone got invited to it). The union covers projects
+    that exist by data and projects that exist only by membership.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT project_name
+              FROM (
+                SELECT DISTINCT project_name FROM uploads
+                 WHERE project_name IS NOT NULL AND project_name <> ''
+                UNION
+                SELECT DISTINCT project_name FROM project_members
+                 WHERE project_name IS NOT NULL AND project_name <> ''
+              ) p
+             ORDER BY project_name
+            """,
+        )
+    return [r["project_name"] for r in rows]
 
 
 async def revoke_tier(pool: asyncpg.Pool, user_id: int, tier: str) -> Optional[dict[str, Any]]:
