@@ -222,9 +222,15 @@ async def grant_tier(pool: asyncpg.Pool, user_id: int, tier: str) -> Optional[di
 async def list_distinct_projects(pool: asyncpg.Pool) -> list[str]:
     """All project_name values known to the system, deduplicated and sorted.
 
-    Pulls from both `uploads` (someone has data for the project) and
-    `project_members` (someone got invited to it). The union covers projects
-    that exist by data and projects that exist only by membership.
+    Three sources, unioned:
+      1. `uploads.project_name` — explicit upload-to-project tag (optional)
+      2. `project_members.project_name` — someone got invited to it
+      3. `user_data` keys `f2_projects` / `projects` — the per-user JSONB dict
+         where finance project configuration lives (this is what the finance
+         dashboard reads via ProjectResolver, so it's the source of truth for
+         the project names users actually see in the UI).
+
+    Empty strings and the "NAO_CLASSIFICADO" sentinel are filtered out.
     """
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -236,7 +242,13 @@ async def list_distinct_projects(pool: asyncpg.Pool) -> list[str]:
                 UNION
                 SELECT DISTINCT project_name FROM project_members
                  WHERE project_name IS NOT NULL AND project_name <> ''
+                UNION
+                SELECT DISTINCT jsonb_object_keys(data_value) AS project_name
+                  FROM user_data
+                 WHERE data_key IN ('f2_projects', 'projects')
+                   AND jsonb_typeof(data_value) = 'object'
               ) p
+             WHERE project_name <> '' AND project_name <> 'NAO_CLASSIFICADO'
              ORDER BY project_name
             """,
         )
