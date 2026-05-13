@@ -291,6 +291,56 @@ async def list_memberships_for_user(
     ]
 
 
+async def list_inherited_projects(
+    pool: asyncpg.Pool, user_id: int,
+) -> list[dict[str, Any]]:
+    """Projects this user can READ via accepted membership.
+
+    Returns rows of {project_name, owner_id, role} — the data lives in
+    `owner_id`'s namespace (user_data + uploads.user_id), and the finance
+    read endpoints should swap _bind_user(owner_id) when serving this user
+    inside this project.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT project_name, invited_by AS owner_id, role
+              FROM project_members
+             WHERE user_id = $1
+               AND accepted_at IS NOT NULL
+               AND invited_by IS NOT NULL
+             ORDER BY project_name
+            """,
+            user_id,
+        )
+    return [
+        {"project_name": r["project_name"], "owner_id": r["owner_id"], "role": r["role"]}
+        for r in rows
+    ]
+
+
+async def get_owner_for_project_via_membership(
+    pool: asyncpg.Pool, user_id: int, project_name: str,
+) -> Optional[int]:
+    """Return the inviter (owner) user_id if `user_id` is an accepted member of
+    `project_name`, else None. Used by read-routes to swap the bound user for
+    data scoping — caller sees data from `owner_id`'s namespace inside the
+    project they were invited to."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT invited_by AS owner_id
+              FROM project_members
+             WHERE user_id = $1 AND project_name = $2
+               AND accepted_at IS NOT NULL
+               AND invited_by IS NOT NULL
+             LIMIT 1
+            """,
+            user_id, project_name,
+        )
+    return row["owner_id"] if row else None
+
+
 async def admin_grant_membership(
     pool: asyncpg.Pool, *, target_user_id: int, project_name: str,
     role: str, granted_by_admin_id: int,

@@ -99,15 +99,74 @@ def _bind_user(user: CurrentUser) -> None:
     legacy_db.set_current_user_id(user.id)
 
 
-@router.get("/projects", response_model=ProjectsListOut)
-def list_projects(user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
-    """Return the user's projects dict from PostgreSQL (key=`projects` in user_data).
+def _bind_user_id(user_id: int) -> None:
+    """Bind any user_id — used to swap to the project owner when the caller
+    is reading data through a project membership."""
+    legacy_db.set_current_user_id(user_id)
 
-    Mirrors what Streamlit's sidebar project selector reads. If the user hasn't
-    configured projects yet, returns empty `{}` — same behaviour as legacy.
+
+async def _resolve_effective_user_for_project(
+    pool, caller: CurrentUser, project: str,
+) -> int:
+    """For read endpoints scoped to a single `project`: return the caller's
+    own id if they own the project, otherwise the inviter (owner) id if the
+    caller has an accepted membership.
+
+    Callers should `_bind_user_id(resolved)` so the legacy data loaders read
+    from the right user_data / uploads namespace.
     """
+    if pool is None or not project:
+        return caller.id
+    try:
+        from v2.services import project_members as pm_svc
+        owner_id = await pm_svc.get_owner_for_project_via_membership(
+            pool, caller.id, project,
+        )
+        return owner_id if owner_id else caller.id
+    except Exception:
+        return caller.id
+
+
+@router.get("/projects", response_model=ProjectsListOut)
+async def list_projects(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Return the projects visible to this user — own projects (from their
+    user_data) PLUS projects they were invited to as a collaborator.
+
+    Inherited projects are loaded from each inviter's user_data so the project
+    metadata (sku_prefixes, launch_date, etc.) matches what the owner sees.
+    """
+    # Own projects
     _bind_user(user)
-    projects = legacy_config.load_projects() or {}
+    projects: dict = dict(legacy_config.load_projects() or {})
+
+    # Projects inherited via memberships — load from each inviter's namespace
+    if pool is not None:
+        try:
+            from v2.services import project_members as pm_svc
+            memberships = await pm_svc.list_inherited_projects(pool, user.id)
+        except Exception:
+            memberships = []
+        for m in memberships:
+            project_name = m["project_name"]
+            owner_id = m["owner_id"]
+            if not project_name or not owner_id or project_name in projects:
+                continue
+            # Swap the contextvar to owner_id, load THEIR projects dict,
+            # pick out just the one project the caller is a member of, and
+            # rebind back to the caller before exiting.
+            try:
+                _bind_user_id(owner_id)
+                owner_projects = legacy_config.load_projects() or {}
+                if project_name in owner_projects:
+                    projects[project_name] = owner_projects[project_name]
+            except Exception:
+                pass
+            finally:
+                _bind_user(user)
+
     return {"projects": projects, "count": len(projects)}
 
 
@@ -140,8 +199,14 @@ async def get_reports(
     First call after upload / settings change recomputes from scratch and
     stores the bundle; subsequent calls return cached JSONB in ~50ms.
     Pass `?fresh=1` to force recomputation.
+
+    ACL: if the caller is an accepted member of `project` but not the owner,
+    we rebind to the owner's user_id so the legacy loaders read from the
+    owner's namespace (user_data + uploads). Cache key is namespaced by the
+    effective user, not the caller, so members and owners share the cache.
     """
-    _bind_user(user)
+    effective_user_id = await _resolve_effective_user_for_project(pool, user, project)
+    _bind_user_id(effective_user_id)
     projects = legacy_config.load_projects()
     if project not in projects:
         raise HTTPException(status_code=404, detail={"error": "project_not_found", "available": list(projects.keys())})
@@ -233,8 +298,10 @@ async def get_reports(
     cache_key = f"reports:{project}:{pf.isoformat()}:{pt.isoformat()}:{basis}"
     # Don't cache partial / errored bundles — half-computed results would
     # be served indefinitely until next user input change.
+    # Cache is keyed by the effective owner so members and owners share the
+    # same precomputed bundle.
     bundle, status = finance_cache.cached_compute(
-        user.id, cache_key, _compute_bundle,
+        effective_user_id, cache_key, _compute_bundle,
         force=fresh,
         should_cache=lambda b: not any(k.endswith("_error") for k in b),
     )
@@ -1207,19 +1274,25 @@ async def debug_sku_mapping(
 
 
 @router.get("/pnl-matrix", response_model=PnlMatrixOut)
-def get_pnl_matrix(
+async def get_pnl_matrix(
     response: Response,
     project: str = Query(..., description="Project ID, e.g. 'ARTHUR'"),
     fresh: bool = Query(False, description="Bypass cache and recompute from scratch"),
     user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
 ):
     """Monthly PnL matrix (rows × 12 months): revenue breakdown + expenses +
     summary (op_profit, margin, orders). Mirrors Streamlit `build_monthly_pnl_matrix`.
 
     Wrapped in the same durable cache as /reports. Pass `?fresh=1` to force.
     On compute timeout returns empty months/rows (and skips caching).
+
+    ACL: rebinds to the project owner if the caller is an invited collaborator
+    (so the legacy loaders read the owner's namespace). Cache is namespaced by
+    the effective user so members share the owner's compute.
     """
-    _bind_user(user)
+    effective_user_id = await _resolve_effective_user_for_project(pool, user, project)
+    _bind_user_id(effective_user_id)
 
     def _compute_matrix() -> dict[str, Any]:
         from v2.legacy.reports import build_monthly_pnl_matrix
@@ -1240,7 +1313,7 @@ def get_pnl_matrix(
 
     cache_key = f"matrix:{project}"
     payload, status = finance_cache.cached_compute(
-        user.id, cache_key, _compute_matrix,
+        effective_user_id, cache_key, _compute_matrix,
         force=fresh,
         should_cache=lambda p: not p.get("_error") and bool(p.get("months")),
     )
