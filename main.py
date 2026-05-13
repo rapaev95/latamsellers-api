@@ -87,11 +87,53 @@ app.include_router(v2_router)
 # APScheduler for background ML token refresh (every 5h < 6h TTL)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler  # noqa: E402
 from apscheduler.triggers.cron import CronTrigger  # noqa: E402
+from apscheduler.events import (  # noqa: E402
+    EVENT_JOB_MAX_INSTANCES,
+    EVENT_JOB_EXECUTED,
+    EVENT_JOB_ERROR,
+)
 import asyncio as _asyncio  # noqa: E402
 import logging as _logging  # noqa: E402
 
 _ml_scheduler: AsyncIOScheduler | None = None
 _ml_log = _logging.getLogger("ml-oauth-scheduler")
+
+# Per-job consecutive-skip counter for stall detection.
+# Increments on EVENT_JOB_MAX_INSTANCES, resets on EVENT_JOB_EXECUTED/ERROR.
+# When a job hits the threshold, fire a one-shot admin TG alert.
+_SCHEDULER_SKIP_ALERT_THRESHOLD = 3
+_scheduler_skip_counts: dict[str, int] = {}
+
+
+def _on_scheduler_event(event) -> None:  # type: ignore[no-untyped-def]
+    """APScheduler listener: detects stalled jobs that get skipped repeatedly.
+
+    Catches the exact failure mode of the 2026-05-12 incident — scheduler jobs
+    silently logging WARNING "skipped: maximum number of running instances
+    reached (1)" for 36+ hours without any other signal. Now this triggers a
+    TG admin alert on the 3rd consecutive skip.
+    """
+    job_id = getattr(event, "job_id", "unknown")
+    if event.code == EVENT_JOB_MAX_INSTANCES:
+        count = _scheduler_skip_counts.get(job_id, 0) + 1
+        _scheduler_skip_counts[job_id] = count
+        if count == _SCHEDULER_SKIP_ALERT_THRESHOLD:
+            # Fire-and-forget — listener can't await
+            from v2.services import tg_admin_alerts as _alerts
+            _asyncio.create_task(_alerts.send_admin_alert(
+                title="Scheduler job stalled",
+                detail=(
+                    f"job_id={job_id} skipped {count}x подряд "
+                    f"(max_instances=1). Предыдущий запуск не завершился — "
+                    f"вероятно pool exhaustion или зависший await. "
+                    f"Проверь логи и restart сервиса."
+                ),
+                severity="error",
+                service="apscheduler",
+                deduplicate_key=f"scheduler_stall:{job_id}",
+            ))
+    elif event.code in (EVENT_JOB_EXECUTED, EVENT_JOB_ERROR):
+        _scheduler_skip_counts.pop(job_id, None)
 
 
 async def _refresh_ml_tokens_job() -> None:
@@ -1069,6 +1111,12 @@ async def _v2_startup() -> None:
         max_instances=1,
         coalesce=True,
         replace_existing=True,
+    )
+    # Attach stall-detection listener BEFORE start so we don't miss the very
+    # first burst of skips. See _on_scheduler_event docstring.
+    _ml_scheduler.add_listener(
+        _on_scheduler_event,
+        EVENT_JOB_MAX_INSTANCES | EVENT_JOB_EXECUTED | EVENT_JOB_ERROR,
     )
     _ml_scheduler.start()
     _ml_log.info(

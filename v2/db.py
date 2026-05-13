@@ -24,11 +24,15 @@ async def create_pool() -> asyncpg.Pool | None:
         return None
     _pool = await asyncpg.create_pool(
         dsn=dsn,
-        min_size=1,
-        max_size=5,
+        min_size=2,
+        # Bumped 5 → 20: scheduler гоняет ~15 джоб параллельно, каждый
+        # webhook-handler делает несколько кратких pool.acquire()-and-release.
+        # 5 коннектов было катастрофически мало — любая волна вебхуков
+        # доводила до queue-wait на acquire (см. инцидент 2026-05-12).
+        max_size=20,
         # Prevent a single misbehaving query from holding a pool slot forever.
         # Без него падение DB / зависший запрос навечно отнимали бы коннект
-        # и приводили к exhaustion (см. инцидент с _enrich_order_with_margin).
+        # и приводили к exhaustion.
         command_timeout=30.0,
     )
     return _pool
