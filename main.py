@@ -341,6 +341,25 @@ async def _backfill_all_users_job() -> None:
         _ml_log.exception("ML backfill job failed: %s", err)
 
 
+async def _backfill_startup_kickoff() -> None:
+    """Run on service startup with days=7 — catches up gaps from long downtime
+    (scheduler stalls, deployment failures, etc). The 24h cron only does days=1
+    so if backfill missed multiple days, normal cron would never recover them.
+    Inспирировано инцидентом 2026-05-13 где ml_user_orders простоял 7 дней."""
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("startup backfill kickoff skipped: no DB pool")
+            return
+        result = await ml_backfill_svc.backfill_all_users(pool, days=7)
+        _ml_log.info(
+            "startup backfill kickoff (days=7): users=%s fetched=%s saved=%s",
+            result.get("users"), result.get("fetched"), result.get("saved"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("startup backfill kickoff failed: %s", err)
+
+
 async def _promo_analytics_finalize_job() -> None:
     """Daily 06:00 UTC = 03:00 BRT — finalize promotion outcome windows
     older than 14d (compute treatment_revenue + delta vs baseline)."""
@@ -1133,6 +1152,15 @@ async def _v2_startup() -> None:
     _asyncio.create_task(_sync_ml_notices_job())
     # And drain pending TG queue right away — no waiting for the first 2-min tick.
     _asyncio.create_task(_dispatch_pending_telegram_job())
+    # Catch-up backfill (orders for last 7 days) — daily cron only does days=1,
+    # so without this any restart after a multi-day stall would leave gaps in
+    # ml_user_orders forever.
+    _asyncio.create_task(_backfill_startup_kickoff())
+    # Item caches refresh (stock, health, visits, questions, claims, promotions).
+    # Normally runs at 03:00 UTC — but if scheduler was down, ml_user_items
+    # стал stale (stock в TG не совпадает с ML UI). Kick on startup чтобы
+    # stock в первой post-deploy notification был корректным.
+    _asyncio.create_task(_nightly_refresh_all_users_job())
 
 
 @app.on_event("shutdown")
