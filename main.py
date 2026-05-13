@@ -345,17 +345,43 @@ async def _backfill_startup_kickoff() -> None:
     """Run on service startup with days=7 — catches up gaps from long downtime
     (scheduler stalls, deployment failures, etc). The 24h cron only does days=1
     so if backfill missed multiple days, normal cron would never recover them.
-    Inспирировано инцидентом 2026-05-13 где ml_user_orders простоял 7 дней."""
+    Inспирировано инцидентом 2026-05-13 где ml_user_orders простоял 7 дней.
+
+    Делает ДВА catch-up'а:
+    1. ml_backfill.backfill_all_users(days=7) → пишет в ml_notices (события
+       для TG-dispatch'а и финрепортов).
+    2. ml_orders.refresh_for_period(days_back=7) → пишет в ml_user_orders
+       (canonical orders cache, который читает inventory_forecast для
+       sold_in_window / avg_daily / days_left). Без этого stock в TG не
+       совпадает с реальностью на ML side даже после нашего фикса.
+    """
     try:
         pool = await get_pool()
         if pool is None:
             _ml_log.warning("startup backfill kickoff skipped: no DB pool")
             return
+        # (1) notices/events backfill
         result = await ml_backfill_svc.backfill_all_users(pool, days=7)
         _ml_log.info(
             "startup backfill kickoff (days=7): users=%s fetched=%s saved=%s",
             result.get("users"), result.get("fetched"), result.get("saved"),
         )
+        # (2) canonical orders cache refresh (per-user, paginated)
+        from v2.services import ml_orders as _ml_orders_kick
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT user_id FROM ml_user_tokens WHERE access_token IS NOT NULL"
+            )
+        for r in rows:
+            uid = r["user_id"]
+            try:
+                res = await _ml_orders_kick.refresh_for_period(pool, uid, days_back=7)
+                _ml_log.info(
+                    "startup orders cache user=%s fetched=%s saved=%s pages=%s",
+                    uid, res.get("fetched"), res.get("saved"), res.get("pages"),
+                )
+            except Exception as err:  # noqa: BLE001
+                _ml_log.warning("startup orders cache user=%s failed: %s", uid, err)
     except Exception as err:  # noqa: BLE001
         _ml_log.exception("startup backfill kickoff failed: %s", err)
 
