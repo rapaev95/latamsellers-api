@@ -105,6 +105,63 @@ def _bind_user_id(user_id: int) -> None:
     legacy_db.set_current_user_id(user_id)
 
 
+async def _resolve_primary_owner(pool, caller: CurrentUser) -> int:
+    """For global per-user endpoints (sku-mapping, rules) when there's no
+    `project` parameter: pick the project owner if the caller is a member of
+    any project, else the caller's own id.
+
+    Rationale: a collaborator with a membership in a single owner's project
+    should see that owner's sku catalog and bank rules so the data they're
+    looking at (vendas + classifications) is consistent. For a caller with
+    memberships in multiple owners' projects, we use the smallest owner id
+    deterministically — multi-tenant collaborator setups will need a more
+    careful UX (e.g. an owner selector), but no such users exist today.
+    """
+    if pool is None:
+        return caller.id
+    try:
+        from v2.services import project_members as pm_svc
+        memberships = await pm_svc.list_inherited_projects(pool, caller.id)
+    except Exception:
+        return caller.id
+    owner_ids = sorted({m["owner_id"] for m in memberships if m.get("owner_id")})
+    return owner_ids[0] if owner_ids else caller.id
+
+
+async def _resolve_effective_user_for_upload(
+    pool, caller: CurrentUser, upload_id: int,
+) -> int:
+    """For endpoints scoped by upload_id (transactions, bank classifications):
+    look up the upload's owner and project. If the caller is the owner or a
+    member of the upload's project, return the owner_id so legacy loaders
+    read from the owner's namespace. Otherwise return caller.id (legacy will
+    then 404 the row anyway via user_id mismatch).
+    """
+    if pool is None:
+        return caller.id
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT user_id, project_name FROM uploads WHERE id = $1",
+                int(upload_id),
+            )
+        if row is None:
+            return caller.id
+        owner_id = row["user_id"]
+        if owner_id == caller.id:
+            return caller.id
+        project = row["project_name"]
+        if not project:
+            return caller.id
+        from v2.services import project_members as pm_svc
+        membership_owner = await pm_svc.get_owner_for_project_via_membership(
+            pool, caller.id, project,
+        )
+        return owner_id if membership_owner == owner_id else caller.id
+    except Exception:
+        return caller.id
+
+
 async def _resolve_effective_user_for_project(
     pool, caller: CurrentUser, project: str,
 ) -> int:
@@ -343,7 +400,10 @@ async def get_services_reports(
             status_code=403,
             detail={"code": "superadmin_required", "feature": "services_reports"},
         )
-    _bind_user(user)
+
+    # ACL: members read through the project owner's namespace.
+    effective_user_id = await _resolve_effective_user_for_project(pool, user, project)
+    _bind_user_id(effective_user_id)
 
     projects = legacy_config.load_projects()
     if project not in projects:
@@ -386,7 +446,7 @@ async def get_services_reports(
 
     async def _compute_async() -> dict[str, Any]:
         bundle = await services_svc.compute_for_user(
-            pool, user.id, project, period_from=pf, period_to=pt,
+            pool, effective_user_id, project, period_from=pf, period_to=pt,
         )
         return {k: v for k, v in bundle.items() if k not in ("project", "period")}
 
@@ -398,9 +458,9 @@ async def get_services_reports(
         bundle = await _compute_async()
         cache_status = "force"
     else:
-        fp, deps = finance_cache.compute_fingerprint(user.id)
+        fp, deps = finance_cache.compute_fingerprint(effective_user_id)
         cached = (
-            finance_cache._read_cached(user.id, cache_key, fp) if fp else None  # noqa: SLF001
+            finance_cache._read_cached(effective_user_id, cache_key, fp) if fp else None  # noqa: SLF001
         )
         if cached is not None:
             bundle = cached
@@ -410,7 +470,7 @@ async def get_services_reports(
             has_error = any(k.endswith("_error") for k in bundle)
             if not has_error and fp:
                 stored = finance_cache._write_cached(  # noqa: SLF001
-                    user.id, cache_key, bundle, fp, deps,
+                    effective_user_id, cache_key, bundle, fp, deps,
                 )
                 cache_status = "miss" if stored else "compute_only"
             else:
@@ -754,9 +814,12 @@ async def get_sku_mapping(
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ):
-    _bind_user(user)
-    ml_sku_map = await _load_ml_items_sku_map(pool, user.id)
-    return _build_sku_mapping(user.id, ml_sku_map)
+    # ACL: members read the owner's sku catalog so the projects they see in
+    # /finance/projects also have a populated SKU mapping screen.
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
+    ml_sku_map = await _load_ml_items_sku_map(pool, effective_user_id)
+    return _build_sku_mapping(effective_user_id, ml_sku_map)
 
 
 @router.get("/pnl-gap-debug")
@@ -1384,14 +1447,21 @@ _ML_ORDER_URL = "https://www.mercadolivre.com.br/vendas/{oid}/detalhe"
 
 
 @router.get("/orphan-pacotes", response_model=OrphanPacotesResponse)
-def get_orphan_pacotes(user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
+async def get_orphan_pacotes(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
     """List all «Pacote de N produtos» orders with no resolvable SKU.
 
     Each item includes the ML order-detail link so the user can check the
     cart content manually before assigning a project. `assigned_project`
     reflects the current saved choice (or null).
+
+    ACL: members read the owner's orphan list so they can resolve missing
+    SKUs the owner uploaded.
     """
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
 
     from v2.legacy.reports import list_orphan_pacotes, load_orphan_assignments
 
@@ -1431,16 +1501,21 @@ def get_orphan_pacotes(user: CurrentUser = Depends(current_user)) -> dict[str, A
 
 
 @router.post("/orphan-pacotes/save", response_model=OrphanSaveOut)
-def save_orphan_pacotes(
+async def save_orphan_pacotes(
     body: OrphanSaveIn,
     user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
 ) -> dict[str, Any]:
     """Bulk-assign orphan pacote → project. null value clears the assignment.
 
     Returns the number of records that actually changed plus the total number
     of persisted assignments after the save.
+
+    ACL: writes go to the owner's namespace so the assignment is visible to
+    the dashboard the owner sees.
     """
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
 
     from v2.legacy.reports import save_orphan_assignments_bulk, load_orphan_assignments
 
@@ -1452,16 +1527,18 @@ def save_orphan_pacotes(
 # ── Retirada Overrides (per-row политика «списание / в обороте») ────────────
 
 @router.get("/retirada-overrides")
-def get_retirada_overrides(
+async def get_retirada_overrides(
     project: str = Query(..., min_length=1),
     user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
 ) -> dict[str, Any]:
     """Map текущих override'ов retirada-операций для проекта.
 
     Если override не задан, в response будет `overrides: {}` — это значит
     `Forma de retirada` берётся из ML-отчёта (Envio/Descarte) без изменений.
     """
-    _bind_user(user)
+    effective_user_id = await _resolve_effective_user_for_project(pool, user, project)
+    _bind_user_id(effective_user_id)
     from v2.legacy.reports import load_retirada_overrides
     raw = load_retirada_overrides(project) or {}
     # Канонизируем для UI: descarte/envio в lowercase.
@@ -1473,8 +1550,9 @@ def get_retirada_overrides(
 
 
 @router.get("/retirada/preview", response_model=RetiradaPreviewOut)
-def get_retirada_preview(
+async def get_retirada_preview(
     user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
 ) -> dict[str, Any]:
     """Все retirada-операции пользователя без project/period-фильтра.
 
@@ -1483,7 +1561,8 @@ def get_retirada_preview(
     Каждая строка содержит уже применённый override (если задан) и
     оригинальную ML forma.
     """
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.reports import list_all_retirada_rows
     rows = list_all_retirada_rows() or []
     projects = sorted({str(r.get("project") or "").strip() for r in rows if r.get("project")})
@@ -1491,9 +1570,10 @@ def get_retirada_preview(
 
 
 @router.post("/retirada-overrides")
-def save_retirada_overrides_endpoint(
+async def save_retirada_overrides_endpoint(
     body: RetiradaOverridesIn,
     user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
 ) -> dict[str, Any]:
     """Замена (replace, не merge) override-карты для проекта.
 
@@ -1501,7 +1581,12 @@ def save_retirada_overrides_endpoint(
     legacy/reports.save_retirada_overrides канонизирует значения — допустимо
     только `descarte` или `envio`, всё остальное отбрасывается.
     """
-    _bind_user(user)
+    # body has `project` field; resolve owner for that project so writes go
+    # to the right namespace.
+    effective_user_id = await _resolve_effective_user_for_project(
+        pool, user, getattr(body, "project", "") or "",
+    )
+    _bind_user_id(effective_user_id)
     from v2.legacy.reports import save_retirada_overrides, load_retirada_overrides
     overrides_map: dict[str, str] = {}
     for item in body.overrides or []:
@@ -1955,18 +2040,35 @@ _BANK_SOURCES = {"extrato_mp", "extrato_nubank", "extrato_c6_brl", "extrato_c6_u
 
 
 @router.get("/rules", response_model=RulesOut)
-def get_rules(user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
-    """Return the user's transaction-classification rules (user_data key `transaction_rules`)."""
-    _bind_user(user)
+async def get_rules(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Return classification rules (user_data key `transaction_rules`).
+
+    Members read the owner's rules so bank statement classification matches
+    what the owner sees on the dashboard.
+    """
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.config import load_transaction_rules
     rules = load_transaction_rules() or []
     return {"rules": rules, "count": len(rules)}
 
 
 @router.put("/rules", response_model=RulesOut)
-def put_rules(body: RulesSaveIn, user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
-    """Replace the full rules list. Normalization happens inside save_transaction_rules."""
-    _bind_user(user)
+async def put_rules(
+    body: RulesSaveIn,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Replace the full rules list. Normalization happens inside save_transaction_rules.
+
+    ACL: writes go to the project owner's namespace so changes show up on the
+    owner's dashboard for everyone with access.
+    """
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.config import save_transaction_rules, load_transaction_rules
     save_transaction_rules([r.model_dump() for r in body.rules])
     rules = load_transaction_rules() or []
@@ -1986,15 +2088,20 @@ async def get_transactions(
     """Parse a stored bank-statement file, apply rules, merge saved overrides.
 
     Response shape: list of rows with category/project/label + dropdown options.
+
+    ACL: resolved via the upload's project — if the caller is a member of that
+    project, we rebind to the owner so rules + overrides come from the owner's
+    namespace, and the upload row is read from the owner's user_id.
     """
     if pool is None:
         raise HTTPException(status_code=503, detail="db_unavailable")
-    _bind_user(user)
+    effective_user_id = await _resolve_effective_user_for_upload(pool, user, upload_id)
+    _bind_user_id(effective_user_id)
 
     from v2.legacy.bank_tx import parse_bank_tx_bytes, looks_like_pdf, CATEGORY_OPTIONS
     from v2.legacy.db_storage import db_load
 
-    stored = await uploads_storage.get_file(pool, user.id, upload_id)
+    stored = await uploads_storage.get_file(pool, effective_user_id, upload_id)
     if stored is None:
         raise HTTPException(status_code=404, detail="upload_not_found")
     if stored.source_key not in _BANK_SOURCES:
@@ -2055,12 +2162,15 @@ async def save_transactions(
     """
     if pool is None:
         raise HTTPException(status_code=503, detail="db_unavailable")
-    _bind_user(user)
+    effective_user_id = await _resolve_effective_user_for_upload(pool, user, upload_id)
+    _bind_user_id(effective_user_id)
 
     from v2.legacy.db_storage import db_load, db_save
 
-    # Ownership check — don't let clients write overrides for uploads they don't own
-    stored = await uploads_storage.get_file(pool, user.id, upload_id)
+    # Ownership check — don't let clients write overrides for uploads they don't own.
+    # If caller is a member, effective_user_id == owner's id and the upload row
+    # exists; otherwise it's caller's id and they can only see their own.
+    stored = await uploads_storage.get_file(pool, effective_user_id, upload_id)
     if stored is None:
         raise HTTPException(status_code=404, detail="upload_not_found")
 
@@ -2130,12 +2240,15 @@ async def get_bank_transactions_grouped(
             detail={"error": "unsupported_source", "source_key": source_key,
                     "supported": sorted(_BANK_SOURCES)},
         )
-    _bind_user(user)
+    # Bank statements are scoped to one user_id — for members we read the
+    # owner's uploads (so classification screen mirrors what the owner sees).
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
 
     from v2.legacy.bank_tx import parse_bank_tx_bytes, looks_like_pdf, CATEGORY_OPTIONS, extract_pdf_summary
     from v2.legacy.db_storage import db_load
 
-    files = await uploads_storage.fetch_files_by_source(pool, user.id, source_key)
+    files = await uploads_storage.fetch_files_by_source(pool, effective_user_id, source_key)
 
     rows_by_hash: dict[str, dict[str, Any]] = {}
     upload_ids: list[int] = []
@@ -2295,7 +2408,9 @@ async def save_bank_transactions_grouped(
         raise HTTPException(status_code=503, detail="db_unavailable")
     if source_key not in _BANK_SOURCES:
         raise HTTPException(status_code=400, detail="unsupported_source")
-    _bind_user(user)
+    # Writes go to the owner's namespace so the dashboard sees the change.
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
 
     from v2.legacy.db_storage import db_load, db_save
 
