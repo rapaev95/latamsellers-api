@@ -101,6 +101,16 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
         buyer = buyer_obj.get("nickname") or buyer_obj.get("first_name") or ""
         shipping = enriched.get("shipping") or {}
         pack_id = enriched.get("pack_id")
+        # Seller's internal SKU (артикул) — продавцу полезнее видеть свой
+        # внутренний код товара чем ML pack_id. Берём с item.seller_sku или
+        # с верхнего уровня order_item. fallback на pack_id ниже сохраняем
+        # для совместимости — если у продавца SKU не выставлен, всё равно
+        # есть идентификатор для ML deeplink.
+        seller_sku = ""
+        if isinstance(inner, dict):
+            seller_sku = str(inner.get("seller_sku") or "").strip()
+        if not seller_sku:
+            seller_sku = str(first.get("seller_sku") or "").strip()
 
         def _money(v: Any) -> str:
             try:
@@ -142,7 +152,9 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
             desc_lines.append(f"Comprador: {buyer}")
         if shipping.get("status"):
             desc_lines.append(f"Envio: {shipping.get('status')}")
-        if pack_id:
+        if seller_sku:
+            desc_lines.append(f"SKU: {seller_sku}")
+        elif pack_id:
             desc_lines.append(f"Pack #{pack_id}")
 
         # Attribution — organic vs ads. ML order payload иногда включает:

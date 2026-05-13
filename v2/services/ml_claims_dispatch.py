@@ -575,11 +575,95 @@ async def _summarize_complaint(
         return None
 
 
+async def _translate_text(
+    http: httpx.AsyncClient,
+    text: str,
+    target_lang: str,
+    pool: Optional[asyncpg.Pool] = None,
+    user_id: Optional[int] = None,
+) -> Optional[str]:
+    """Translate PT text to target_lang (ru/en) via OpenRouter, preserving meaning.
+
+    Used for `Resolução ML` blocks где AI-summary не генерируется (resolved
+    claims) и raw mediator text оставался в PT — продавец видел заголовок
+    «Решение ML:» а тело по-португальски. Возвращает None при сбое — caller
+    fallback'нет на raw PT.
+    """
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return None
+    if not text or not text.strip():
+        return None
+    target = (target_lang or "ru").lower()
+    if target not in ("ru", "en"):
+        return None  # pt — переводить незачем
+
+    if target == "ru":
+        sys_prompt = (
+            "Ты профессиональный переводчик. Переведи следующий текст с "
+            "португальского на русский. Сохраняй смысл и структуру (списки, "
+            "абзацы). Никаких комментариев — выводи ТОЛЬКО перевод."
+        )
+    else:
+        sys_prompt = (
+            "You are a professional translator. Translate the following text "
+            "from Portuguese to English. Preserve meaning and structure (lists, "
+            "paragraphs). No commentary — output ONLY the translation."
+        )
+
+    try:
+        r = await http.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://app.lsprofit.app",
+                "X-Title": "LS Profit App",
+            },
+            json={
+                "model": LLM_MODEL,
+                "max_tokens": 800,
+                "messages": [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": text[:2000]},
+                ],
+            },
+            timeout=20.0,
+        )
+        if r.status_code != 200:
+            log.warning("OpenRouter translate %s: %s", r.status_code, r.text[:200])
+            try:
+                from . import ai_usage_tracker as _tracker
+                await _tracker.log_call(
+                    pool, user_id=user_id, service="claims/translate_resolution",
+                    model=LLM_MODEL, response_data=None, status_code=r.status_code,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+        data = r.json()
+        try:
+            from . import ai_usage_tracker as _tracker
+            await _tracker.log_call(
+                pool, user_id=user_id, service="claims/translate_resolution",
+                model=LLM_MODEL, response_data=data, status_code=200,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        content = (data.get("choices") or [{}])[0].get("message", {}).get("content")
+        out = content.strip() if isinstance(content, str) else None
+        return out or None
+    except Exception as err:  # noqa: BLE001
+        log.exception("claim text translate failed: %s", err)
+        return None
+
+
 def _build_claim_card(
     claim: dict[str, Any],
     summary: Optional[str] = None,
     summary_lang: str = "ru",
     recommended_action: Optional[str] = None,
+    translated_complaint: Optional[str] = None,
 ) -> str:
     """MarkdownV2-formatted TG card for one actionable claim."""
     cid = claim.get("id") or "?"
@@ -685,7 +769,12 @@ def _build_claim_card(
                 lines.append(head_lbl)
             else:
                 lines.append("💬 *Motivo do comprador:*")
-            lines.append(_esc(clip))
+            # Для resolved + не-pt: показываем перевод вместо PT (если caller
+            # передал). На fallback (translation failed) — raw PT.
+            body_text = translated_complaint if (
+                is_resolved and translated_complaint and summary_lang in ("ru", "en")
+            ) else clip
+            lines.append(_esc(body_text))
 
     # If ML expects the seller to respond to the mediator (action
     # 'send_message_to_mediator' — common in dispute stage), surface the
@@ -988,6 +1077,7 @@ async def _send_claim(
     app_base_url: str,
     summary: Optional[str] = None,
     summary_lang: str = "ru",
+    translated_complaint: Optional[str] = None,
 ) -> Optional[str]:
     """Send one claim card. Returns TG message_id on success."""
     cid_raw = claim.get("id")
@@ -1000,6 +1090,7 @@ async def _send_claim(
     text = _build_claim_card(
         claim, summary=summary, summary_lang=summary_lang,
         recommended_action=recommended_action,
+        translated_complaint=translated_complaint,
     )
     if len(text) > 4000:
         text = text[:3990] + "…"
@@ -1125,8 +1216,21 @@ async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int, app_base_url: str
             # _build_claim_card сам подхватит mediator-текст через
             # _extract_buyer_complaint и пометит его как «Resumo da resolução».
             skip_ai_summary = _is_ml_resolved(enriched)
+            translated_complaint: Optional[str] = None
             if skip_ai_summary:
-                pass
+                # Resolved-claim: AI-summary НЕ генерируем, но тело
+                # `complaint` оставалось в PT. Если у юзера ru/en — переводим
+                # raw text напрямую через OpenRouter (без summarization).
+                if summary_lang in ("ru", "en"):
+                    complaint_for_translate = _extract_buyer_complaint(enriched)
+                    if complaint_for_translate:
+                        clip_for_translate = complaint_for_translate[:600].rstrip()
+                        if len(complaint_for_translate) > 600:
+                            clip_for_translate += "…"
+                        translated_complaint = await _translate_text(
+                            http, clip_for_translate, summary_lang,
+                            pool=pool, user_id=user_id,
+                        )
             elif summary_lang in ("ru", "en"):
                 cached = row["tg_summary"]
                 cached_lang = row["tg_summary_lang"]
@@ -1166,6 +1270,7 @@ async def _dispatch_for_user(pool: asyncpg.Pool, user_id: int, app_base_url: str
             msg_id = await _send_claim(
                 http, bot_token, chat_id, enriched, app_base_url,
                 summary=summary, summary_lang=summary_lang,
+                translated_complaint=translated_complaint,
             )
             if msg_id:
                 async with pool.acquire() as conn:
