@@ -341,6 +341,38 @@ async def _backfill_all_users_job() -> None:
         _ml_log.exception("ML backfill job failed: %s", err)
 
 
+async def _full_inventory_refresh_job() -> None:
+    """Refresh physical Full warehouse stock for every ML-connected user.
+    Runs on cron (4h) — stock в Full меняется быстро при активных продажах,
+    чтобы цифра в TG совпадала с ML UI нужна частая синхронизация."""
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("full_inventory job skipped: no DB pool")
+            return
+        from v2.services import ml_full_inventory as _full_inv
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT user_id FROM ml_user_tokens WHERE access_token IS NOT NULL"
+            )
+        total_inv = 0
+        total_failed = 0
+        for r in rows:
+            uid = r["user_id"]
+            try:
+                res = await _full_inv.refresh_user_full_inventory(pool, uid)
+                total_inv += res.get("inventories", 0)
+                total_failed += res.get("failed", 0)
+            except Exception as err:  # noqa: BLE001
+                _ml_log.warning("full_inventory tick user %s: %s", uid, err)
+        _ml_log.info(
+            "ML full_inventory tick: users=%s inventories=%s failed=%s",
+            len(rows), total_inv, total_failed,
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("ML full_inventory job failed: %s", err)
+
+
 async def _backfill_startup_kickoff() -> None:
     """Run on service startup with days=7 — catches up gaps from long downtime
     (scheduler stalls, deployment failures, etc). The 24h cron only does days=1
@@ -382,6 +414,20 @@ async def _backfill_startup_kickoff() -> None:
                 )
             except Exception as err:  # noqa: BLE001
                 _ml_log.warning("startup orders cache user=%s failed: %s", uid, err)
+        # (3) ml_full_inventory — physical Full warehouse stock per inventory_id.
+        # Replaces user XLSX uploads — ml_inventory_forecast._get_stock читает
+        # это priority-1 чтобы сток в TG совпадал с ML UI («Aptas para venda»).
+        from v2.services import ml_full_inventory as _full_inv_kick
+        for r in rows:
+            uid = r["user_id"]
+            try:
+                res = await _full_inv_kick.refresh_user_full_inventory(pool, uid)
+                _ml_log.info(
+                    "startup full inventory user=%s: inventories=%s mlbs=%s failed=%s",
+                    uid, res.get("inventories"), res.get("mlbs"), res.get("failed"),
+                )
+            except Exception as err:  # noqa: BLE001
+                _ml_log.warning("startup full inventory user=%s failed: %s", uid, err)
     except Exception as err:  # noqa: BLE001
         _ml_log.exception("startup backfill kickoff failed: %s", err)
 
@@ -771,6 +817,18 @@ async def _nightly_refresh_all_users_job() -> None:
                     )
                 except Exception as err:  # noqa: BLE001
                     _ml_log.warning("nightly promotions user %s: %s", uid, err)
+                # Physical Full warehouse stock — replaces user XLSX uploads.
+                # ml_full_inventory cache читается inventory_forecast'ом
+                # priority-1 (см. ml_inventory_forecast._get_stock).
+                try:
+                    from v2.services import ml_full_inventory as _full_inv_svc
+                    res = await _full_inv_svc.refresh_user_full_inventory(pool, uid)
+                    _ml_log.info(
+                        "nightly full inventory user=%s: inventories=%s mlbs=%s failed=%s",
+                        uid, res.get("inventories"), res.get("mlbs"), res.get("failed"),
+                    )
+                except Exception as err:  # noqa: BLE001
+                    _ml_log.warning("nightly full_inventory user %s: %s", uid, err)
             try:
                 await ml_user_questions_svc.refresh_user_questions(pool, uid)
             except Exception as err:  # noqa: BLE001
@@ -1042,6 +1100,20 @@ async def _v2_startup() -> None:
         "interval",
         hours=_backfill_interval_hours,
         id="ml_backfill_daily",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Physical Full warehouse stock sync every 4h — ml_inventory_forecast reads
+    # this priority-1 (over XLSX upload + /items.available_quantity). Default
+    # 4h to keep TG stock numbers within ~percent of live ML UI; override via
+    # FULL_INVENTORY_INTERVAL_HOURS.
+    _full_inv_interval = float(os.environ.get("FULL_INVENTORY_INTERVAL_HOURS", "4"))
+    _ml_scheduler.add_job(
+        _full_inventory_refresh_job,
+        "interval",
+        hours=_full_inv_interval,
+        id="ml_full_inventory_refresh",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

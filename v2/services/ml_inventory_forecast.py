@@ -67,18 +67,31 @@ async def _get_window_days(pool: asyncpg.Pool, user_id: int) -> int:
     return DEFAULT_WINDOW_DAYS
 
 
+async def _get_stock_from_api_cache(
+    pool: asyncpg.Pool, user_id: int, item_id: str,
+) -> Optional[int]:
+    """Priority-1 source: ml_full_inventory cache populated via ML
+    /inventories/{id}/stock/fulfillment endpoint. Returns the AVAILABLE
+    quantity (excludes lost/blocked units) — matches ML UI's «Aptas para
+    venda». Returns None if not cached (caller falls back to XLSX → API)."""
+    try:
+        from . import ml_full_inventory as _full_inv
+        entry = await _full_inv.get_total_by_mlb(pool, user_id, item_id)
+        if entry is None:
+            return None
+        return int(entry.get("available_quantity") or 0)
+    except Exception as err:  # noqa: BLE001
+        log.debug("ml_full_inventory lookup failed for %s: %s", item_id, err)
+        return None
+
+
 async def _get_stock_full_for_mlb(
     pool: asyncpg.Pool, user_id: int, item_id: str,
 ) -> Optional[int]:
-    """Lookup physical Full stock for a given MLB from user's latest
-    stock_full XLSX upload. Returns None if no upload exists or MLB not
-    found in any SKU entry. ML /items API returns "allocated" stock
-    (133 for MLB6143605452) which is per-listing share; the physical
-    report shows actual warehouse total (172) shared across listings.
-
-    User explicitly requested «руководствуемся отчётом физическим» —
-    if a stock_full report is uploaded, it takes priority over /items
-    API value. Falls back to API only when no report exists.
+    """Priority-2 source: lookup physical Full stock for a given MLB from
+    user's latest stock_full XLSX upload. Used as fallback when API cache
+    (ml_full_inventory) is empty — e.g., if API refresh failed or scope
+    missing. Returns None if no upload exists or MLB not found.
     """
     try:
         from v2.parsers import db_loader as _db_loader
@@ -107,20 +120,25 @@ async def _get_stock(
 ) -> tuple[Optional[int], Optional[str]]:
     """Returns (stock_int, variation_label).
 
-    Stock source priority:
-      1. Physical stock_full XLSX (user-uploaded report) — covers shared
-         listings/inventory pool correctly. Used only when variation_id
-         not supplied (report не хранит per-variation breakdown).
-      2. ml_user_items.available_quantity — from ML /items API (per-listing
-         allocation, undercounts shared-inventory listings).
+    Stock source priority (no variation_id):
+      1. ml_full_inventory cache — populated from ML /inventories/{id}/
+         stock/fulfillment API. Freshest + handles shared inventory
+         correctly via external_references.
+      2. stock_full XLSX upload (user-uploaded report) — fallback if API
+         refresh failed.
+      3. ml_user_items.available_quantity — last resort. Returns
+         per-listing allocation, may undercount shared-inventory listings.
 
     If variation_id is provided, drills into ml_user_items.raw.variations[]
     and returns the matched variation's available_quantity + a short
-    label derived from variation attributes. Falls back to item-level
-    available_quantity if variation not found in cached raw.
+    label derived from variation attributes. (Variation-level breakdown
+    not available from /inventories/.../stock/fulfillment.)
     """
-    # Physical Full report takes priority for item-level lookups (no variation).
+    # Physical Full stock takes priority for item-level lookups (no variation).
     if not variation_id:
+        api_cached = await _get_stock_from_api_cache(pool, user_id, item_id)
+        if api_cached is not None:
+            return api_cached, None
         physical = await _get_stock_full_for_mlb(pool, user_id, item_id)
         if physical is not None:
             return physical, None
