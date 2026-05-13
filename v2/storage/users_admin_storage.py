@@ -222,7 +222,8 @@ async def grant_tier(pool: asyncpg.Pool, user_id: int, tier: str) -> Optional[di
 async def list_distinct_projects(pool: asyncpg.Pool) -> list[str]:
     """All project_name values known to the system, deduplicated and sorted.
 
-    Three sources, unioned:
+    Three sources, unioned in Python to keep each source's failure mode
+    isolated (a malformed JSONB row mustn't take down the whole query):
       1. `uploads.project_name` — explicit upload-to-project tag (optional)
       2. `project_members.project_name` — someone got invited to it
       3. `user_data` keys `f2_projects` / `projects` — the per-user JSONB dict
@@ -232,27 +233,53 @@ async def list_distinct_projects(pool: asyncpg.Pool) -> list[str]:
 
     Empty strings and the "NAO_CLASSIFICADO" sentinel are filtered out.
     """
+    names: set[str] = set()
     async with pool.acquire() as conn:
+        # 1) uploads
+        try:
+            rows = await conn.fetch(
+                "SELECT DISTINCT project_name FROM uploads "
+                " WHERE project_name IS NOT NULL AND project_name <> ''"
+            )
+            names.update(r["project_name"] for r in rows)
+        except asyncpg.PostgresError:
+            pass  # column may be absent on a fresh DB before first ensure_project_name_column()
+
+        # 2) project_members
+        try:
+            rows = await conn.fetch(
+                "SELECT DISTINCT project_name FROM project_members "
+                " WHERE project_name IS NOT NULL AND project_name <> ''"
+            )
+            names.update(r["project_name"] for r in rows)
+        except asyncpg.PostgresError:
+            pass
+
+        # 3) user_data finance project dicts — parse JSONB in Python so a bad
+        # row doesn't abort the whole listing. data_value may come back as
+        # str (text column) or dict (JSONB with codec registered).
         rows = await conn.fetch(
-            """
-            SELECT project_name
-              FROM (
-                SELECT DISTINCT project_name FROM uploads
-                 WHERE project_name IS NOT NULL AND project_name <> ''
-                UNION
-                SELECT DISTINCT project_name FROM project_members
-                 WHERE project_name IS NOT NULL AND project_name <> ''
-                UNION
-                SELECT DISTINCT jsonb_object_keys(data_value) AS project_name
-                  FROM user_data
-                 WHERE data_key IN ('f2_projects', 'projects')
-                   AND jsonb_typeof(data_value) = 'object'
-              ) p
-             WHERE project_name <> '' AND project_name <> 'NAO_CLASSIFICADO'
-             ORDER BY project_name
-            """,
+            "SELECT data_value FROM user_data "
+            " WHERE data_key IN ('f2_projects', 'projects')"
         )
-    return [r["project_name"] for r in rows]
+        for r in rows:
+            raw = r["data_value"]
+            value: Any = raw
+            if isinstance(raw, (bytes, bytearray)):
+                value = raw.decode("utf-8", errors="ignore")
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except (ValueError, TypeError):
+                    continue
+            if isinstance(value, dict):
+                for k in value.keys():
+                    if isinstance(k, str):
+                        names.add(k)
+
+    names.discard("")
+    names.discard("NAO_CLASSIFICADO")
+    return sorted(names)
 
 
 async def revoke_tier(pool: asyncpg.Pool, user_id: int, tier: str) -> Optional[dict[str, Any]]:
