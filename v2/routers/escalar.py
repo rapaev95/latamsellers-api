@@ -3242,10 +3242,9 @@ async def orders_notice_from_webhook(
     enrichment_status = "skipped"
     if topic in ("orders_v2", "orders"):
         try:
-            async with pool.acquire() as conn:
-                await ml_backfill_svc._enrich_order_with_margin(
-                    conn, body.user_id, enriched, pool=pool,
-                )
+            await ml_backfill_svc._enrich_order_with_margin(
+                body.user_id, enriched, pool=pool,
+            )
             enrichment_status = (
                 "with_margin_breakeven" if (
                     enriched.get("_margin") and enriched.get("_breakeven")
@@ -3461,10 +3460,9 @@ async def order_replay_notice(
     enrich_result = {"called": False, "exception": None}
     if item_id and sale_price > 0 and pool is not None:
         try:
-            async with pool.acquire() as conn:
-                await ml_backfill_svc._enrich_order_with_margin(
-                    conn, user.id, enriched, pool=pool,
-                )
+            await ml_backfill_svc._enrich_order_with_margin(
+                user.id, enriched, pool=pool,
+            )
             enrich_result["called"] = True
         except Exception as err:  # noqa: BLE001
             enrich_result["exception"] = str(err)

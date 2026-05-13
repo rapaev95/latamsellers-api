@@ -22,7 +22,15 @@ async def create_pool() -> asyncpg.Pool | None:
     dsn = get_settings().database_url
     if not dsn:
         return None
-    _pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=5)
+    _pool = await asyncpg.create_pool(
+        dsn=dsn,
+        min_size=1,
+        max_size=5,
+        # Prevent a single misbehaving query from holding a pool slot forever.
+        # Без него падение DB / зависший запрос навечно отнимали бы коннект
+        # и приводили к exhaustion (см. инцидент с _enrich_order_with_margin).
+        command_timeout=30.0,
+    )
     return _pool
 
 

@@ -224,7 +224,7 @@ ON CONFLICT (user_id, notice_id) DO UPDATE SET
 
 
 async def _enrich_order_with_margin(
-    conn: asyncpg.Connection, user_id: int, enriched: dict, period_months: int = 3,
+    user_id: int, enriched: dict, period_months: int = 3,
     pool: Optional[asyncpg.Pool] = None,
 ) -> None:
     """Injects `_margin` (apply_hypothetical_price от sale_price) в order payload.
@@ -237,7 +237,15 @@ async def _enrich_order_with_margin(
     Также инжектит `_breakeven` — state break-even tracker'а после этой
     продажи (cumulative variable margin + target + breakeven_reached). Это
     показывается в TG normalize как "📈 Прогресс месяца".
+
+    Acquires its own connections from `pool` and releases each before calling
+    subservices (breakeven / inventory / paused-with-stock). Не принимает
+    caller-owned `conn` — иначе под concurrent webhook load 5+ хэндлеров
+    держат по одному коннекту и одновременно делают nested pool.acquire(),
+    что исчерпывает пул и навечно блокирует scheduler-задачи.
     """
+    if pool is None:
+        return
     from . import ml_item_margin as ml_margin_svc
     from . import ml_breakeven as breakeven_svc
 
@@ -260,16 +268,15 @@ async def _enrich_order_with_margin(
     if not item_id or sale_price <= 0:
         return
 
-    # Inline-query (тот же что в get_cached_margin), потому что у нас уже
-    # есть conn. Это копия нескольких строк ради избегания двойного pool-acquire.
-    row = await conn.fetchrow(
-        """
-        SELECT payload, computed_at
-          FROM ml_item_margin_cache
-         WHERE user_id = $1 AND item_id = $2 AND period_months = $3
-        """,
-        user_id, item_id, period_months,
-    )
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT payload, computed_at
+              FROM ml_item_margin_cache
+             WHERE user_id = $1 AND item_id = $2 AND period_months = $3
+            """,
+            user_id, item_id, period_months,
+        )
     if not row:
         return
     payload = row["payload"]
@@ -317,8 +324,6 @@ async def _enrich_order_with_margin(
         except (ValueError, TypeError):
             sale_dt = None
 
-    if pool is None:
-        return  # без pool не можем — graceful skip
     try:
         await breakeven_svc.ensure_schema(pool)
         order_id_for_dedup = str(enriched.get("id") or "").strip() or None
@@ -511,12 +516,11 @@ async def _upsert_batch(
     for topic, resource, enriched in items:
         # For orders — pre-enrich with cached unit margin (apply_hypothetical_price
         # at sale_price) so normalize-ветка orders_v2 рисует profit/breakdown.
-        # `pool` нужен enricher'у для вторичного pool.acquire() в breakeven
-        # tracker'е (не можем reuse `conn` потому что он внутри transaction'а
-        # caller'а — `add_sale_and_check_breakeven` делает свой commit).
+        # Enrich manages its own pool acquires; не передаём наш `conn`, иначе
+        # nested acquire-while-holding-conn исчерпывает пул под concurrent load.
         if topic in ("orders_v2", "orders"):
             try:
-                await _enrich_order_with_margin(conn, user_id, enriched, pool=pool)
+                await _enrich_order_with_margin(user_id, enriched, pool=pool)
             except Exception as err:  # noqa: BLE001
                 log.debug("enrich order margin failed: %s", err)
         try:
