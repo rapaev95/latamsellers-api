@@ -354,9 +354,51 @@ def _empty_cashflow(reason: str) -> dict[str, Any]:
         "total_outflows": 0.0,
         "debito_estonia": 0.0,
         "by_month": {},
+        "operating_expenses": {"total_brl": 0.0, "transactions": []},
         "_needs_config": True,
         "_reason": reason,
     }
+
+
+def _load_operating_expenses(project_id: str) -> dict[str, Any]:
+    """Pull manual operating expenses for a services project from projects_db.
+
+    Services-cashflow generators (generate_dds_estonia) only handle invoice/transfer
+    flows — they don't surface the company's running costs (ads, salaries, rent,
+    accounting, software, etc.). Those live as `manual_expenses` on the project
+    record, same shape that ecom compute_cashflow already consumes. We read them
+    here so the services DDS tab can show them too.
+    """
+    try:
+        from v2.legacy import config as legacy_config
+        from v2.legacy.finance import _entry_valor_brl
+        projects = legacy_config.load_projects()
+    except Exception as err:  # noqa: BLE001
+        log.warning("services_reports.operating_expenses: load failed for %s: %s", project_id, err)
+        return {"total_brl": 0.0, "transactions": []}
+
+    proj_meta = projects.get(project_id, {}) or {}
+    raw = proj_meta.get("manual_expenses") or []
+    txs: list[dict[str, Any]] = []
+    total = 0.0
+    for item in raw:
+        try:
+            v_brl = abs(_entry_valor_brl(item))
+        except Exception:  # noqa: BLE001
+            continue
+        total += v_brl
+        cur = str(item.get("currency", "BRL") or "BRL").upper()
+        txs.append({
+            "date": str(item.get("date") or "")[:10],
+            "valor_brl": -v_brl,
+            "category": item.get("category", "expense"),
+            "note": item.get("note", ""),
+            "currency": cur,
+            "valor_orig": float(item.get("valor", 0) or 0),
+            "rate": float(item.get("rate_brl", 0) or 0) if cur != "BRL" else None,
+        })
+    txs.sort(key=lambda r: r.get("date") or "", reverse=True)
+    return {"total_brl": round(total, 2), "transactions": txs}
 
 
 def _empty_balance(reason: str) -> dict[str, Any]:
@@ -426,11 +468,17 @@ def generate_services_cashflow_sync(project_id: str) -> dict[str, Any]:
         from v2.legacy.reports import generate_dds_estonia
         result = generate_dds_estonia()
         result["_needs_config"] = False
+        result["operating_expenses"] = _load_operating_expenses(project_id)
         return result
 
-    return _empty_cashflow(
+    # Non-Estonia services project — DDS skeleton is still empty, but manual
+    # operating expenses (ads, rent, salaries, …) entered via the project UI
+    # are real and should surface even before Phase 6.
+    result = _empty_cashflow(
         "not_yet_supported: only ESTONIA is wired (Phase 6 generic refactor pending)"
     )
+    result["operating_expenses"] = _load_operating_expenses(project_id)
+    return result
 
 
 def generate_services_balance_sync(project_id: str) -> dict[str, Any]:

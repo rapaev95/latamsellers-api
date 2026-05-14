@@ -1057,6 +1057,12 @@ class ServicesCashflowOut(BaseModel):
     total_outflows: float = 0
     debito_estonia: float = 0
     by_month: dict[str, dict[str, Any]] = {}
+    # Manual operating expenses (ads, rent, salaries, accounting, software, …)
+    # read from project.manual_expenses. Surfaced in the services DDS tab so the
+    # company's running costs are visible alongside invoice/transfer flows.
+    # Shape: {"total_brl": float, "transactions": [{date, valor_brl, category,
+    # note, currency, valor_orig, rate}]}.
+    operating_expenses: dict[str, Any] = {"total_brl": 0, "transactions": []}
     needs_config: bool = Field(default=False, alias="_needs_config")
     reason: Optional[str] = Field(default=None, alias="_reason")
 
