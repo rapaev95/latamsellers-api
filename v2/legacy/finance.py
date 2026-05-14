@@ -837,7 +837,11 @@ def compute_cashflow(project: str, period: tuple[date, date]) -> CashFlowReport:
         + Operating profit из ОПиУ (то что заработано на продажах после всех расходов)
         + USDT инвестиции собственника (Artur)
         - Bank outflows категории "supplier" (закупки товара)
+        - Bank outflows прочих категорий: expense, tax, bank_fee, dividends, software
         = Cash position
+
+    Категории fx и internal_transfer в ДДС НЕ учитываются — это конверсия валюты
+    и внутренние переводы между своими счетами, не реальный отток капитала.
 
     Это НЕ строгая бухгалтерия — операционная прибыль это accrual,
     а supplier — реальный cash. Смешение допущено для управленческого
@@ -986,6 +990,33 @@ def compute_cashflow(project: str, period: tuple[date, date]) -> CashFlowReport:
             val = 0
         supplier_total += val
         supplier_txs.append(tx)
+
+    # 3b. Прочие банковские расходы из классифицированных выписок.
+    # Категории: expense, tax, bank_fee, dividends, software.
+    # fx и internal_transfer НЕ включены — это конверсия валюты / внутренний
+    # перевод, не реальный отток. C6 USD пропускаем — BRL-стоимость USD-расходов
+    # определяется через FIFO câmbio (cambio.py), а не прямой суммой Valor
+    # (которая в USD, не в BRL).
+    BANK_OUTFLOW_CATS = {"expense", "tax", "bank_fee", "dividends", "software"}
+    for tx in live.get("transactions", []):
+        cat = str(tx.get("Категория", "") or "").lower()
+        if cat not in BANK_OUTFLOW_CATS:
+            continue
+        if str(tx.get("_source_key", "")) == "extrato_c6_usd":
+            continue
+        ds = str(tx.get("Data", ""))
+        try:
+            td = _pd.to_datetime(ds, dayfirst=True).date()
+        except Exception:
+            continue
+        if td > period_end:
+            continue
+        try:
+            val = abs(float(tx.get("Valor", 0) or 0))
+        except (ValueError, TypeError):
+            val = 0
+        other_expenses_total += val
+        other_expenses_txs.append(tx)
 
     # Manual supplier entries — факт, всё до period_end
     from datetime import datetime as _dt
