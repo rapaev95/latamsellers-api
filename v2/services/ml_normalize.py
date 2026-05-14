@@ -710,6 +710,14 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
             t = item_title if len(item_title) <= 90 else item_title[:87] + "..."
             desc_lines.append(f"📦 {t}")
         desc_lines.append(f"🆔 {item_id}")
+        # Auto-price warning — ML blocks manual price changes on items с активной
+        # pricing-automation rule. Если seller жмёт «Поднять +X% и принять»,
+        # accept упадёт с "price not_modifiable". Помечаем заранее так seller
+        # знает что попросят подтвердить отключение Dynamic Pricing.
+        # `_has_auto_price` injected by refresh_user_promotions (см.
+        # ml_user_promotions.refresh_user_promotions комментарий).
+        if enriched.get("_has_auto_price"):
+            desc_lines.append("⚠️ *Auto-cena (Precificação Dinâmica) ATIVA* — ML controla o preço; «Subir» pedirá confirmação para desligá-la primeiro")
         desc_lines.append("")
         desc_lines.append(f"🏷 Tipo: {type_friendly}")
         if promo_name and promo_name.lower() != type_friendly.lower():

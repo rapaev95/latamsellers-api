@@ -64,7 +64,8 @@ ALTER TABLE ml_user_promotions
   ADD COLUMN IF NOT EXISTS dismissed_at TIMESTAMPTZ,
   ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ,
   ADD COLUMN IF NOT EXISTS last_reminder_at TIMESTAMPTZ,
-  ADD COLUMN IF NOT EXISTS reminder_count INT NOT NULL DEFAULT 0;
+  ADD COLUMN IF NOT EXISTS reminder_count INT NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS has_auto_price BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS idx_ml_promo_pending_dispatch
   ON ml_user_promotions(user_id, notified_at, last_reminder_at)
   WHERE status = 'candidate' AND dismissed_at IS NULL AND accepted_at IS NULL;
@@ -301,10 +302,31 @@ async def refresh_user_promotions(
             if not offers:
                 await asyncio.sleep(RATE_SLEEP)
                 continue
+            # Check if this item has an active auto-price rule. ML blocks
+            # manual price changes when /pricing-automation rule is set —
+            # seller needs to know about this before clicking promo «Принять»
+            # с raise, иначе accept упадёт с "price not_modifiable".
+            # 200 = rule exists; 404 = none; everything else (5xx) → conservative
+            # False so we don't mis-warn. One GET per item с promo (~50/refresh).
+            has_auto_price = False
+            try:
+                ar = await http.get(
+                    f"https://api.mercadolibre.com/pricing-automation/items/{mlb}/automation",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10.0,
+                )
+                has_auto_price = (ar.status_code == 200)
+            except Exception as err:  # noqa: BLE001
+                log.debug("auto-price probe failed for %s: %s", mlb, err)
             try:
                 fetched_promo_ids: list[str] = []
                 async with pool.acquire() as conn:
                     for offer in offers:
+                        # Tag offer raw payload with has_auto_price BEFORE upsert
+                        # so it persists in ml_user_promotions.raw and survives
+                        # to TG normalization (where promo card is composed).
+                        if isinstance(offer, dict):
+                            offer["_has_auto_price"] = has_auto_price
                         is_new = await _upsert_offer(conn, user_id, mlb, offer)
                         upserted += 1
                         promo_id_str = str(offer.get("id") or offer.get("promotion_id") or "")
@@ -320,8 +342,20 @@ async def refresh_user_promotions(
                                 "deal_price": offer.get("deal_price"),
                                 "original_price": offer.get("original_price"),
                                 "discount_percentage": offer.get("discount_percentage"),
+                                "has_auto_price": has_auto_price,
                                 "raw": offer,
                             })
+                    # Persist has_auto_price on all promo rows of this item
+                    # (so callback handler can branch into raise_with_disable_dyn
+                    # if needed without re-querying ML).
+                    await conn.execute(
+                        """
+                        UPDATE ml_user_promotions
+                           SET has_auto_price = $3
+                         WHERE user_id = $1 AND item_id = $2
+                        """,
+                        user_id, mlb, has_auto_price,
+                    )
                     # Candidates that ML no longer returns for this item were
                     # accepted/rejected outside TG (web UI, app, API). Mark
                     # them dismissed so the dispatcher stops sending reminders.
