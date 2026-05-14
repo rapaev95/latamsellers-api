@@ -295,6 +295,50 @@ async def _enrich_order_with_margin(
         log.debug("margin recompute failed for %s: %s", item_id, err)
         return
 
+    # ── Velocity adjustment ───────────────────────────────────────────────
+    # Cached margin uses vendas CSV для units_sold count, который юзер
+    # обновляет вручную раз в N дней. Когда продажи ускорились (например
+    # +20×) — vendas-based count устарел и fixed_overhead_per_unit
+    # завышен в 20×. ml_user_orders (API source, обновляется автоматически)
+    # имеет правильную velocity. Если API-count существенно выше cached —
+    # масштабируем fixed_overhead_per_unit и пересчитываем net.
+    try:
+        from datetime import datetime as _dt2, timedelta as _td, timezone as _tz
+        from . import ml_orders as _ml_orders_svc
+        cached_units = int(payload.get("units_sold") or 0)
+        if cached_units > 0:
+            period_months = int(payload.get("period_months") or 3)
+            end = _dt2.now(_tz.utc)
+            start = end - _td(days=30 * period_months)
+            win = await _ml_orders_svc.get_orders_for_window(
+                pool, user_id, item_id, start, end,
+            )
+            api_units = int(win.get("units") or 0)
+            # Only scale DOWN — никогда не увеличиваем overhead/unit
+            # на случай если ml_user_orders ещё не догнал backfill.
+            if api_units > cached_units * 1.5:  # 50%+ выше cached
+                ratio = cached_units / api_units
+                unit_d = recomputed.get("unit") or {}
+                old_fixed = unit_d.get("fixed_overhead_per_unit")
+                profit_var = unit_d.get("profit_variable")
+                price_b = unit_d.get("current_price") or sale_price
+                if old_fixed is not None and profit_var is not None and price_b:
+                    new_fixed = float(old_fixed) * ratio
+                    new_net = float(profit_var) - new_fixed
+                    unit_d["fixed_overhead_per_unit"] = round(new_fixed, 2)
+                    unit_d["profit_net_per_unit"] = round(new_net, 2)
+                    unit_d["margin_net_pct"] = round(new_net / float(price_b) * 100, 1)
+                    recomputed["velocity_adjustment"] = {
+                        "cached_units_3m": cached_units,
+                        "api_units_3m": api_units,
+                        "ratio": round(ratio, 4),
+                        "source": "ml_user_orders",
+                    }
+                    recomputed["unit"] = unit_d
+                    enriched["_margin"] = recomputed
+    except Exception as err:  # noqa: BLE001
+        log.debug("velocity adjustment failed for %s: %s", item_id, err)
+
     # Break-even tracker: добавить эту продажу в cumulative проекта/месяца.
     # Project определяется из margin payload (тот же что в /escalar/products).
     project = recomputed.get("project") or payload.get("project")
