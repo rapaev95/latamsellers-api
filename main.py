@@ -341,6 +341,24 @@ async def _backfill_all_users_job() -> None:
         _ml_log.exception("ML backfill job failed: %s", err)
 
 
+async def _fbm_capacity_check_job() -> None:
+    """Scrape FBM space-purchase page, detect when ML opens new units in
+    «Pequenos» / «Grandes» categories. Push TG alert on transition 0→N>0."""
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("FBM capacity job skipped: no DB pool")
+            return
+        from v2.services import ml_fbm_capacity as _cap
+        res = await _cap.check_all_users(pool)
+        _ml_log.info(
+            "FBM capacity tick: users=%s alerts=%s errors=%s",
+            res.get("users_checked"), res.get("alerts"), res.get("errors"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("FBM capacity job failed: %s", err)
+
+
 async def _aging_stock_alerts_job() -> None:
     """Scan ml_full_inventory + velocity for not_supported/lost/transfer units
     and «excedente» (slow movers) — push TG notices via ml_notices."""
@@ -1148,6 +1166,21 @@ async def _v2_startup() -> None:
         _aging_stock_alerts_job,
         CronTrigger(hour=11, minute=0, timezone="UTC"),
         id="ml_aging_stock_alerts_daily",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # FBM space-purchase capacity check — every 2h. Scrapes ML's web-UI page
+    # «Comprar mais espaço no Full» (public API doesn't expose this) via
+    # the existing Playwright session. Alerts on transition 0→N>0 для каждой
+    # категории (Pequenos / Grandes) — momento когда ML открывает slots.
+    # Auto-buy НЕ делаем — финансовое действие требует explicit user click.
+    _fbm_cap_interval = float(os.environ.get("FBM_CAPACITY_CHECK_INTERVAL_H", "2"))
+    _ml_scheduler.add_job(
+        _fbm_capacity_check_job,
+        "interval",
+        hours=_fbm_cap_interval,
+        id="ml_fbm_capacity_check",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
