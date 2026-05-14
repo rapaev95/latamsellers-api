@@ -467,19 +467,40 @@ async def _dispatch_to_telegram(
             user_id,
         )
 
+        # Atomic claim: SELECT + UPDATE telegram_sent_at в одной транзакции
+        # с FOR UPDATE SKIP LOCKED. Это предотвращает race condition при
+        # одновременном дispatch'е из двух процессов (typical scenario —
+        # Railway redeploy: old container ещё дispatch'ит, new container
+        # startup kicks _dispatch_pending_telegram_job → оба видят те же
+        # pending rows и шлют один и тот же notice ДВА раза в TG).
+        # tg_sent_at ставим СРАЗУ (до send_notice). Если send fails ниже,
+        # делаем rollback на эту строку (NULL опять). Trade-off: при крэше
+        # уже claim'нутая но не отправленная нотиция «потеряется» (не
+        # ре-tried). Но это лучше чем дубль в TG для seller'а — finance
+        # нотиции дублировать в чате критично, а потеря одной (раз в N
+        # деплоев) приемлема.
         pending_rows = await conn.fetch(
             """
-            SELECT notice_id, label, description, actions, tags, topic, raw,
-                   ai_digest_at
-              FROM ml_notices
-             WHERE user_id = $1 AND telegram_sent_at IS NULL
-             ORDER BY from_date ASC NULLS FIRST
-             LIMIT $2
+            WITH claimed AS (
+              SELECT id
+                FROM ml_notices
+               WHERE user_id = $1 AND telegram_sent_at IS NULL
+               ORDER BY from_date ASC NULLS FIRST
+               LIMIT $2
+              FOR UPDATE SKIP LOCKED
+            )
+            UPDATE ml_notices m
+               SET telegram_sent_at = NOW()
+              FROM claimed
+             WHERE m.id = claimed.id
+            RETURNING m.notice_id, m.label, m.description, m.actions,
+                      m.tags, m.topic, m.raw, m.ai_digest_at
             """,
             user_id, TG_BATCH_CAP,
         )
 
     sent = 0
+    rollback_ids: list[str] = []
     for row in pending_rows:
         # AI digest для платформенных news (без webhook topic, с HTML).
         # Idempotent — уже digested rows имеют ai_digest_at IS NOT NULL.
@@ -520,13 +541,26 @@ async def _dispatch_to_telegram(
         }
         ok = await tg_svc.send_notice(chat_id, notice, language, http)
         if ok:
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE ml_notices SET telegram_sent_at = NOW() WHERE user_id = $1 AND notice_id = $2",
-                    user_id, row["notice_id"],
-                )
+            # tg_sent_at уже set в claim-step. Ничего дополнительно делать
+            # не надо. sent — для логирования.
             sent += 1
+        else:
+            # Send failed — отдадим строку обратно в очередь (NULL tg_sent_at).
+            # Следующий тик попробует ещё раз. Это лучше чем «потерять»
+            # уведомление навсегда из-за временной TG/network ошибки.
+            rollback_ids.append(row["notice_id"])
         await asyncio.sleep(TG_MESSAGE_THROTTLE)
+
+    if rollback_ids:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE ml_notices SET telegram_sent_at = NULL
+                 WHERE user_id = $1 AND notice_id = ANY($2::text[])
+                """,
+                user_id, rollback_ids,
+            )
+
     return sent
 
 
