@@ -341,6 +341,27 @@ async def _backfill_all_users_job() -> None:
         _ml_log.exception("ML backfill job failed: %s", err)
 
 
+async def _aging_stock_alerts_job() -> None:
+    """Scan ml_full_inventory + velocity for not_supported/lost/transfer units
+    and «excedente» (slow movers) — push TG notices via ml_notices."""
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("aging alerts job skipped: no DB pool")
+            return
+        from v2.services import ml_aging_alerts as _aging
+        totals = await _aging.scan_all_users(pool)
+        _ml_log.info(
+            "Aging stock alerts tick: users=%s not_supported=%s lost=%s "
+            "transfer=%s excedente=%s skipped_dedup=%s",
+            totals.get("users"), totals.get("not_supported"),
+            totals.get("lost"), totals.get("transfer"),
+            totals.get("excedente"), totals.get("skipped_dedup"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("aging alerts job failed: %s", err)
+
+
 async def _full_inventory_refresh_job() -> None:
     """Refresh physical Full warehouse stock for every ML-connected user.
     Runs on cron (4h) — stock в Full меняется быстро при активных продажах,
@@ -1114,6 +1135,19 @@ async def _v2_startup() -> None:
         "interval",
         hours=_full_inv_interval,
         id="ml_full_inventory_refresh",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Aging stock alerts — daily at 11:00 UTC = 08:00 BRT. Scans Full
+    # inventory for not_supported/lost/transfer units and slow-movers
+    # (excedente > 60d at current velocity). 7-day dedup per item-type
+    # avoids floor flood. ML doesn't expose exact discard deadlines via
+    # API — alerts give heads-up + deep-link to ML space management UI.
+    _ml_scheduler.add_job(
+        _aging_stock_alerts_job,
+        CronTrigger(hour=11, minute=0, timezone="UTC"),
+        id="ml_aging_stock_alerts_daily",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
