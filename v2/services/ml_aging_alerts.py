@@ -96,27 +96,39 @@ def _build_alert_payload(
 
     lines: list[str] = [f"📦 {title_short}", f"🆔 {item_id}", ""]
     if alert_type == "excedente":
-        lines.append(f"⚠️ *Estoque parado*: {available} un. para vender")
+        lines.append(f"⚠️ *Produto parado — precisa liquidar o estoque*")
+        lines.append(f"📦 Disponível: {available} un.")
         if days_left is not None:
             lines.append(f"📊 No ritmo atual, dura ~{days_left} dias")
         lines.append("")
         lines.append(
-            "ML pode descartar excedente — considere baixar preço / "
-            "campanha publicitária / retirar do Full."
+            "🗓 *Verifique a data-limite de armazenamento no Full do ML* "
+            "para evitar o descarte automático das unidades."
         )
-    else:
-        lines.append(f"⚠️ *{qty} un. {type_friendly}* de {total} total")
         lines.append("")
         lines.append(
-            "ML descartará essas unidades se não forem retiradas. "
-            "Abra «Gerenciar estoque Full» → «Retirar unidades» para evitar."
+            "Ações para vender mais rápido: baixar o preço · "
+            "campanha publicitária · retirar do Full antes que ML descarte."
+        )
+    else:
+        lines.append(f"⚠️ *Produto parado — {qty} un. {type_friendly}* (de {total} total)")
+        lines.append("")
+        lines.append(
+            "🗓 *Verifique a data-limite no ML para retirar essas unidades* — "
+            "ML descartará automaticamente o que não for retirado a tempo."
+        )
+        lines.append("")
+        lines.append(
+            "Ações: abra «Gerenciar estoque Full» → «Retirar unidades» antes "
+            "do prazo expirar; ou reduza preço para liquidar o estoque ativo."
         )
     if deadline_hint:
         lines.append("")
         lines.append(f"⏰ {deadline_hint}")
     lines.append("")
     lines.append(
-        "🔗 [Gerenciar Full](https://www.mercadolivre.com.br/anuncios/lista/"
+        "🔗 [Verificar prazos + Gerenciar Full]"
+        "(https://www.mercadolivre.com.br/anuncios/lista/"
         "space_management?filters=aging-stock)"
     )
 
