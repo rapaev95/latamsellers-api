@@ -360,6 +360,60 @@ def _empty_cashflow(reason: str) -> dict[str, Any]:
     }
 
 
+def _load_approved_transfers(project_id: str) -> list[dict[str, Any]]:
+    """Pull user-added approved transfers to the client for a services project.
+
+    The hardcoded list inside generate_dds_estonia covers transfers up to the
+    approved-report cutoff (19/03/2026). Anything after that — or any post-Phase-3
+    backfill — is entered through ApprovedDataCard and lives on the project
+    record under `approved_transfer`. We surface them here so the services DDS
+    formula (saldo_inicial + invoices_net − total_outflows) reflects reality.
+
+    Returns rows in the same shape as the hardcoded list:
+      {date "DD/MM/YYYY", canal, usd|None, vet|None, brl, _user_added=True}.
+    Currency normalisation:
+      - BRL entries → brl = valor, usd/vet = None
+      - USD/USDT entries → brl = valor × rate_brl, usd = valor, vet = rate_brl
+    """
+    try:
+        from v2.legacy import config as legacy_config
+        from v2.legacy.finance import _entry_valor_brl
+        projects = legacy_config.load_projects()
+    except Exception as err:  # noqa: BLE001
+        log.warning("services_reports.approved_transfers: load failed for %s: %s", project_id, err)
+        return []
+
+    proj_meta = projects.get(project_id, {}) or {}
+    raw = proj_meta.get("approved_transfer") or []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        try:
+            brl = abs(_entry_valor_brl(item))
+        except Exception:  # noqa: BLE001
+            continue
+        if brl <= 0:
+            continue
+        cur = str(item.get("currency", "BRL") or "BRL").upper()
+        # ApprovedDataCard stores ISO YYYY-MM-DD; the hardcoded list uses
+        # DD/MM/YY. Convert so the UI table renders consistently.
+        iso = str(item.get("date") or "")[:10]
+        try:
+            from datetime import datetime as _dt
+            d = _dt.strptime(iso, "%Y-%m-%d").date()
+            date_str = d.strftime("%d/%m/%y")
+        except (ValueError, TypeError):
+            date_str = iso
+        out.append({
+            "date": date_str,
+            "canal": str(item.get("source") or item.get("note") or ""),
+            "usd": float(item.get("valor") or 0) if cur in ("USD", "USDT") else None,
+            "vet": float(item.get("rate_brl") or 0) if cur != "BRL" and item.get("rate_brl") else None,
+            "brl": round(brl, 2),
+            "_user_added": True,
+        })
+    return out
+
+
 def _load_operating_expenses(project_id: str) -> dict[str, Any]:
     """Pull manual operating expenses for a services project from projects_db.
 
@@ -469,6 +523,30 @@ def generate_services_cashflow_sync(project_id: str) -> dict[str, Any]:
         result = generate_dds_estonia()
         result["_needs_config"] = False
         result["operating_expenses"] = _load_operating_expenses(project_id)
+
+        # Append user-curated approved_transfers entered via ApprovedDataCard.
+        # generate_dds_estonia's hardcoded list ends at 19/03/2026; anything
+        # after that is appended here so debito_estonia drops as the user
+        # records new client transfers.
+        extra_transfers = _load_approved_transfers(project_id)
+        if extra_transfers:
+            existing = result.get("transfers") or []
+            # Stamp continuation indices so the UI table can key rows uniquely.
+            base = (existing[-1]["n"] if existing and existing[-1].get("n") is not None else 0)
+            for i, tr in enumerate(extra_transfers, start=1):
+                tr.setdefault("n", base + i)
+            result["transfers"] = list(existing) + extra_transfers
+
+            extra_brl = sum(float(t.get("brl") or 0) for t in extra_transfers)
+            new_total = float(result.get("total_outflows") or 0) + extra_brl
+            result["total_outflows"] = round(new_total, 2)
+
+            # Recompute debito_estonia = saldo_inicial + invoices_net − total_outflows.
+            inflows = result.get("inflows") or {}
+            saldo = float(inflows.get("saldo_inicial") or 0)
+            net = float(inflows.get("invoices_net") or 0)
+            result["debito_estonia"] = round(saldo + net - new_total, 2)
+
         return result
 
     # Non-Estonia services project — DDS skeleton is still empty, but manual
