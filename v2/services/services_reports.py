@@ -625,9 +625,129 @@ async def compute_for_user(
         out["cashflow"] = await cf_task
     except Exception as err:  # noqa: BLE001
         out["cashflow_error"] = f"{type(err).__name__}: {err}"
+    else:
+        # Auto-import TrafficStars USD débitos from C6 USD as approved transfers.
+        # We pay TrafficStars on the client's behalf, so every TS debit on the
+        # services-project C6 USD account is effectively a transfer to the
+        # client. BRL cost comes from the cambio FIFO engine (real BRL spent
+        # to acquire the consumed USD lots), not the spot rate at the time of
+        # the debit. Falls back silently if uploads / FIFO fail.
+        if _is_legacy_hardcoded(project_id) and isinstance(out.get("cashflow"), dict):
+            try:
+                ts_transfers = await _build_trafficstars_auto_transfers(pool, user_id)
+            except Exception as err:  # noqa: BLE001
+                log.warning("services_reports.ts_auto failed for %s: %s", project_id, err)
+                ts_transfers = []
+            if ts_transfers:
+                cf = out["cashflow"]
+                existing = cf.get("transfers") or []
+                base_n = (existing[-1].get("n") or 0) if existing else 0
+                for i, tr in enumerate(ts_transfers, start=1):
+                    tr.setdefault("n", base_n + i)
+                cf["transfers"] = list(existing) + ts_transfers
+                extra_brl = sum(float(t.get("brl") or 0) for t in ts_transfers)
+                cf["total_outflows"] = round(float(cf.get("total_outflows") or 0) + extra_brl, 2)
+                inflows = cf.get("inflows") or {}
+                saldo = float(inflows.get("saldo_inicial") or 0)
+                net = float(inflows.get("invoices_net") or 0)
+                cf["debito_estonia"] = round(saldo + net - cf["total_outflows"], 2)
     try:
         out["balance"] = await bal_task
     except Exception as err:  # noqa: BLE001
         out["balance_error"] = f"{type(err).__name__}: {err}"
 
     return out
+
+
+async def _build_trafficstars_auto_transfers(
+    pool: asyncpg.Pool, user_id: int,
+) -> list[dict[str, Any]]:
+    """Auto-map C6 USD TrafficStars débitos into approved-transfer rows.
+
+    For services projects (Estonia / GANZA-USD) we settle TrafficStars from
+    the client's USD float on C6. Each TS debit is therefore money that left
+    the float on the client's behalf — exactly the semantic of an approved
+    transfer. Convert with BRL cost taken from the cambio FIFO (real BRL
+    spent for the consumed USD lots), not from a synthetic spot rate.
+
+    Filter rule: description (case-insensitive) contains "trafficstars". Other
+    USD debits (Saque, Pagamento with another counterparty, …) stay outside —
+    user can still add them manually via ApprovedDataCard.
+
+    Skips débitos that came back uncovered (no FIFO lots to consume) — we'd
+    have no BRL value to add to debito_estonia for them and silently writing
+    R$ 0 would understate the debit.
+
+    Returns rows in the same shape as the hardcoded list:
+      {date "DD/MM/YY", canal, usd, vet (rate), brl, _auto_imported=True,
+       _auto_source="trafficstars"}
+    """
+    from v2.legacy.bank_tx import parse_bank_tx_bytes
+    from v2.services import cambio
+    from v2.storage import uploads_storage
+
+    try:
+        files = await uploads_storage.fetch_files_by_source(pool, user_id, "extrato_c6_usd")
+    except Exception as err:  # noqa: BLE001
+        log.warning("ts_auto: fetch_files_by_source failed: %s", err)
+        return []
+    if not files:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for f in files:
+        try:
+            parsed = parse_bank_tx_bytes("extrato_c6_usd", f.file_bytes)
+        except Exception as err:  # noqa: BLE001
+            log.warning("ts_auto: parse failed for upload %s: %s", getattr(f, "id", "?"), err)
+            continue
+        for r in parsed:
+            h = r.get("tx_hash") or ""
+            if not h or h in seen:
+                continue
+            seen.add(h)
+            rows.append(r)
+    if not rows:
+        return []
+
+    try:
+        result = await cambio.compute_for_user(pool, user_id, rows)
+        cambio.enrich_rows(rows, result)
+    except Exception as err:  # noqa: BLE001
+        log.warning("ts_auto: cambio compute_for_user failed: %s", err)
+        return []
+
+    out_transfers: list[dict[str, Any]] = []
+    for r in rows:
+        val = float(r.get("value_brl") or 0)
+        if val >= 0:
+            continue  # entradas only contribute to FIFO inventory, not transfers
+        haystack = (str(r.get("description") or "") + " " + str(r.get("title") or "")).lower()
+        if "trafficstars" not in haystack:
+            continue
+        usd_abs = abs(val)
+        brl_cost = float(r.get("fifo_brl_cost") or 0)
+        if brl_cost <= 0:
+            # Uncovered — no FIFO lots when this saída ran. Adding R$ 0 would
+            # understate debito_estonia; let user record it manually if needed.
+            continue
+        date_iso = str(r.get("date") or "")[:10]
+        try:
+            from datetime import datetime as _dt
+            d = _dt.strptime(date_iso, "%Y-%m-%d").date()
+            date_str = d.strftime("%d/%m/%y")
+        except (ValueError, TypeError):
+            date_str = date_iso
+        rate = round(brl_cost / usd_abs, 4) if usd_abs > 0 else None
+        out_transfers.append({
+            "date": date_str,
+            "canal": "C6 TrafficStars (auto)",
+            "usd": round(usd_abs, 2),
+            "vet": rate,
+            "brl": round(brl_cost, 2),
+            "_auto_imported": True,
+            "_auto_source": "trafficstars",
+        })
+    out_transfers.sort(key=lambda r: r["date"])
+    return out_transfers
