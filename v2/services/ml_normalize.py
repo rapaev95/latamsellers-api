@@ -272,6 +272,44 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                         "   ⚠ Sem cobrir overhead — considere subir preço ou cortar custos fixos"
                     )
 
+            # ── Break-even explainer (когда net < 0) ─────────────────────
+            # «Чтобы выйти в плюс»: показывает фикс расходы / мес, сколько
+            # продаж нужно vs фактических за текущий календарный месяц.
+            # Инжектится в ml_backfill._enrich_order_with_margin.
+            be_exp = enriched.get("_breakeven_explainer") or {}
+            if be_exp and margin_net_pct is not None and float(margin_net_pct) < 0:
+                monthly_fixed = float(be_exp.get("monthly_fixed_brl") or 0)
+                pv_pu_be = float(be_exp.get("profit_variable_per_sale") or 0)
+                sales_needed = int(be_exp.get("sales_needed_per_month") or 0)
+                sales_actual = int(be_exp.get("sales_actual_mtd") or 0)
+                coverage_pct = float(be_exp.get("coverage_pct") or 0)
+                gap = int(be_exp.get("gap_units") or 0)
+                month_so_far = float(be_exp.get("month_so_far_brl") or 0)
+
+                # ASCII progress bar (10 chars).
+                bar_fill = int(round(min(100, coverage_pct) / 10))
+                bar = "█" * bar_fill + "░" * (10 - bar_fill)
+
+                desc_lines.append("")
+                desc_lines.append("💡 *Para sair do vermelho neste mês:*")
+                desc_lines.append(
+                    f"   • Custos fixos do item: {_money(monthly_fixed)} /mês"
+                )
+                desc_lines.append(
+                    f"   • Margem variável: {_money(pv_pu_be)} /venda"
+                )
+                desc_lines.append(
+                    f"   • Precisa vender: *{sales_needed} un./mês*"
+                )
+                desc_lines.append(
+                    f"   • Vendido este mês: *{sales_actual} un.* ({_money(month_so_far)})"
+                )
+                gap_brl = _money(monthly_fixed - month_so_far) or "—"
+                desc_lines.append(
+                    f"   {bar} {coverage_pct:.0f}% coberto · "
+                    f"faltam {gap} un. ({gap_brl})"
+                )
+
             # ── Break-even progress block (Сессия C) ────────────────────
             # _breakeven инжектится ml_backfill._enrich_order_with_margin
             # после увеличения cumulative variable margin за этот месяц.

@@ -339,6 +339,57 @@ async def _enrich_order_with_margin(
     except Exception as err:  # noqa: BLE001
         log.debug("velocity adjustment failed for %s: %s", item_id, err)
 
+    # ── Break-even explainer (когда net < 0) ─────────────────────────────
+    # Если чистая прибыль negative — посчитаем расшифровку:
+    # сколько продаж/мес нужно чтобы покрыть фиксированные расходы,
+    # сколько уже продано в текущем календарном месяце, сколько % покрытия.
+    try:
+        unit_d = (recomputed.get("unit") or {})
+        net_pu = unit_d.get("profit_net_per_unit")
+        pv_pu = unit_d.get("profit_variable")
+        if (
+            net_pu is not None and float(net_pu) < 0
+            and pv_pu is not None and float(pv_pu) > 0
+        ):
+            overhead_total = float(recomputed.get("overhead_total") or payload.get("overhead_total") or 0)
+            period_m = int(recomputed.get("period_months") or payload.get("period_months") or 3)
+            monthly_fixed = overhead_total / max(period_m, 1)
+            if monthly_fixed > 0:
+                import math as _math
+                sales_needed = int(_math.ceil(monthly_fixed / float(pv_pu)))
+                # Sales this calendar month for THIS item — sum units from
+                # ml_user_orders.items where mlb matches AND date_created
+                # is in current calendar month UTC (close enough to BRT
+                # для round-numbers explainer).
+                from datetime import datetime as _dt3
+                from . import ml_orders as _mo_for_mtd
+                async with pool.acquire() as conn_be:
+                    actual_row = await conn_be.fetchrow(
+                        """
+                        SELECT COALESCE(SUM((items_elem->>'quantity')::int), 0) AS units
+                          FROM ml_user_orders, jsonb_array_elements(items) items_elem
+                         WHERE user_id = $1
+                           AND status NOT IN ('cancelled','invalid')
+                           AND items_elem->>'mlb' = $2
+                           AND date_created >= date_trunc('month', NOW())
+                        """,
+                        user_id, item_id,
+                    )
+                actual_mtd = int((actual_row or {}).get("units") or 0)
+                coverage_pct = round((actual_mtd / sales_needed) * 100, 1) if sales_needed > 0 else 0.0
+                enriched["_breakeven_explainer"] = {
+                    "monthly_fixed_brl": round(monthly_fixed, 2),
+                    "profit_variable_per_sale": round(float(pv_pu), 2),
+                    "sales_needed_per_month": sales_needed,
+                    "sales_actual_mtd": actual_mtd,
+                    "coverage_pct": coverage_pct,
+                    "gap_units": max(0, sales_needed - actual_mtd),
+                    "month_so_far_brl": round(actual_mtd * float(pv_pu), 2),
+                    "monthly_target_brl": round(monthly_fixed, 2),
+                }
+    except Exception as err:  # noqa: BLE001
+        log.debug("breakeven explainer failed for %s: %s", item_id, err)
+
     # Break-even tracker: добавить эту продажу в cumulative проекта/месяца.
     # Project определяется из margin payload (тот же что в /escalar/products).
     project = recomputed.get("project") or payload.get("project")
