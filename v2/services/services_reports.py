@@ -513,14 +513,16 @@ def generate_services_pnl_sync(project_id: str) -> dict[str, Any]:
     )
 
 
-def generate_services_cashflow_sync(project_id: str) -> dict[str, Any]:
+def generate_services_cashflow_sync(
+    project_id: str, *, include_hardcoded_outflows: bool = True,
+) -> dict[str, Any]:
     ok, reason = _validate_project(project_id)
     if not ok:
         return _empty_cashflow(reason or "unknown")
 
     if _is_legacy_hardcoded(project_id):
         from v2.legacy.reports import generate_dds_estonia
-        result = generate_dds_estonia()
+        result = generate_dds_estonia(include_hardcoded_outflows=include_hardcoded_outflows)
         result["_needs_config"] = False
         result["operating_expenses"] = _load_operating_expenses(project_id)
 
@@ -584,6 +586,8 @@ async def compute_for_user(
     project_id: str,
     period_from: Optional[date] = None,
     period_to: Optional[date] = None,
+    *,
+    include_hardcoded_outflows: bool = True,
 ) -> dict[str, Any]:
     """Build the full services-reports bundle for one project.
 
@@ -614,7 +618,10 @@ async def compute_for_user(
             return None, err
 
     pnl_task = asyncio.create_task(asyncio.to_thread(generate_services_pnl_sync, project_id))
-    cf_task = asyncio.create_task(asyncio.to_thread(generate_services_cashflow_sync, project_id))
+    cf_task = asyncio.create_task(asyncio.to_thread(
+        generate_services_cashflow_sync, project_id,
+        include_hardcoded_outflows=include_hardcoded_outflows,
+    ))
     bal_task = asyncio.create_task(asyncio.to_thread(generate_services_balance_sync, project_id))
 
     try:

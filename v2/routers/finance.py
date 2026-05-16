@@ -374,6 +374,13 @@ async def get_services_reports(
     period_from: Optional[str] = Query(None, alias="from"),
     period_to: Optional[str] = Query(None, alias="to"),
     fresh: bool = Query(False, description="Bypass cache and recompute from scratch"),
+    bank_only: bool = Query(
+        False,
+        description="When true, drop hardcoded transfers/outflows baked into "
+                    "generate_dds_estonia. Outflows will come only from "
+                    "ApprovedDataCard entries + auto-imported TS debits + "
+                    "operating expenses from bank statements.",
+    ),
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ) -> dict[str, Any]:
@@ -447,10 +454,13 @@ async def get_services_reports(
     async def _compute_async() -> dict[str, Any]:
         bundle = await services_svc.compute_for_user(
             pool, effective_user_id, project, period_from=pf, period_to=pt,
+            include_hardcoded_outflows=not bank_only,
         )
         return {k: v for k, v in bundle.items() if k not in ("project", "period")}
 
-    cache_key = f"services_reports:{project}:{pf.isoformat()}:{pt.isoformat()}"
+    # Cache key includes bank_only so the two views don't collide.
+    bo_suffix = "bankonly" if bank_only else "full"
+    cache_key = f"services_reports:{project}:{pf.isoformat()}:{pt.isoformat()}:{bo_suffix}"
 
     bundle: dict[str, Any]
     cache_status: str

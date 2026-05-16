@@ -745,41 +745,68 @@ def generate_opiu_estonia() -> dict:
     }
 
 
-def generate_dds_estonia() -> dict:
-    """Generate cash flow for Estonia project from approved report."""
+def generate_dds_estonia(include_hardcoded_outflows: bool = True) -> dict:
+    """Generate cash flow for Estonia project from approved report.
+
+    `include_hardcoded_outflows`: when False, the hardcoded transfers list
+    (CALIZA / Bybit USDT / C6 Cambio / Cred.Nubank TS rows baked into this
+    generator from the approved CSV section 2) is dropped, and `outflows` /
+    `total_outflows` are zeroed. Inflows (saldo_inicial + invoices) stay
+    intact, and `debito_estonia` is recomputed = saldo + net_invoices.
+    Used by the UI toggle «убрать данные расходов из хардкода»: after that
+    only ApprovedDataCard transfers + auto-imported TrafficStars debits
+    (added later in services_reports.compute_for_user) plus operating
+    expenses from bank statements feed into outflows.
+    """
     opiu = generate_opiu_estonia()
 
     # Detailed transfers list (from approved CSV section 2)
-    transfers = [
-        {"n": 1, "date": "22/09/25", "usd": None, "vet": None, "canal": "CALIZA-Nubank", "brl": 56131.26},
-        {"n": 2, "date": "30/09/25", "usd": None, "vet": None, "canal": "CALIZA-Nubank", "brl": 61179.60},
-        {"n": 3, "date": "24/12/25", "usd": None, "vet": None, "canal": "Bybit 9.000 USDT", "brl": 49689.00},
-        {"n": 4, "date": "23/02/26", "usd": None, "vet": None, "canal": "Bybit 6.000 USDT", "brl": 33900.00},
-        {"n": 5, "date": "06/02/26", "usd": 20, "vet": 5.68, "canal": "C6 Cambio", "brl": 113.50},
-        {"n": 6, "date": "06/02/26", "usd": 100, "vet": 5.68, "canal": "C6 Cambio", "brl": 567.49},
-        {"n": 7, "date": "06/02/26", "usd": 2200, "vet": 5.54, "canal": "C6 Cambio", "brl": 12180.79},
-        {"n": 8, "date": "09/02/26", "usd": 1600, "vet": 5.48, "canal": "C6 Cambio", "brl": 8764.51},
-        {"n": 9, "date": "17/02/26", "usd": 2070, "vet": 5.62, "canal": "C6 Cambio", "brl": 11638.29},
-        {"n": 10, "date": "23/02/26", "usd": 2500, "vet": 5.56, "canal": "C6 Cambio", "brl": 13905.20},
-        {"n": 11, "date": "26/02/26", "usd": 4100, "vet": 5.42, "canal": "C6 Cambio", "brl": 22217.09},
-        {"n": 12, "date": "03/03/26", "usd": 1500, "vet": 5.57, "canal": "C6 Cambio", "brl": 8351.03},
-        {"n": 13, "date": "03/03/26", "usd": 4200, "vet": 5.59, "canal": "C6 Cambio", "brl": 23459.09},
-        {"n": 14, "date": "06/03/26", "usd": 4000, "vet": 5.67, "canal": "C6 Cambio", "brl": 22668.55},
-        {"n": 15, "date": "07/03/26", "usd": 100, "vet": 5.65, "canal": "C6 Cambio", "brl": 564.57},
-        {"n": 16, "date": "11/03/26", "usd": 100, "vet": 5.44, "canal": "C6 Cambio", "brl": 544.17},
-        {"n": 17, "date": "11/03/26", "usd": 4100, "vet": 5.45, "canal": "C6 Cambio", "brl": 22340.45},
-        {"n": 18, "date": "13/03/26", "usd": 4150, "vet": 5.52, "canal": "C6 Cambio", "brl": 22923.96},
-        {"n": 19, "date": "18/03/26", "usd": 4100, "vet": 5.59, "canal": "C6 Cambio", "brl": 22907.80},
-        {"n": 20, "date": "20/01/26", "usd": 103, "vet": None, "canal": "Cred.Nubank TS", "brl": 598.69},
-        {"n": 21, "date": "04/02/26", "usd": 103, "vet": None, "canal": "Cred.Nubank TS", "brl": 582.76},
-    ]
+    transfers: list[dict] = []
+    outflows: dict = {}
+    total_outflows: float
+    debito_estonia: float
 
-    outflows = {
-        "caliza_col": 56131.26 + 61179.60,
-        "bybit_crypto": 49689.00 + 33900.00,
-        "trafficstars_c6": sum(t["brl"] for t in transfers if t["canal"] == "C6 Cambio"),
-        "trafficstars_credit": 598.69 + 582.76,
-    }
+    if include_hardcoded_outflows:
+        transfers = [
+            {"n": 1, "date": "22/09/25", "usd": None, "vet": None, "canal": "CALIZA-Nubank", "brl": 56131.26},
+            {"n": 2, "date": "30/09/25", "usd": None, "vet": None, "canal": "CALIZA-Nubank", "brl": 61179.60},
+            {"n": 3, "date": "24/12/25", "usd": None, "vet": None, "canal": "Bybit 9.000 USDT", "brl": 49689.00},
+            {"n": 4, "date": "23/02/26", "usd": None, "vet": None, "canal": "Bybit 6.000 USDT", "brl": 33900.00},
+            {"n": 5, "date": "06/02/26", "usd": 20, "vet": 5.68, "canal": "C6 Cambio", "brl": 113.50},
+            {"n": 6, "date": "06/02/26", "usd": 100, "vet": 5.68, "canal": "C6 Cambio", "brl": 567.49},
+            {"n": 7, "date": "06/02/26", "usd": 2200, "vet": 5.54, "canal": "C6 Cambio", "brl": 12180.79},
+            {"n": 8, "date": "09/02/26", "usd": 1600, "vet": 5.48, "canal": "C6 Cambio", "brl": 8764.51},
+            {"n": 9, "date": "17/02/26", "usd": 2070, "vet": 5.62, "canal": "C6 Cambio", "brl": 11638.29},
+            {"n": 10, "date": "23/02/26", "usd": 2500, "vet": 5.56, "canal": "C6 Cambio", "brl": 13905.20},
+            {"n": 11, "date": "26/02/26", "usd": 4100, "vet": 5.42, "canal": "C6 Cambio", "brl": 22217.09},
+            {"n": 12, "date": "03/03/26", "usd": 1500, "vet": 5.57, "canal": "C6 Cambio", "brl": 8351.03},
+            {"n": 13, "date": "03/03/26", "usd": 4200, "vet": 5.59, "canal": "C6 Cambio", "brl": 23459.09},
+            {"n": 14, "date": "06/03/26", "usd": 4000, "vet": 5.67, "canal": "C6 Cambio", "brl": 22668.55},
+            {"n": 15, "date": "07/03/26", "usd": 100, "vet": 5.65, "canal": "C6 Cambio", "brl": 564.57},
+            {"n": 16, "date": "11/03/26", "usd": 100, "vet": 5.44, "canal": "C6 Cambio", "brl": 544.17},
+            {"n": 17, "date": "11/03/26", "usd": 4100, "vet": 5.45, "canal": "C6 Cambio", "brl": 22340.45},
+            {"n": 18, "date": "13/03/26", "usd": 4150, "vet": 5.52, "canal": "C6 Cambio", "brl": 22923.96},
+            {"n": 19, "date": "18/03/26", "usd": 4100, "vet": 5.59, "canal": "C6 Cambio", "brl": 22907.80},
+            {"n": 20, "date": "20/01/26", "usd": 103, "vet": None, "canal": "Cred.Nubank TS", "brl": 598.69},
+            {"n": 21, "date": "04/02/26", "usd": 103, "vet": None, "canal": "Cred.Nubank TS", "brl": 582.76},
+        ]
+        outflows = {
+            "caliza_col": 56131.26 + 61179.60,
+            "bybit_crypto": 49689.00 + 33900.00,
+            "trafficstars_c6": sum(t["brl"] for t in transfers if t["canal"] == "C6 Cambio"),
+            "trafficstars_credit": 598.69 + 582.76,
+        }
+        total_outflows = opiu["total_enviado"]
+        debito_estonia = opiu["debito_estonia"]
+    else:
+        # No hardcoded outflows — debito = saldo + invoices_net (no withdrawals
+        # baked in). ApprovedDataCard rows and auto-TS transfers will be added
+        # by compute_for_user and total_outflows / debito will be recomputed
+        # there as the new entries arrive.
+        total_outflows = 0.0
+        debito_estonia = round(
+            float(opiu["saldo_inicial"]) + float(opiu["total_net_client"]), 2,
+        )
 
     return {
         "inflows": {
@@ -790,8 +817,8 @@ def generate_dds_estonia() -> dict:
         },
         "outflows": outflows,
         "transfers": transfers,
-        "total_outflows": opiu["total_enviado"],
-        "debito_estonia": opiu["debito_estonia"],
+        "total_outflows": total_outflows,
+        "debito_estonia": debito_estonia,
         "by_month": opiu["by_month"],
         # Per-invoice breakdown for the DDS "Поступления (инвойсы)" section.
         # Each entry: {date, gross, tax, net, rate, numero, auto_loaded}.
