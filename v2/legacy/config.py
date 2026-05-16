@@ -844,8 +844,18 @@ C6_ACCOUNTS = {
 DEFAULT_TRANSACTION_RULES = [
     # Internal transfers
     {"keywords": ["ganza comercial", "bco c6", "c6 s.a"], "category": "internal_transfer", "project": "GANZA", "label": "Перевод BRL → C6 (Ganza)"},
-    # C6 internal: BRL → USD conta global
-    {"keywords": ["transferência para c6 conta global", "transferencia para c6 conta global", "c6 conta global", "câmbio"], "category": "fx", "project": "GANZA", "label": "💱 Câmbio C6 (BRL→USD)"},
+    # C6 internal: BRL ↔ USD conta global. Includes both legs:
+    #   - BRL → USD: "Transferência para C6 Conta Global", "Câmbio"
+    #   - USD → BRL: "C6 Cambio" (note: ASCII spelling without diacritic — bank
+    #     statement uses plain "Cambio", so we match both spellings).
+    {"keywords": [
+        "transferência para c6 conta global",
+        "transferencia para c6 conta global",
+        "c6 conta global",
+        "câmbio",
+        "cambio",
+        "c6 cambio",
+    ], "category": "fx", "project": "GANZA", "label": "💱 Câmbio C6"},
     # C6 card fees
     {"keywords": ["emissão cartão global", "emissao cartao global", "emiss. cartao global"], "category": "bank_fee", "project": "GANZA", "label": "💳 Эмиссия C6 Global Card"},
     # Generic Pix outgoing
