@@ -365,11 +365,21 @@ async def _enrich_order_with_margin(
             import math as _math
             async with pool.acquire() as conn_be:
                 # PROJECT-level: aggregate overhead + units + weighted-margin
-                # across ALL items mapped to this project in margin cache.
+                # across ALL items mapped to this project в margin cache.
+                # NB: SUM по 4 non-DAS статьям (publi + armaz + aluguel +
+                # fulfillment). DAS НЕ включаем — он уже вычтен из
+                # profit_variable (true_variable_per_sale включает das_per_unit).
+                # Если использовать payload.overhead_total — DAS дублируется
+                # и breakeven sales overestimated на ~15% (баг найден 2026-05-16).
                 project_row = await conn_be.fetchrow(
                     """
                     SELECT COUNT(*) AS n_items,
-                           COALESCE(SUM((payload->>'overhead_total')::float), 0) AS overhead_total_sum,
+                           COALESCE(SUM(
+                             COALESCE((payload->>'publicidade_share')::float, 0)
+                             + COALESCE((payload->>'armazenagem_share')::float, 0)
+                             + COALESCE((payload->>'aluguel_share')::float, 0)
+                             + COALESCE((payload->>'fulfillment_share')::float, 0)
+                           ), 0) AS overhead_excl_das_sum,
                            COALESCE(SUM((payload->>'units_sold')::int), 0) AS units_sum,
                            COALESCE(SUM(
                              (payload->'unit'->>'profit_variable')::float
@@ -384,7 +394,7 @@ async def _enrich_order_with_margin(
                     """,
                     user_id, project_for_be,
                 )
-                overhead_sum = float((project_row or {}).get("overhead_total_sum") or 0)
+                overhead_sum = float((project_row or {}).get("overhead_excl_das_sum") or 0)
                 units_sum = int((project_row or {}).get("units_sum") or 0)
                 weighted_pv = float((project_row or {}).get("weighted_pv_sum") or 0)
                 period_m = int((project_row or {}).get("period_m") or 3)
