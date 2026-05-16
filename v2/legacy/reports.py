@@ -745,7 +745,10 @@ def generate_opiu_estonia() -> dict:
     }
 
 
-def generate_dds_estonia(include_hardcoded_outflows: bool = True) -> dict:
+def generate_dds_estonia(
+    include_hardcoded_outflows: bool = True,
+    project_id: str = "ESTONIA",
+) -> dict:
     """Generate cash flow for Estonia project from approved report.
 
     `include_hardcoded_outflows`: when False, the hardcoded transfers list
@@ -753,12 +756,35 @@ def generate_dds_estonia(include_hardcoded_outflows: bool = True) -> dict:
     generator from the approved CSV section 2) is dropped, and `outflows` /
     `total_outflows` are zeroed. Inflows (saldo_inicial + invoices) stay
     intact, and `debito_estonia` is recomputed = saldo + net_invoices.
-    Used by the UI toggle «убрать данные расходов из хардкода»: after that
-    only ApprovedDataCard transfers + auto-imported TrafficStars debits
-    (added later in services_reports.compute_for_user) plus operating
-    expenses from bank statements feed into outflows.
+
+    `project_id` is the project name as the user labels it in the
+    classification UI. We use it to pull bank inflows (category=income,
+    project=project_id) so a Pix recebido tagged ESTONIA on the bank
+    statement actually shows up on the ДДС instead of getting lost.
     """
     opiu = generate_opiu_estonia()
+
+    # Bank inflows — bank-statement rows the user classified as
+    # category=income with this project. Loaded from the same prefetched
+    # transaction list compute_cashflow uses for ecom projects.
+    bank_inflows: list[dict] = []
+    bank_inflows_total = 0.0
+    try:
+        live = aggregate_classified_by_project(project_id) or {}
+        for tx in (live.get("transactions") or []):
+            cat = str(tx.get("Категория") or "").lower()
+            if cat != "income":
+                continue
+            try:
+                val = float(tx.get("Valor", 0) or 0)
+            except (ValueError, TypeError):
+                val = 0
+            if val <= 0:
+                continue
+            bank_inflows.append(tx)
+            bank_inflows_total += val
+    except Exception:  # noqa: BLE001 — bank prefetch missing is fine
+        pass
 
     # Detailed transfers list (from approved CSV section 2)
     transfers: list[dict] = []
@@ -797,15 +823,16 @@ def generate_dds_estonia(include_hardcoded_outflows: bool = True) -> dict:
             "trafficstars_credit": 598.69 + 582.76,
         }
         total_outflows = opiu["total_enviado"]
-        debito_estonia = opiu["debito_estonia"]
+        debito_estonia = opiu["debito_estonia"] + bank_inflows_total
     else:
-        # No hardcoded outflows — debito = saldo + invoices_net (no withdrawals
-        # baked in). ApprovedDataCard rows and auto-TS transfers will be added
-        # by compute_for_user and total_outflows / debito will be recomputed
-        # there as the new entries arrive.
+        # No hardcoded outflows — debito = saldo + invoices_net + bank_inflows
+        # (no withdrawals baked in). ApprovedDataCard rows and auto-TS
+        # transfers will be added by compute_for_user and total_outflows /
+        # debito will be recomputed there as the new entries arrive.
         total_outflows = 0.0
         debito_estonia = round(
-            float(opiu["saldo_inicial"]) + float(opiu["total_net_client"]), 2,
+            float(opiu["saldo_inicial"]) + float(opiu["total_net_client"]) + bank_inflows_total,
+            2,
         )
 
     return {
@@ -814,15 +841,19 @@ def generate_dds_estonia(include_hardcoded_outflows: bool = True) -> dict:
             "invoices_gross": opiu["total_gross"],
             "invoices_tax": -opiu["total_tax_retained"],
             "invoices_net": opiu["total_net_client"],
+            "bank_inflows_total": round(bank_inflows_total, 2),
         },
         "outflows": outflows,
         "transfers": transfers,
         "total_outflows": total_outflows,
-        "debito_estonia": debito_estonia,
+        "debito_estonia": round(float(debito_estonia), 2),
         "by_month": opiu["by_month"],
         # Per-invoice breakdown for the DDS "Поступления (инвойсы)" section.
         # Each entry: {date, gross, tax, net, rate, numero, auto_loaded}.
         "invoice_lines": opiu.get("invoice_lines") or [],
+        # Bank-statement income lines tagged with this project. UI renders
+        # them as a separate "Поступления (выписка)" table below invoices.
+        "bank_inflows": bank_inflows,
     }
 
 

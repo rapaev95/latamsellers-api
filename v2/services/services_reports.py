@@ -522,7 +522,10 @@ def generate_services_cashflow_sync(
 
     if _is_legacy_hardcoded(project_id):
         from v2.legacy.reports import generate_dds_estonia
-        result = generate_dds_estonia(include_hardcoded_outflows=include_hardcoded_outflows)
+        result = generate_dds_estonia(
+            include_hardcoded_outflows=include_hardcoded_outflows,
+            project_id=project_id,
+        )
         result["_needs_config"] = False
         result["operating_expenses"] = _load_operating_expenses(project_id)
 
@@ -543,11 +546,13 @@ def generate_services_cashflow_sync(
             new_total = float(result.get("total_outflows") or 0) + extra_brl
             result["total_outflows"] = round(new_total, 2)
 
-            # Recompute debito_estonia = saldo_inicial + invoices_net − total_outflows.
+            # Recompute debito_estonia = saldo_inicial + invoices_net
+            #                             + bank_inflows_total − total_outflows.
             inflows = result.get("inflows") or {}
             saldo = float(inflows.get("saldo_inicial") or 0)
             net = float(inflows.get("invoices_net") or 0)
-            result["debito_estonia"] = round(saldo + net - new_total, 2)
+            bank_in = float(inflows.get("bank_inflows_total") or 0)
+            result["debito_estonia"] = round(saldo + net + bank_in - new_total, 2)
 
         return result
 
@@ -654,7 +659,8 @@ async def compute_for_user(
                 inflows = cf.get("inflows") or {}
                 saldo = float(inflows.get("saldo_inicial") or 0)
                 net = float(inflows.get("invoices_net") or 0)
-                cf["debito_estonia"] = round(saldo + net - cf["total_outflows"], 2)
+                bank_in = float(inflows.get("bank_inflows_total") or 0)
+                cf["debito_estonia"] = round(saldo + net + bank_in - cf["total_outflows"], 2)
         # Sort the full transfers list chronologically and renumber. Without
         # this the table renders hardcoded rows first (in their author's order),
         # then ApprovedDataCard rows, then auto-TS rows — which jumbles dates
