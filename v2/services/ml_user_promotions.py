@@ -651,6 +651,20 @@ async def dispatch_pending_candidates(
         except Exception as err:  # noqa: BLE001
             log.exception("margin cache read failed for %s: %s", row["item_id"], err)
 
+        # Inventory snapshot — same source as sale notifications (stock +
+        # window-based velocity → days_left). Critical for promo decisions:
+        # accepting a deep discount with only 4 days of stock means burning
+        # the runway at a loss.
+        try:
+            from . import ml_inventory_forecast as inv_svc
+            snap = await inv_svc.get_inventory_snapshot(
+                pool, user_id, row["item_id"], variation_id=None,
+            )
+            if snap:
+                enriched["_inventory"] = snap
+        except Exception as err:  # noqa: BLE001
+            log.debug("inventory snapshot failed for %s: %s", row["item_id"], err)
+
         notice = normalize_event("promotions", None, enriched)
         notice["notice_id"] = (
             f"promotions:{row['item_id']}:{row['promotion_id']}"

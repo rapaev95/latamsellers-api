@@ -861,23 +861,68 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                     f" ({units} un. vendidas)"
                 )
             elif now_pct is not None:
-                # Two views per ML product: full PnL margin (with all overhead
-                # incl. fixed Aluguel) and unit economics (variable per-sale
-                # costs only). Promo decisions usually need the unit number;
-                # the PnL number is shown for accounting consistency.
+                # Unit economics for promo decisions — variable per-sale costs
+                # only. PnL margin (period-based, includes past sales at past
+                # prices) is misleading here: the seller is deciding about a
+                # FUTURE sale at the CURRENT price, not reconciling past
+                # accounting. Layout mirrors sale-notification breakdown so the
+                # seller sees the same metric/labels in both contexts.
                 unit = margin.get("unit") or {}
-                unit_pct = unit.get("margin_pct")
-                unit_profit = unit.get("profit_per_unit")
-                desc_lines.append(f"📊 *Margem (PnL): {now_pct}%* ({units} un. vendidas)")
-                lucro = margin.get("net_profit")
-                if lucro is not None:
-                    desc_lines.append(f"💵 Lucro líquido total: {_money(lucro) or '—'}")
-                if unit_pct is not None:
+                profit_variable_pu = unit.get("profit_variable")
+                margin_variable_pct = unit.get("margin_variable_pct")
+                profit_net_pu = unit.get("profit_net_per_unit")
+                margin_net_pct = unit.get("margin_net_pct")
+                # Fallback to legacy fields if variable not present in older cache rows.
+                unit_profit = (
+                    profit_variable_pu if profit_variable_pu is not None
+                    else unit.get("profit_per_unit")
+                )
+                unit_margin_pct = (
+                    margin_variable_pct if margin_variable_pct is not None
+                    else unit.get("margin_pct")
+                )
+
+                if unit_margin_pct is not None and unit_profit is not None:
+                    margin_str = f"{unit_margin_pct}%"
                     desc_lines.append("")
-                    desc_lines.append(f"📐 *Margem unitária: {unit_pct}%* (apenas custos variáveis)")
-                    if unit_profit is not None:
-                        desc_lines.append(f"💰 Lucro por unidade: {_money(unit_profit) or '—'}")
-                # Show unit margin at each price point in the range.
+                    desc_lines.append(
+                        f"📊 *Margem variável: {margin_str} ({_money(float(unit_profit))})*"
+                    )
+                    # Per-unit breakdown — variable costs only (cogs+ml_fee+envios+das).
+                    cogs_pu = unit.get("cogs_per_unit")
+                    ml_fee_pu = unit.get("ml_fee_per_unit")
+                    envios_pu = unit.get("envios_per_sale")
+                    das_pu = unit.get("das_per_unit")
+                    das_rate = unit.get("das_rate")
+                    if cogs_pu is not None:
+                        desc_lines.append(f"   • Custo produto: {_money(float(cogs_pu))}")
+                    if ml_fee_pu is not None:
+                        desc_lines.append(f"   • Tarifa ML: {_money(float(ml_fee_pu))}")
+                    if envios_pu is not None and float(envios_pu) > 0:
+                        desc_lines.append(f"   • Envios: {_money(float(envios_pu))}")
+                    if das_pu is not None and float(das_pu) > 0:
+                        if das_rate is not None and float(das_rate) > 0:
+                            pct = float(das_rate) * 100
+                            desc_lines.append(
+                                f"   • DAS ({pct:.2f}% efetivo): {_money(float(das_pu))}"
+                            )
+                        else:
+                            desc_lines.append(f"   • DAS: {_money(float(das_pu))}")
+                    if float(unit_margin_pct) < 0:
+                        desc_lines.append(
+                            "⚠ *Esta venda é negativa* — preço abaixo do custo variável"
+                        )
+                    # Net margin (after fixed overhead allocation per unit) —
+                    # mirrors the sale-notification "Lucro líquido" block.
+                    if profit_net_pu is not None and margin_net_pct is not None:
+                        emoji = "💰" if float(margin_net_pct) >= 0 else "📉"
+                        desc_lines.append(
+                            f"{emoji} *Lucro líquido: {margin_net_pct}% "
+                            f"({_money(float(profit_net_pu))})*"
+                        )
+
+                # Margin at each price point in the discount range — the
+                # actionable part for promo decisions.
                 pts: list[tuple[str, dict]] = []
                 if margin_at_min.get("ok"):
                     pts.append(("entrada", margin_at_min))
@@ -887,17 +932,66 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                     pts.append(("máx desc", margin_at_max))
                 if pts:
                     desc_lines.append("")
-                    desc_lines.append("📈 Margem unitária após promo:")
+                    desc_lines.append("📈 Margem após promo:")
                     for label_pt, m in pts:
                         u = m.get("unit") or {}
-                        u_pct = u.get("margin_pct")
-                        u_profit = u.get("profit_per_unit")
+                        u_pct = (
+                            u.get("margin_variable_pct")
+                            if u.get("margin_variable_pct") is not None
+                            else u.get("margin_pct")
+                        )
+                        u_profit = (
+                            u.get("profit_variable")
+                            if u.get("profit_variable") is not None
+                            else u.get("profit_per_unit")
+                        )
                         if u_pct is None:
                             continue
                         line = f"   • {label_pt}: {u_pct}%"
                         if u_profit is not None:
-                            line += f" (lucro/un. {_money(u_profit) or '—'})"
+                            line += f" (lucro/un. {_money(float(u_profit)) or '—'})"
                         desc_lines.append(line)
+
+                # Inventory forecast — stock + 14d velocity → days_left.
+                # Critical for promo decisions: accepting deep discount with
+                # 4 days of stock means burning the runway at a loss.
+                inv = enriched.get("_inventory") or {}
+                if inv:
+                    stock = int(inv.get("stock") or 0)
+                    sold_w = int(inv.get("sold_in_window") or 0)
+                    window_d = int(inv.get("window_days") or 14)
+                    avg_d = float(inv.get("avg_daily") or 0)
+                    days_left = inv.get("days_left")
+                    level = inv.get("level") or "ok"
+                    var_label = inv.get("variation_label") or ""
+                    est_label = f"Estoque ({var_label})" if var_label else "Estoque"
+                    desc_lines.append("")
+                    if stock <= 0 and avg_d > 0:
+                        refill_30d = int(round(avg_d * 30))
+                        desc_lines.append(
+                            f"📦 🛑 {est_label} esgotado! {window_d}d: {sold_w} vendas "
+                            f"(≈{avg_d:.1f}/dia) → reabasteça ≈{refill_30d} un. para 30 dias"
+                        )
+                    elif stock <= 0:
+                        desc_lines.append(
+                            f"📦 🛑 {est_label} esgotado · sem vendas em {window_d}d"
+                        )
+                    elif level == "no_history" or avg_d <= 0:
+                        desc_lines.append(
+                            f"📦 {est_label}: {stock} un. · sem histórico em {window_d}d"
+                        )
+                    elif level == "critical":
+                        days_disp = days_left if days_left is not None else 0
+                        desc_lines.append(
+                            f"📦 ⚠️ {est_label}: {stock} un. · {window_d}d: {sold_w} vendas "
+                            f"(≈{avg_d:.1f}/dia) · ⏰ apenas ~{days_disp} dias!"
+                        )
+                    else:
+                        days_disp = days_left if days_left is not None else "∞"
+                        desc_lines.append(
+                            f"📦 {est_label}: {stock} un. · {window_d}d: {sold_w} vendas "
+                            f"(≈{avg_d:.1f}/dia) · ⏰ ~{days_disp} dias"
+                        )
         elif margin.get("error") == "no_sales_in_period":
             desc_lines.append("")
             desc_lines.append("📊 Sem vendas nos últimos 3 meses — margem indisponível")
