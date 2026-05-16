@@ -719,6 +719,56 @@ async def get_latest_fetched_at(pool: asyncpg.Pool, user_id: int) -> Optional[st
         )
 
 
+async def get_cancellation_stats(
+    pool: asyncpg.Pool,
+    user_id: int,
+    mlb: str,
+    *,
+    days: int = 90,
+    min_sample: int = 5,
+) -> Optional[dict[str, Any]]:
+    """Per-SKU cancellation rate over the last `days` days.
+
+    Returns None when sample size is below `min_sample` — a single cancellation
+    out of two orders (50%) is noisy; we want enough denominator before
+    surfacing the percentage in a TG notification.
+
+    Containment uses `items @> '[{"mlb":"MLB..."}]'::jsonb` which matches any
+    order where at least one line item has this MLB. Order can have multiple
+    items; we count it once.
+    """
+    if not mlb or not mlb.startswith("MLB"):
+        return None
+    container = json.dumps([{"mlb": mlb}])
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"""
+            SELECT
+              COUNT(*) FILTER (WHERE LOWER(status) IN ('cancelled', 'invalid')) AS cancelled,
+              COUNT(*) AS total
+              FROM ml_user_orders
+             WHERE user_id = $1
+               AND date_created > NOW() - INTERVAL '{int(days)} days'
+               AND items @> $2::jsonb
+            """,
+            user_id, container,
+        )
+    if row is None:
+        return None
+    total = int(row["total"] or 0)
+    cancelled = int(row["cancelled"] or 0)
+    if total < min_sample:
+        return None
+    rate = round(cancelled / total * 100, 1) if total else 0.0
+    return {
+        "mlb": mlb,
+        "days": days,
+        "cancelled": cancelled,
+        "total": total,
+        "rate_pct": rate,
+    }
+
+
 # ── Probe (TEST step in TEST→БД→КЭШ) ───────────────────────────────────────────
 
 

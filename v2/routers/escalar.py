@@ -3273,6 +3273,29 @@ async def orders_notice_from_webhook(
             except Exception:  # noqa: BLE001
                 pass
 
+    # For cancelled orders, attach per-SKU cancellation stats so the TG card
+    # can show "% cancelled in 90d". Best-effort: failures are logged but
+    # do not break the notice pipeline.
+    if topic in ("orders_v2", "orders") and str(enriched.get("status") or "").lower() in ("cancelled", "invalid"):
+        try:
+            order_items = enriched.get("order_items") or enriched.get("items") or []
+            first_item = (order_items[0] or {}) if order_items else {}
+            inner = first_item.get("item") if isinstance(first_item.get("item"), dict) else first_item
+            mlb = str(
+                (inner.get("id") if isinstance(inner, dict) else "")
+                or first_item.get("mlb")
+                or ""
+            ).strip().upper()
+            if mlb.startswith("MLB"):
+                from v2.services import ml_orders as ml_orders_svc
+                stats = await ml_orders_svc.get_cancellation_stats(
+                    pool, body.user_id, mlb,
+                )
+                if stats:
+                    enriched["_cancellation_stats"] = stats
+        except Exception as err:  # noqa: BLE001
+            _log_n.debug("cancellation stats failed: %s", err)
+
     try:
         notice = ml_normalize_svc.normalize_event(topic, resource, enriched)
     except Exception as err:  # noqa: BLE001

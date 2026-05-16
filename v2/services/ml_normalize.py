@@ -66,18 +66,102 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                 "tags": ["ORDERS", "SKIP_TG", "ENRICHMENT_FAILED"],
                 "actions": [],
             }
-        # Skip cancelled/invalid — это не реальная продажа, бесполезный TG-noise.
-        # ml_notices хранит запись для аналитики, но label/description короткий
-        # без кнопок (telegram_notify не отправит keyboard если sale_price = 0).
+        # Cancelled / invalid order — not a real sale. Previously rendered a
+        # one-line "Pedido cancelado R$X" with no context. We now surface:
+        #   - product title + SKU + qty (so the seller recognizes the item)
+        #   - cancellation reason from ML's status_detail (if available)
+        #   - per-SKU cancellation rate over the last 90d, injected by the
+        #     orders_notice_from_webhook router as `_cancellation_stats`.
+        # Useful for spotting bad listings: if one SKU has 30%+ cancel rate
+        # over a meaningful sample, that's worth investigating.
         if status.lower() in ("cancelled", "invalid"):
             permalink_x = (
                 f"https://www.mercadolivre.com.br/vendas/{enriched.get('id')}/detalhe"
                 if enriched.get("id") else ""
             )
+
+            cx_order_items = enriched.get("order_items") or enriched.get("items") or []
+            cx_first = (cx_order_items[0] or {}) if cx_order_items else {}
+            cx_inner = cx_first.get("item") if isinstance(cx_first.get("item"), dict) else cx_first
+            cx_title = (
+                (cx_inner.get("title") if isinstance(cx_inner, dict) else "")
+                or cx_first.get("title")
+                or ""
+            )
+            cx_mlb = str(
+                (cx_inner.get("id") if isinstance(cx_inner, dict) else "")
+                or cx_first.get("mlb")
+                or ""
+            ).strip().upper()
+            cx_sku = ""
+            if isinstance(cx_inner, dict):
+                cx_sku = str(cx_inner.get("seller_sku") or "").strip()
+            if not cx_sku:
+                cx_sku = str(cx_first.get("seller_sku") or "").strip()
+            try:
+                cx_qty = int(cx_first.get("quantity") or 1)
+            except (TypeError, ValueError):
+                cx_qty = 1
+            try:
+                cx_unit_price = float(cx_first.get("unit_price") or 0.0)
+            except (TypeError, ValueError):
+                cx_unit_price = 0.0
+
+            # status_detail: ML returns either a string ("buyer_cancelled") or
+            # an object with `description` / `code` keys. Handle both shapes.
+            cx_reason = ""
+            raw_detail = enriched.get("status_detail") or enriched.get("cancel_detail")
+            if isinstance(raw_detail, dict):
+                cx_reason = str(
+                    raw_detail.get("description")
+                    or raw_detail.get("code")
+                    or raw_detail.get("reason")
+                    or ""
+                ).strip()
+            elif isinstance(raw_detail, str):
+                cx_reason = raw_detail.strip()
+
+            stats = enriched.get("_cancellation_stats") or {}
+
+            def _money_x(v: Any) -> str:
+                try:
+                    f = float(v)
+                except (TypeError, ValueError):
+                    return "—"
+                return f"R$ {f:.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+            cx_lines: list[str] = []
+            if cx_title:
+                t_short = cx_title if len(cx_title) <= 90 else cx_title[:87] + "..."
+                cx_lines.append(f"Produto: {t_short}")
+            if cx_sku:
+                cx_lines.append(f"SKU: {cx_sku}")
+            elif cx_mlb:
+                cx_lines.append(f"Item ML: {cx_mlb}")
+            if cx_qty > 1 and cx_unit_price > 0:
+                cx_lines.append(f"Quantidade: {cx_qty}× ({_money_x(cx_unit_price)}/un.)")
+            elif cx_qty > 1:
+                cx_lines.append(f"Quantidade: {cx_qty}×")
+            if cx_reason:
+                cx_lines.append(f"Motivo (ML): {cx_reason}")
+            cx_lines.append("")
+            cx_lines.append("Status: cancelado / inválido — não conta como venda.")
+            if stats and isinstance(stats, dict):
+                rate = stats.get("rate_pct")
+                cancelled_n = stats.get("cancelled")
+                total_n = stats.get("total")
+                days_n = stats.get("days")
+                if rate is not None and total_n:
+                    badge = "⚠️ " if isinstance(rate, (int, float)) and rate >= 15 else ""
+                    cx_lines.append(
+                        f"📊 {badge}Taxa de cancelamento deste SKU: {rate}% "
+                        f"({cancelled_n}/{total_n} em {days_n}d)"
+                    )
+
             return {
                 **base,
                 "label": f"Pedido cancelado {_brl(total)}",
-                "description": "Status: cancelado / inválido — não conta como venda.",
+                "description": "\n".join(cx_lines),
                 "from_date": enriched.get("date_created") or enriched.get("last_updated"),
                 "tags": ["ORDERS", "CANCELLED"],
                 "actions": [{"label": "Ver pedido", "url": permalink_x}] if permalink_x else [],
