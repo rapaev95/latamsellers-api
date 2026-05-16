@@ -641,9 +641,6 @@ async def compute_for_user(
             if ts_transfers:
                 cf = out["cashflow"]
                 existing = cf.get("transfers") or []
-                base_n = (existing[-1].get("n") or 0) if existing else 0
-                for i, tr in enumerate(ts_transfers, start=1):
-                    tr.setdefault("n", base_n + i)
                 cf["transfers"] = list(existing) + ts_transfers
                 extra_brl = sum(float(t.get("brl") or 0) for t in ts_transfers)
                 cf["total_outflows"] = round(float(cf.get("total_outflows") or 0) + extra_brl, 2)
@@ -651,12 +648,42 @@ async def compute_for_user(
                 saldo = float(inflows.get("saldo_inicial") or 0)
                 net = float(inflows.get("invoices_net") or 0)
                 cf["debito_estonia"] = round(saldo + net - cf["total_outflows"], 2)
+        # Sort the full transfers list chronologically and renumber. Without
+        # this the table renders hardcoded rows first (in their author's order),
+        # then ApprovedDataCard rows, then auto-TS rows — which jumbles dates
+        # (e.g. 18/03/26 hardcoded → 20/01/26 hardcoded → 02/05/26 auto-TS).
+        # Done once at the end so it covers every source uniformly.
+        if isinstance(out.get("cashflow"), dict):
+            cf = out["cashflow"]
+            transfers = cf.get("transfers") or []
+            transfers.sort(key=_transfer_sort_key)
+            for i, tr in enumerate(transfers, start=1):
+                tr["n"] = i
+            cf["transfers"] = transfers
     try:
         out["balance"] = await bal_task
     except Exception as err:  # noqa: BLE001
         out["balance_error"] = f"{type(err).__name__}: {err}"
 
     return out
+
+
+def _transfer_sort_key(tr: dict[str, Any]) -> date:
+    """Order transfers chronologically regardless of source.
+
+    Hardcoded list uses DD/MM/YY ("22/09/25"), approved_transfer uses the
+    same format after normalisation in _load_approved_transfers, auto-TS
+    uses it too. A few edge cases need DD/MM/YYYY. Anything unparseable
+    drops to date.min so it sits at the top of the table where it's easy
+    to spot.
+    """
+    raw = str(tr.get("date") or "")
+    for fmt in ("%d/%m/%y", "%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except (ValueError, TypeError):
+            continue
+    return date.min
 
 
 async def _build_trafficstars_auto_transfers(
