@@ -312,29 +312,34 @@ def _parse_c6_usd_pdf(file_bytes: bytes) -> list[dict[str, Any]]:
 
             # Pick a clean description: prefer captured merchant text, fall back to label
             desc = (mid or default_desc).strip()
-            # Some PDFs split the merchant name onto the next line — the row
-            # has `Débito de cartão … -US$ X` only, and the merchant string
-            # ("Ts/trafficstars.com\\spirou Kiprianou …") starts on line+1
-            # (sometimes wrapping onto line+2 with just "6602" or similar
-            # card tail). When `mid` came back empty, sweep up to two
-            # following lines as long as they don't start a new dated row.
-            # Without this the description stays the bare type label and any
-            # downstream filter (e.g. services_reports TrafficStars detection)
-            # silently misses these debits.
+            # C6 USD wraps card-debit merchant text across lines. Observed in
+            # real statements (Conta Global USD, May 2026):
+            #   [n-1] 'Ts/trafficstars.com\\spirou Kiprianou, 79 Cartão'   ← merchant
+            #   [n  ] '08/05 Débito de cartão -US$ 2.062,16 06/05'         ← dated row
+            #   [n+1] '6602'                                                ← card tail
+            # The dated row carries no merchant text between the type label
+            # and the amount, so `mid` is empty. We then sweep one line back
+            # (must not itself be a dated row or a header) and one line forward
+            # (only a short card-tail-like token, otherwise it would belong to
+            # the next transaction). Without this the description stays "Débito
+            # de cartão" and downstream filters (services_reports TrafficStars
+            # detection) silently miss the row.
             if not mid:
-                merchant_parts: list[str] = []
-                for off in (1, 2):
-                    j = i + off
-                    if j >= len(all_lines):
-                        break
-                    nxt = all_lines[j].strip()
-                    if not nxt:
-                        break
-                    if re.search(r"^\d{2}/\d{2}\b", nxt):
-                        break
-                    merchant_parts.append(nxt)
-                if merchant_parts:
-                    desc = (default_desc + " · " + " ".join(merchant_parts)).strip()
+                parts: list[str] = []
+                # Look back for merchant text
+                if i - 1 >= 0:
+                    prev = all_lines[i - 1].strip()
+                    if (prev
+                        and not re.match(r"^\d{2}/\d{2}\b", prev)
+                        and not re.search(r"\b(Data\s+Tipo|Resumo|Saldo|Per[ií]odo|Extrato)\b", prev, re.IGNORECASE)):
+                        parts.append(prev)
+                # Look forward for a short card-tail (digits only, ≤8 chars).
+                if i + 1 < len(all_lines):
+                    nxt = all_lines[i + 1].strip()
+                    if nxt and re.fullmatch(r"\d{2,8}", nxt):
+                        parts.append(nxt)
+                if parts:
+                    desc = (default_desc + " · " + " ".join(parts)).strip()
 
             iso_date = _ddmm_to_iso(ddmm, year)
             val = sign * amount
