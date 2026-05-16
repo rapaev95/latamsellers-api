@@ -3013,6 +3013,42 @@ async def items_price_shift(
 
     dyn_disabled = False
     async with httpx.AsyncClient() as http:
+        # Preflight: detect active Precificação Dinâmica BEFORE blindly
+        # PUT'ing the new price. Without this check, ML often returns 200 OK
+        # for the PUT but the dyn-pricing algorithm rewrites the price back
+        # within minutes — the seller sees a new sale at the OLD price and
+        # has no way to tell the raise didn't stick. Reported by user
+        # 2026-05-16: clicked +10% (got success toast), then 1h later a new
+        # order arrived at the original price.
+        #
+        # The existing post-PUT branch (line ~3087) only triggers when ML
+        # returns 400 item.price.not_modifiable, which it does NOT do in
+        # this silent-revert path. Preflight + dialog is the only reliable
+        # way to catch it.
+        if not body.disable_dyn:
+            try:
+                pa_resp = await http.get(
+                    f"https://api.mercadolibre.com/pricing-automation/items/{mlb}/automation",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10.0,
+                )
+                if pa_resp.status_code == 200:
+                    pa = pa_resp.json() or {}
+                    item_rule = pa.get("item_rule") or {}
+                    if item_rule.get("rule_id") or pa.get("status") == "active":
+                        return {
+                            "ok": False,
+                            "needs_dyn_confirm": True,
+                            "reason": "dynamic_pricing_active_preflight",
+                            "item_id": mlb,
+                            "old_price": base_price,
+                            "attempted_new_price": new_price,
+                            "delta_pct": float(body.delta_pct),
+                        }
+            except Exception:  # noqa: BLE001
+                pass  # best-effort — fall through to PUT, ML will still
+                      # error with 400 if Dyn blocks the write
+
         # Optional preflight: disable Dynamic Pricing if user confirmed via
         # TG button. Saves prev rule into ml_user_pricing_history.
         if body.disable_dyn:
