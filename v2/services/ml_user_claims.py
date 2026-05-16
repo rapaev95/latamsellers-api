@@ -189,36 +189,24 @@ async def _enrich_one(http: httpx.AsyncClient, token: str, claim: dict) -> dict:
         except Exception:  # noqa: BLE001
             pass
 
-    # 4. Mediation details (only for type=mediations / stage=dispute claims).
-    # The base /claims/{id} response is sparse for disputes — the rich data
-    # (due_date, affects_reputation, last_action_player, expected_actions)
-    # lives on /post-purchase/v1/mediations/{id}. Without this we cannot
-    # filter "needs my action" the way ML's UI does.
-    if claim.get("type") == "mediations" or claim.get("stage") == "dispute":
-        try:
-            r = await http.get(
-                f"{ML_API_BASE}/post-purchase/v1/mediations/{cid}",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=15.0,
-            )
-            if r.status_code == 200:
-                claim["mediation"] = r.json()
-            elif r.status_code not in (403, 404):
-                log.info("mediations/%s status=%s body=%s", cid, r.status_code, r.text[:200])
-        except Exception as err:  # noqa: BLE001
-            log.warning("mediations/%s exception: %s", cid, err)
+    # 4. Mediation details — REMOVED 2026-05-16.
+    # ML deprecated /post-purchase/v1/mediations/{id}; the endpoint now
+    # returns 404 for every claim, generating ~50% of the refresh-loop
+    # traffic for no payoff and causing 429 rate limits on legitimate
+    # /claims/{id}/messages calls.
+    # If a future ML version embeds mediation data inline in /claims/{id}
+    # response, the `claim.get("mediation")` reader in section (c) below
+    # will pick it up automatically. No separate fetch needed.
 
     # 5. Messages thread — buyer's complaint + ML mediator notes + seller
-    # replies. Three sources we have to merge:
+    # replies. Two sources we merge:
     #   a) /claims/{id}/messages — the regular thread
-    #   b) /mediations/{id}/messages — once a claim escalates to dispute
-    #      stage, ML's UI routes the seller's "Responder" action to this
-    #      thread, NOT the claims thread; without (b) every mediation
-    #      shows as un-replied even after the seller answered.
-    #   c) claim.mediation.messages — sometimes the mediation payload
+    #   b) claim.mediation.messages — sometimes the mediation payload
     #      itself embeds the message list, no separate fetch needed.
-    # All three are merged + de-duped so _compute_needs_action and the
-    # Telegram dispatcher see the latest reply regardless of source.
+    # NB: /post-purchase/v1/mediations/{id}/messages was a third source
+    # but ML deprecated it (always 404); see section 4 above.
+    # Both remaining sources are merged + de-duped so _compute_needs_action
+    # and the Telegram dispatcher see the latest reply regardless of source.
 
     def _absorb(msg_list: Any) -> list[dict]:
         out: list[dict] = []
@@ -250,22 +238,13 @@ async def _enrich_one(http: httpx.AsyncClient, token: str, claim: dict) -> dict:
     except Exception as err:  # noqa: BLE001
         log.warning("claims/%s/messages exception: %s", cid, err)
 
-    # (b) mediations/{id}/messages — only for dispute/mediation claims
-    if claim.get("type") == "mediations" or claim.get("stage") == "dispute":
-        try:
-            r = await http.get(
-                f"{ML_API_BASE}/post-purchase/v1/mediations/{cid}/messages",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=15.0,
-            )
-            if r.status_code == 200:
-                aggregated.extend(_absorb(r.json()))
-            elif r.status_code not in (403, 404):
-                log.info("mediations/%s/messages status=%s body=%s", cid, r.status_code, r.text[:200])
-        except Exception as err:  # noqa: BLE001
-            log.warning("mediations/%s/messages exception: %s", cid, err)
+    # (b) mediations/{id}/messages — REMOVED 2026-05-16 (ML deprecated;
+    # always returned 404, causing rate-limit pressure). See section 4.
 
-    # (c) embedded inside mediation payload (best-effort — keys vary)
+    # (c) embedded inside mediation payload (best-effort — keys vary).
+    # `claim["mediation"]` is no longer populated by us (the /mediations/
+    # fetch was dropped), but if ML embeds mediation data inline in the
+    # /claims/{id} response, this block picks it up automatically.
     mediation = claim.get("mediation")
     if isinstance(mediation, dict):
         for key in ("messages", "message_history", "thread"):
