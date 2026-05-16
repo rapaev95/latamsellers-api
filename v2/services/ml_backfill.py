@@ -340,53 +340,93 @@ async def _enrich_order_with_margin(
         log.debug("velocity adjustment failed for %s: %s", item_id, err)
 
     # ── Break-even explainer (когда net < 0) ─────────────────────────────
-    # Если чистая прибыль negative — посчитаем расшифровку:
-    # сколько продаж/мес нужно чтобы покрыть фиксированные расходы,
-    # сколько уже продано в текущем календарном месяце, сколько % покрытия.
+    # «Чтобы выйти в плюс по проекту»: считаем PROJECT-level (а не per-item),
+    # так как user явно требовал «по проекту всего»:
+    #   - sum(overhead_total) across all items in project = project monthly fixed
+    #   - weighted avg per-sale margin = SUM(pv × units) / SUM(units) across project
+    #   - sales needed/мес = ceil(project_monthly_fixed / weighted_avg_margin)
+    #   - sales actual this calendar month = sum units across all project items
+    #     in ml_user_orders где status not cancelled
     try:
         unit_d = (recomputed.get("unit") or {})
         net_pu = unit_d.get("profit_net_per_unit")
         pv_pu = unit_d.get("profit_variable")
+        project_norm = (project or "").upper().strip() if 'project' in dir() else ""
+        # Re-derive project here (block runs before main project resolution below).
+        proj_from_payload = (
+            recomputed.get("project") or payload.get("project") or ""
+        )
+        project_for_be = str(proj_from_payload).upper().strip()
         if (
             net_pu is not None and float(net_pu) < 0
             and pv_pu is not None and float(pv_pu) > 0
+            and project_for_be
         ):
-            overhead_total = float(recomputed.get("overhead_total") or payload.get("overhead_total") or 0)
-            period_m = int(recomputed.get("period_months") or payload.get("period_months") or 3)
-            monthly_fixed = overhead_total / max(period_m, 1)
-            if monthly_fixed > 0:
-                import math as _math
-                sales_needed = int(_math.ceil(monthly_fixed / float(pv_pu)))
-                # Sales this calendar month for THIS item — sum units from
-                # ml_user_orders.items where mlb matches AND date_created
-                # is in current calendar month UTC (close enough to BRT
-                # для round-numbers explainer).
-                from datetime import datetime as _dt3
-                from . import ml_orders as _mo_for_mtd
-                async with pool.acquire() as conn_be:
-                    actual_row = await conn_be.fetchrow(
-                        """
-                        SELECT COALESCE(SUM((items_elem->>'quantity')::int), 0) AS units
-                          FROM ml_user_orders, jsonb_array_elements(items) items_elem
-                         WHERE user_id = $1
-                           AND status NOT IN ('cancelled','invalid')
-                           AND items_elem->>'mlb' = $2
-                           AND date_created >= date_trunc('month', NOW())
-                        """,
-                        user_id, item_id,
-                    )
-                actual_mtd = int((actual_row or {}).get("units") or 0)
-                coverage_pct = round((actual_mtd / sales_needed) * 100, 1) if sales_needed > 0 else 0.0
-                enriched["_breakeven_explainer"] = {
-                    "monthly_fixed_brl": round(monthly_fixed, 2),
-                    "profit_variable_per_sale": round(float(pv_pu), 2),
-                    "sales_needed_per_month": sales_needed,
-                    "sales_actual_mtd": actual_mtd,
-                    "coverage_pct": coverage_pct,
-                    "gap_units": max(0, sales_needed - actual_mtd),
-                    "month_so_far_brl": round(actual_mtd * float(pv_pu), 2),
-                    "monthly_target_brl": round(monthly_fixed, 2),
-                }
+            import math as _math
+            async with pool.acquire() as conn_be:
+                # PROJECT-level: aggregate overhead + units + weighted-margin
+                # across ALL items mapped to this project in margin cache.
+                project_row = await conn_be.fetchrow(
+                    """
+                    SELECT COUNT(*) AS n_items,
+                           COALESCE(SUM((payload->>'overhead_total')::float), 0) AS overhead_total_sum,
+                           COALESCE(SUM((payload->>'units_sold')::int), 0) AS units_sum,
+                           COALESCE(SUM(
+                             (payload->'unit'->>'profit_variable')::float
+                             * (payload->>'units_sold')::int
+                           ), 0) AS weighted_pv_sum,
+                           MAX((payload->>'period_months')::int) AS period_m,
+                           ARRAY_AGG(item_id) AS item_ids
+                      FROM ml_item_margin_cache
+                     WHERE user_id = $1
+                       AND UPPER(TRIM(payload->>'project')) = $2
+                       AND (payload->>'ok')::boolean = TRUE
+                    """,
+                    user_id, project_for_be,
+                )
+                overhead_sum = float((project_row or {}).get("overhead_total_sum") or 0)
+                units_sum = int((project_row or {}).get("units_sum") or 0)
+                weighted_pv = float((project_row or {}).get("weighted_pv_sum") or 0)
+                period_m = int((project_row or {}).get("period_m") or 3)
+                proj_item_ids = list((project_row or {}).get("item_ids") or [])
+                n_items = int((project_row or {}).get("n_items") or 0)
+
+                project_monthly_fixed = overhead_sum / max(period_m, 1)
+                avg_pv_per_sale = weighted_pv / units_sum if units_sum > 0 else float(pv_pu)
+
+                if project_monthly_fixed <= 0 or avg_pv_per_sale <= 0 or not proj_item_ids:
+                    raise RuntimeError("project breakeven inputs not viable")
+
+                sales_needed = int(_math.ceil(project_monthly_fixed / avg_pv_per_sale))
+
+                # Actual sales this calendar month across ALL project items.
+                actual_row = await conn_be.fetchrow(
+                    """
+                    SELECT COALESCE(SUM((items_elem->>'quantity')::int), 0) AS units
+                      FROM ml_user_orders, jsonb_array_elements(items) items_elem
+                     WHERE user_id = $1
+                       AND status NOT IN ('cancelled','invalid')
+                       AND items_elem->>'mlb' = ANY($2::text[])
+                       AND date_created >= date_trunc('month', NOW())
+                    """,
+                    user_id, proj_item_ids,
+                )
+            actual_mtd = int((actual_row or {}).get("units") or 0)
+            month_so_far_brl = round(actual_mtd * avg_pv_per_sale, 2)
+            coverage_pct = round((actual_mtd / sales_needed) * 100, 1) if sales_needed > 0 else 0.0
+            enriched["_breakeven_explainer"] = {
+                "scope": "project",
+                "project": project_for_be,
+                "n_items": n_items,
+                "monthly_fixed_brl": round(project_monthly_fixed, 2),
+                "profit_variable_per_sale": round(avg_pv_per_sale, 2),
+                "sales_needed_per_month": sales_needed,
+                "sales_actual_mtd": actual_mtd,
+                "coverage_pct": coverage_pct,
+                "gap_units": max(0, sales_needed - actual_mtd),
+                "month_so_far_brl": month_so_far_brl,
+                "monthly_target_brl": round(project_monthly_fixed, 2),
+            }
     except Exception as err:  # noqa: BLE001
         log.debug("breakeven explainer failed for %s: %s", item_id, err)
 
