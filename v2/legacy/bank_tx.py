@@ -312,12 +312,29 @@ def _parse_c6_usd_pdf(file_bytes: bytes) -> list[dict[str, Any]]:
 
             # Pick a clean description: prefer captured merchant text, fall back to label
             desc = (mid or default_desc).strip()
-            # Some PDFs split the merchant name onto the next line; if the
-            # captured text is empty/short, peek 1 line ahead for context.
-            if (not desc or len(desc) < 4) and i + 1 < len(all_lines):
-                nxt = all_lines[i + 1].strip()
-                if nxt and not re.search(r"\d{2}/\d{2}", nxt):
-                    desc = (default_desc + " · " + nxt).strip()
+            # Some PDFs split the merchant name onto the next line — the row
+            # has `Débito de cartão … -US$ X` only, and the merchant string
+            # ("Ts/trafficstars.com\\spirou Kiprianou …") starts on line+1
+            # (sometimes wrapping onto line+2 with just "6602" or similar
+            # card tail). When `mid` came back empty, sweep up to two
+            # following lines as long as they don't start a new dated row.
+            # Without this the description stays the bare type label and any
+            # downstream filter (e.g. services_reports TrafficStars detection)
+            # silently misses these debits.
+            if not mid:
+                merchant_parts: list[str] = []
+                for off in (1, 2):
+                    j = i + off
+                    if j >= len(all_lines):
+                        break
+                    nxt = all_lines[j].strip()
+                    if not nxt:
+                        break
+                    if re.search(r"^\d{2}/\d{2}\b", nxt):
+                        break
+                    merchant_parts.append(nxt)
+                if merchant_parts:
+                    desc = (default_desc + " · " + " ".join(merchant_parts)).strip()
 
             iso_date = _ddmm_to_iso(ddmm, year)
             val = sign * amount

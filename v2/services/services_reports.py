@@ -718,6 +718,15 @@ async def _build_trafficstars_auto_transfers(
         log.warning("ts_auto: cambio compute_for_user failed: %s", err)
         return []
 
+    # Fallback rate for débitos that FIFO couldn't fully cover (no USD lots
+    # left at the time). Without this we'd either skip them — hiding real
+    # spend from debito_estonia — or write R$ 0 and silently misstate the
+    # debit. Using the period's average câmbio rate gives a reasonable
+    # estimate; rows that fall back are flagged _brl_estimated so the UI can
+    # warn the user to backfill manual USD inflows (Bybit / Nubank / etc.).
+    summary = result.summary if hasattr(result, "summary") else {}
+    avg_rate = float(summary.get("avg_rate") or 0)
+
     out_transfers: list[dict[str, Any]] = []
     for r in rows:
         val = float(r.get("value_brl") or 0)
@@ -728,9 +737,16 @@ async def _build_trafficstars_auto_transfers(
             continue
         usd_abs = abs(val)
         brl_cost = float(r.get("fifo_brl_cost") or 0)
+        uncovered = float(r.get("fifo_uncovered_usd") or 0)
+        estimated = False
+        if uncovered > 0 and avg_rate > 0:
+            # Cover the missing portion at avg rate; flag the row.
+            brl_cost = round(brl_cost + uncovered * avg_rate, 2)
+            estimated = True
         if brl_cost <= 0:
-            # Uncovered — no FIFO lots when this saída ran. Adding R$ 0 would
-            # understate debito_estonia; let user record it manually if needed.
+            # No FIFO data AND no avg rate to fall back on — can't represent
+            # this debit in BRL at all. Skip so we don't write R$ 0 into the
+            # transfers table.
             continue
         date_iso = str(r.get("date") or "")[:10]
         try:
@@ -742,12 +758,13 @@ async def _build_trafficstars_auto_transfers(
         rate = round(brl_cost / usd_abs, 4) if usd_abs > 0 else None
         out_transfers.append({
             "date": date_str,
-            "canal": "C6 TrafficStars (auto)",
+            "canal": "C6 TrafficStars (auto)" + (" ~est" if estimated else ""),
             "usd": round(usd_abs, 2),
             "vet": rate,
             "brl": round(brl_cost, 2),
             "_auto_imported": True,
             "_auto_source": "trafficstars",
+            "_brl_estimated": estimated,
         })
     out_transfers.sort(key=lambda r: r["date"])
     return out_transfers
