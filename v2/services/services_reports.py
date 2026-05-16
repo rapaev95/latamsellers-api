@@ -738,6 +738,25 @@ async def _build_trafficstars_auto_transfers(
     if not rows:
         return []
 
+    # Second-pass dedup by (date, usd amount) — covers the case where two
+    # uploaded PDFs cover overlapping periods AND the parser captured the
+    # same debit under slightly different descriptions (so tx_hash dedup
+    # above doesn't catch them). Keeps the earliest-seen row, drops repeats.
+    by_key: dict[tuple[str, float], dict[str, Any]] = {}
+    for r in rows:
+        val = float(r.get("value_brl") or 0)
+        if val >= 0:
+            by_key[(str(r.get("date") or ""), val, r.get("tx_hash") or "")] = r  # entradas keyed by hash so they all stay
+            continue
+        k = (str(r.get("date") or "")[:10], round(abs(val), 2))
+        # Skip if a debit with the same (date, |usd|) already exists. Two
+        # legitimately separate debits on the same day for the exact same
+        # amount are rare enough to call out via a manual ApprovedDataCard
+        # entry if they ever happen.
+        if k not in by_key:
+            by_key[k] = r
+    rows = list(by_key.values())
+
     try:
         result = await cambio.compute_for_user(pool, user_id, rows)
         cambio.enrich_rows(rows, result)

@@ -1053,6 +1053,9 @@ class ServicesCashflowOut(BaseModel):
 
     inflows: dict[str, float] = {}
     outflows: dict[str, float] = {}
+    # Per-invoice breakdown surfaced by the DDS «Поступления» table.
+    # Each entry: {date, gross, tax, net, rate, numero, auto_loaded}.
+    invoice_lines: list[dict[str, Any]] = []
     transfers: list[dict[str, Any]] = []
     total_outflows: float = 0
     debito_estonia: float = 0

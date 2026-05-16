@@ -686,12 +686,33 @@ def generate_opiu_estonia() -> dict:
             "profit": bm.get("commission", 0) - das_value,
         })
 
+    # Per-invoice list for downstream consumers (DDS Поступления table).
+    # Sorted by date asc; each entry exposes the same gross/tax/rate fields
+    # used to compute the totals so the UI can show one row per invoice
+    # alongside the aggregated KPIs.
+    invoices_out = sorted(
+        [
+            {
+                "date": str(inv.get("date") or "")[:10],
+                "gross": round(float(inv.get("gross") or 0), 2),
+                "tax": round(float(inv.get("tax") or 0), 2),
+                "net": round(float(inv.get("gross") or 0) - float(inv.get("tax") or 0), 2),
+                "rate": float(inv.get("rate") or 0),
+                "numero": inv.get("numero"),
+                "auto_loaded": bool(inv.get("auto_loaded")),
+            }
+            for inv in invoice_lines
+        ],
+        key=lambda r: r["date"],
+    )
+
     return {
         # Invoice totals
         "total_gross": total_gross,
         "total_tax_retained": total_tax,
         "total_net_client": total_net_client,
         "invoice_count": invoice_count,
+        "invoice_lines": invoices_out,
         # Balance
         "saldo_inicial": saldo_inicial,
         "total_enviado": total_enviado,
@@ -772,6 +793,9 @@ def generate_dds_estonia() -> dict:
         "total_outflows": opiu["total_enviado"],
         "debito_estonia": opiu["debito_estonia"],
         "by_month": opiu["by_month"],
+        # Per-invoice breakdown for the DDS "Поступления (инвойсы)" section.
+        # Each entry: {date, gross, tax, net, rate, numero, auto_loaded}.
+        "invoice_lines": opiu.get("invoice_lines") or [],
     }
 
 
