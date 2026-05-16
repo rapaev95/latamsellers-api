@@ -515,7 +515,7 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
             # ждать до следующего refresh).
             desc_lines.append("")
             desc_lines.append(
-                f"📊 Margem indisponível ({item_id}) — preencha custo "
+                f"❌ Margem indisponível ({item_id}) — preencha custo "
                 f"em /finance/sku-mapping ou aguarde refresh noturno"
             )
 
