@@ -163,6 +163,27 @@ async def _dispatch_questions_to_tg_job() -> None:
         _ml_log.exception("Questions dispatch job failed: %s", err)
 
 
+async def _price_revert_check_job() -> None:
+    """Verify recent price-shifts still hold on ML (cron, default 5 min).
+
+    Catches the silent-revert path: PUT /items returned 200 OK, but ML's
+    pricing-automation rewrote the price back minutes later. Sends a TG
+    follow-up so the seller knows their +10% (or similar) didn't stick.
+    See v2/services/price_revert_check.py for the full rationale.
+    """
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("Price-revert check skipped: no DB pool")
+            return
+        from v2.services import price_revert_check as price_revert_check_svc
+        stats = await price_revert_check_svc.run_check_tick(pool)
+        if stats.get("checked", 0) > 0:
+            _ml_log.info("Price-revert tick: %s", stats)
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("Price-revert job failed: %s", err)
+
+
 async def _dispatch_claims_to_tg_job() -> None:
     """Send actionable opened claims to seller's Telegram (cron, default 5 min).
 
@@ -1027,6 +1048,21 @@ async def _v2_startup() -> None:
         "interval",
         minutes=_claims_interval,
         id="claims_tg_dispatch",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Price-revert verification — catches the silent case where ML's PUT
+    # /items returned 200 OK but pricing-automation rewrote the price
+    # back minutes later. Scans escalar_audit for unverified
+    # price_raised/price_lowered events between 5 and 60 min old, GETs
+    # the current price, alerts seller if diverged > 1%.
+    _price_revert_interval = int(os.environ.get("PRICE_REVERT_CHECK_INTERVAL_MIN", "5"))
+    _ml_scheduler.add_job(
+        _price_revert_check_job,
+        "interval",
+        minutes=_price_revert_interval,
+        id="price_revert_check",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
