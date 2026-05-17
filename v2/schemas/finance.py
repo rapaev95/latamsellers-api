@@ -1066,6 +1066,11 @@ class ServicesCashflowOut(BaseModel):
     # Shape: {"total_brl": float, "transactions": [{date, valor_brl, category,
     # note, currency, valor_orig, rate}]}.
     operating_expenses: dict[str, Any] = {"total_brl": 0, "transactions": []}
+    # Bank-statement income rows the user classified as category=income with
+    # this project. Each entry is a tx dict ({Data, Valor, Описание, …}).
+    # Surfaced as a separate "Поступления (выписка)" table; the aggregated
+    # total also lives in inflows.bank_inflows_total.
+    bank_inflows: list[dict[str, Any]] = []
     needs_config: bool = Field(default=False, alias="_needs_config")
     reason: Optional[str] = Field(default=None, alias="_reason")
 
