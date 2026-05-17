@@ -404,6 +404,9 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                 else:
                     coverage_pct = float(be_exp.get("coverage_pct") or 0)
                     gap = int(be_exp.get("gap_units") or 0)
+                    manual_part = float(be_exp.get("manual_fc_monthly_brl") or 0)
+                    rental_part = float(be_exp.get("rental_monthly_brl") or 0)
+                    rental_label = str(be_exp.get("rental_label") or "")
                     # ASCII progress bar (10 chars).
                     bar_fill = int(round(min(100, coverage_pct) / 10))
                     bar = "█" * bar_fill + "░" * (10 - bar_fill)
@@ -411,6 +414,19 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                     desc_lines.append(
                         f"   • Custos fixos do projeto: {_money(monthly_fixed)} /mês"
                     )
+                    # Breakdown when rental contributes (separate line so seller
+                    # знает что rental добавлен в фикс расходы).
+                    if rental_part > 0 and manual_part > 0:
+                        desc_lines.append(
+                            f"     └ Aluguel/rental: {_money(rental_part)} ({rental_label})"
+                        )
+                        desc_lines.append(
+                            f"     └ Manuais (Salários/Util/etc): {_money(manual_part)}"
+                        )
+                    elif rental_part > 0:
+                        desc_lines.append(
+                            f"     └ Aluguel/rental: {_money(rental_part)} ({rental_label})"
+                        )
                     desc_lines.append(
                         f"   • Margem média por venda: {_money(pv_pu_be)}"
                     )
@@ -420,11 +436,19 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                     desc_lines.append(
                         f"   • Vendido este mês: *{sales_actual} un.* ({_money(month_so_far)})"
                     )
-                    gap_brl = _money(monthly_fixed - month_so_far) or "—"
-                    desc_lines.append(
-                        f"   {bar} {coverage_pct:.0f}% coberto · "
-                        f"faltam {gap} un. ({gap_brl})"
-                    )
+                    if coverage_pct >= 100:
+                        surplus_brl = month_so_far - monthly_fixed
+                        desc_lines.append(
+                            f"   ██████████ ✅ *Meta do mês superada* · "
+                            f"excedente R$ {surplus_brl:,.2f}"
+                            .replace(",", "X").replace(".", ",").replace("X", ".")
+                        )
+                    else:
+                        gap_brl = _money(monthly_fixed - month_so_far) or "—"
+                        desc_lines.append(
+                            f"   {bar} {coverage_pct:.0f}% coberto · "
+                            f"faltam {gap} un. ({gap_brl})"
+                        )
 
             # ── Break-even progress block (Сессия C) ────────────────────
             # _breakeven инжектится ml_backfill._enrich_order_with_margin

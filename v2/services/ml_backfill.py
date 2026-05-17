@@ -402,7 +402,73 @@ async def _enrich_order_with_margin(
                 proj_item_ids = list((project_row or {}).get("item_ids") or [])
                 n_items = int((project_row or {}).get("n_items") or 0)
 
-                project_monthly_fixed = manual_fc_monthly
+                # User-configured rental (compensation_mode='rental'). UI:
+                # «RATE USD: 800» + «PERIOD: quarter» → rental.rate_usd +
+                # rental.period в project config. Берём ИЗ НАСТРОЕК (rate_usd),
+                # не из payments. Конвертим в BRL/мес по последнему paid
+                # rate_brl, fallback 5.3.
+                rental_monthly_brl = 0.0
+                rental_label = ""
+                proj_cfg_row = await conn_be.fetchrow(
+                    "SELECT data_value FROM user_data "
+                    "WHERE user_id = $1 AND data_key = 'projects' LIMIT 1",
+                    user_id,
+                )
+                if proj_cfg_row:
+                    proj_cfg = proj_cfg_row["data_value"]
+                    if isinstance(proj_cfg, str):
+                        try:
+                            proj_cfg = json.loads(proj_cfg)
+                        except Exception:  # noqa: BLE001
+                            proj_cfg = {}
+                    if isinstance(proj_cfg, dict):
+                        for _pname, _pdata in proj_cfg.items():
+                            if (_pname or "").upper().strip() != project_for_be:
+                                continue
+                            if not isinstance(_pdata, dict):
+                                continue
+                            rental_cfg = _pdata.get("rental") or {}
+                            if not isinstance(rental_cfg, dict):
+                                break
+                            try:
+                                rate_usd = float(rental_cfg.get("rate_usd") or 0)
+                            except (TypeError, ValueError):
+                                rate_usd = 0.0
+                            if rate_usd <= 0:
+                                break
+                            period_str = str(rental_cfg.get("period") or "month").lower()
+                            period_divisor = {
+                                "month": 1, "monthly": 1,
+                                "quarter": 3, "quarterly": 3,
+                                "semester": 6,
+                                "year": 12, "yearly": 12, "annual": 12,
+                            }.get(period_str, 1)
+                            # Latest paid rate_brl from payments (для конверсии).
+                            rate_brl = 5.3
+                            paid_rates: list[tuple[str, float]] = []
+                            for _p in (rental_cfg.get("payments") or []):
+                                if (
+                                    isinstance(_p, dict)
+                                    and (_p.get("status") or "").lower() == "paid"
+                                    and _p.get("rate_brl") is not None
+                                ):
+                                    try:
+                                        paid_rates.append((
+                                            str(_p.get("date") or ""),
+                                            float(_p.get("rate_brl")),
+                                        ))
+                                    except (TypeError, ValueError):
+                                        pass
+                            if paid_rates:
+                                paid_rates.sort(key=lambda x: x[0], reverse=True)
+                                rate_brl = paid_rates[0][1]
+                            rental_monthly_brl = (rate_usd * rate_brl) / period_divisor
+                            rental_label = (
+                                f"US$ {int(rate_usd)}/{period_str} × R$ {rate_brl:.2f}"
+                            )
+                            break
+
+                project_monthly_fixed = manual_fc_monthly + rental_monthly_brl
                 avg_pv_per_sale = weighted_pv / units_sum if units_sum > 0 else float(pv_pu)
 
                 if avg_pv_per_sale <= 0 or not proj_item_ids:
@@ -436,6 +502,9 @@ async def _enrich_order_with_margin(
                 "project": project_for_be,
                 "n_items": n_items,
                 "monthly_fixed_brl": round(project_monthly_fixed, 2),
+                "manual_fc_monthly_brl": round(manual_fc_monthly, 2),
+                "rental_monthly_brl": round(rental_monthly_brl, 2),
+                "rental_label": rental_label,
                 "profit_variable_per_sale": round(avg_pv_per_sale, 2),
                 "sales_needed_per_month": sales_needed,
                 "sales_actual_mtd": actual_mtd,
