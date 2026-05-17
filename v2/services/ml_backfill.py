@@ -364,22 +364,23 @@ async def _enrich_order_with_margin(
         ):
             import math as _math
             async with pool.acquire() as conn_be:
-                # PROJECT-level: aggregate overhead + units + weighted-margin
-                # across ALL items mapped to this project в margin cache.
-                # NB: SUM по 4 non-DAS статьям (publi + armaz + aluguel +
-                # fulfillment). DAS НЕ включаем — он уже вычтен из
-                # profit_variable (true_variable_per_sale включает das_per_unit).
-                # Если использовать payload.overhead_total — DAS дублируется
-                # и breakeven sales overestimated на ~15% (баг найден 2026-05-16).
+                # PROJECT-level: agregate ТОЛЬКО user-entered manual fixed
+                # costs (project config UI). Computed shares (publi из ads,
+                # armaz, fulfillment, aluguel-empresa) — НЕ включаем потому
+                # что:
+                # - реклама = инвестиция, не фикс расход
+                # - fulfillment скейлится с продажами, не фикс
+                # - aluguel-empresa pro-rata из company-wide, не project
+                # User explicitly: «полагаемся только на фикс расходы что мы
+                # указали в проекте, от них отталкиваемся». Так что берём
+                # manual_fc_user_total (sum of salaries + utilities + software
+                # + outros + aluguel + armazenagem categories из project
+                # config). 0 → informational note вместо breakeven calc.
                 project_row = await conn_be.fetchrow(
                     """
                     SELECT COUNT(*) AS n_items,
-                           COALESCE(SUM(
-                             COALESCE((payload->>'publicidade_share')::float, 0)
-                             + COALESCE((payload->>'armazenagem_share')::float, 0)
-                             + COALESCE((payload->>'aluguel_share')::float, 0)
-                             + COALESCE((payload->>'fulfillment_share')::float, 0)
-                           ), 0) AS overhead_excl_das_sum,
+                           MAX((payload->'unit'->>'manual_fc_user_total')::float)
+                             AS manual_fc_monthly,
                            COALESCE(SUM((payload->>'units_sold')::int), 0) AS units_sum,
                            COALESCE(SUM(
                              (payload->'unit'->>'profit_variable')::float
@@ -394,20 +395,23 @@ async def _enrich_order_with_margin(
                     """,
                     user_id, project_for_be,
                 )
-                overhead_sum = float((project_row or {}).get("overhead_excl_das_sum") or 0)
+                manual_fc_monthly = float((project_row or {}).get("manual_fc_monthly") or 0)
                 units_sum = int((project_row or {}).get("units_sum") or 0)
                 weighted_pv = float((project_row or {}).get("weighted_pv_sum") or 0)
                 period_m = int((project_row or {}).get("period_m") or 3)
                 proj_item_ids = list((project_row or {}).get("item_ids") or [])
                 n_items = int((project_row or {}).get("n_items") or 0)
 
-                project_monthly_fixed = overhead_sum / max(period_m, 1)
+                project_monthly_fixed = manual_fc_monthly
                 avg_pv_per_sale = weighted_pv / units_sum if units_sum > 0 else float(pv_pu)
 
-                if project_monthly_fixed <= 0 or avg_pv_per_sale <= 0 or not proj_item_ids:
+                if avg_pv_per_sale <= 0 or not proj_item_ids:
                     raise RuntimeError("project breakeven inputs not viable")
 
-                sales_needed = int(_math.ceil(project_monthly_fixed / avg_pv_per_sale))
+                sales_needed = (
+                    int(_math.ceil(project_monthly_fixed / avg_pv_per_sale))
+                    if project_monthly_fixed > 0 else 0
+                )
 
                 # Actual sales this calendar month across ALL project items.
                 actual_row = await conn_be.fetchrow(
@@ -423,7 +427,10 @@ async def _enrich_order_with_margin(
                 )
             actual_mtd = int((actual_row or {}).get("units") or 0)
             month_so_far_brl = round(actual_mtd * avg_pv_per_sale, 2)
-            coverage_pct = round((actual_mtd / sales_needed) * 100, 1) if sales_needed > 0 else 0.0
+            coverage_pct = (
+                round((actual_mtd / sales_needed) * 100, 1)
+                if sales_needed > 0 else None
+            )
             enriched["_breakeven_explainer"] = {
                 "scope": "project",
                 "project": project_for_be,
@@ -436,6 +443,7 @@ async def _enrich_order_with_margin(
                 "gap_units": max(0, sales_needed - actual_mtd),
                 "month_so_far_brl": month_so_far_brl,
                 "monthly_target_brl": round(project_monthly_fixed, 2),
+                "manual_fc_configured": project_monthly_fixed > 0,
             }
     except Exception as err:  # noqa: BLE001
         log.debug("breakeven explainer failed for %s: %s", item_id, err)
