@@ -80,6 +80,15 @@ USER_DATA_KEYS_AFFECTING_FINANCE: tuple[str, ...] = (
     "f2_orphan_assignments",
     "f2_publicidade_invoices",
     "f2_rental_payments",
+    # Per-bank classification overrides — without these the cache returns a
+    # stale services-reports payload (no bank_inflows / wrong project
+    # totals) after the user re-classifies a row in /finance/classification.
+    # Surfaced as separate keys per source_key because that's how
+    # bank_classifications.prefetch_for_user reads them.
+    "f2_classifications_grouped_extrato_nubank",
+    "f2_classifications_grouped_extrato_c6_brl",
+    "f2_classifications_grouped_extrato_c6_usd",
+    "f2_classifications_grouped_extrato_mp",
 )
 
 CREATE_SQL = """
