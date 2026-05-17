@@ -580,6 +580,71 @@ async def services_unhide_transfer(
     return {"ok": True, "hidden_count": len(cur)}
 
 
+_EDITS_KEY_TEMPLATE = "f2_services_transfer_edits_{project}"
+_EDITABLE_FIELDS = {"date", "canal", "brl", "usd", "vet"}
+
+
+@router.post("/services-reports/edit-transfer")
+async def services_edit_transfer(
+    body: dict[str, Any],
+    project: str = Query(..., description="Services project ID"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Patch a single transfer row in services DDS by its `key` (the
+    pre-edit `_hide_key` — saved as `_orig_key` after first edit so
+    callers always have a stable handle).
+
+    Body: {key, patch: {date?, canal?, brl?, usd?, vet?}}. Only the listed
+    fields can be overridden; others ignored. Numeric fields are coerced
+    to floats (or None). Empty patch deletes the existing override so the
+    row reverts to its source values.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    if not _is_superadmin(user):
+        raise HTTPException(status_code=403, detail={"code": "superadmin_required"})
+    key = str(body.get("key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail={"error": "missing_key"})
+    raw_patch = body.get("patch") or {}
+    if not isinstance(raw_patch, dict):
+        raise HTTPException(status_code=400, detail={"error": "patch_must_be_object"})
+
+    effective_user_id = await _resolve_effective_user_for_project(pool, user, project)
+    _bind_user_id(effective_user_id)
+
+    # Coerce: strings stay strings, brl/usd/vet → float or None
+    clean: dict[str, Any] = {}
+    for f, v in raw_patch.items():
+        if f not in _EDITABLE_FIELDS:
+            continue
+        if f in ("brl", "usd", "vet"):
+            if v is None or v == "":
+                clean[f] = None
+            else:
+                try:
+                    clean[f] = float(v)
+                except (TypeError, ValueError):
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"error": "bad_numeric", "field": f, "value": v},
+                    )
+        else:
+            clean[f] = str(v)
+
+    from v2.legacy.db_storage import db_load, db_save
+    edits = db_load(_EDITS_KEY_TEMPLATE.format(project=project), user_id=effective_user_id)
+    if not isinstance(edits, dict):
+        edits = {}
+    if clean:
+        edits[key] = clean
+    else:
+        edits.pop(key, None)  # empty patch → revert to source values
+    db_save(_EDITS_KEY_TEMPLATE.format(project=project), edits)
+    return {"ok": True, "edits_count": len(edits)}
+
+
 def _dataclass_to_dict(obj: Any) -> Any:
     """Convert dataclass / nested dataclasses → dict for JSON serialisation."""
     from dataclasses import asdict, is_dataclass
@@ -3754,6 +3819,12 @@ def delete_project_endpoint(
 _MANUAL_CF_KINDS = (
     "partner_contributions", "manual_expenses", "manual_supplier",
     "loan_given", "loan_received",
+    # Services-projects (Estonia / GANZA-USD) — approved transfers to client
+    # and approved invoices entered via ApprovedDataCard. Same storage
+    # mechanics (per-project JSONB list). Without these in the allow-list the
+    # POST /cashflow-entries call from ApprovedDataCard returns
+    # `{error: bad_kind, allowed: [...]}` and the row silently fails to save.
+    "approved_transfer", "approved_invoice",
 )
 
 

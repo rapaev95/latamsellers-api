@@ -674,16 +674,31 @@ async def compute_for_user(
             # un-hide them later; they don't contribute to total_outflows or
             # debito_estonia.
             hidden_keys = _load_hidden_transfer_keys(project_id)
+            edits = _load_transfer_edits(project_id)
             visible: list[dict[str, Any]] = []
             hidden_rows: list[dict[str, Any]] = []
             for tr in transfers:
-                if transfer_hide_key(tr) in hidden_keys:
-                    hidden_rows.append({**tr, "_hide_key": transfer_hide_key(tr)})
+                orig_key = transfer_hide_key(tr)
+                # Apply user edit if any — original_key is the pre-edit hash,
+                # patch fields overwrite tr in place. _edit_key keeps the
+                # original_key so the UI can look up + clear the patch later.
+                patch = edits.get(orig_key)
+                if isinstance(patch, dict):
+                    for f in ("date", "canal", "brl", "usd", "vet"):
+                        if f in patch:
+                            tr[f] = patch[f]
+                    tr["_edited"] = True
+                    tr["_orig_key"] = orig_key
+                if orig_key in hidden_keys:
+                    hidden_rows.append({**tr, "_hide_key": orig_key})
                 else:
                     visible.append(tr)
             visible.sort(key=_transfer_sort_key)
             for i, tr in enumerate(visible, start=1):
                 tr["n"] = i
+                # Hide-key uses CURRENT (post-edit) values so the ✕ button
+                # targets what the user actually sees. _orig_key (above)
+                # remains stable for un-edit.
                 tr["_hide_key"] = transfer_hide_key(tr)
             cf["transfers"] = visible
             cf["hidden_transfers"] = hidden_rows
@@ -731,6 +746,27 @@ def _load_hidden_transfer_keys(project_id: str) -> set[str]:
     if not isinstance(raw, list):
         return set()
     return {str(x) for x in raw if isinstance(x, str) and x}
+
+
+def _load_transfer_edits(project_id: str) -> dict[str, dict[str, Any]]:
+    """Per-project map of {original_hide_key: patch} applied to transfers
+    after collection. Patch fields override the original row: any of
+    `date`, `canal`, `brl`, `usd`, `vet`. Stored as JSONB under
+    `f2_services_transfer_edits_{project_id}`.
+    """
+    try:
+        from v2.legacy.db_storage import db_load
+        raw = db_load(f"f2_services_transfer_edits_{project_id}")
+    except Exception as err:  # noqa: BLE001
+        log.warning("transfer_edits load failed for %s: %s", project_id, err)
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for k, v in raw.items():
+        if isinstance(k, str) and isinstance(v, dict):
+            out[k] = v
+    return out
 
 
 def _transfer_sort_key(tr: dict[str, Any]) -> date:
