@@ -1,6 +1,7 @@
 """ABC products + snooze endpoints for the Escalar (Promotion) section."""
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, Optional, Union
 
@@ -2959,6 +2960,76 @@ class _ItemPriceShiftIn(__import__("pydantic").BaseModel):
     disable_dyn: Optional[bool] = False
 
 
+async def _auto_disable_dyn_pricing(
+    http: httpx.AsyncClient,
+    pool: Any,
+    user_id: int,
+    mlb: str,
+    token: str,
+) -> bool:
+    """DELETE pricing-automation rule for `mlb` and save the previous rule
+    to ml_user_pricing_history so the seller can later re-enable.
+
+    Used as an automatic recovery step when a PUT /items/{mlb} {price}
+    returns 400 item.price.not_modifiable. Best-effort: failures do not
+    raise; caller checks the bool to decide whether to retry the PUT.
+
+    Returns True when ML reports the rule no longer exists (200/204/404).
+    """
+    # Read current rule before deleting (best-effort, for history).
+    try:
+        gar = await http.get(
+            f"https://api.mercadolibre.com/pricing-automation/items/{mlb}/automation",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15.0,
+        )
+        if gar.status_code == 200:
+            cur_auto = gar.json() or {}
+            rule = (cur_auto.get("item_rule") or {}).get("rule_id") or "INT_EXT"
+            try:
+                min_p = float(cur_auto.get("min_price") or 0)
+            except (TypeError, ValueError):
+                min_p = 0.0
+            try:
+                max_p = float(cur_auto.get("max_price") or 0)
+            except (TypeError, ValueError):
+                max_p = 0.0
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ml_user_pricing_history (
+                      user_id INTEGER NOT NULL,
+                      item_id TEXT NOT NULL,
+                      rule_id TEXT,
+                      min_price NUMERIC,
+                      max_price NUMERIC,
+                      raw JSONB,
+                      disabled_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                    """
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO ml_user_pricing_history
+                      (user_id, item_id, rule_id, min_price, max_price, raw)
+                    VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                    """,
+                    user_id, mlb, rule, min_p, max_p,
+                    json.dumps(cur_auto, default=str),
+                )
+    except Exception:  # noqa: BLE001
+        pass  # history save is best-effort
+    try:
+        dr = await http.delete(
+            f"https://api.mercadolibre.com/pricing-automation/items/{mlb}/automation",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15.0,
+        )
+        return dr.status_code in (200, 204, 404)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @router.post("/items/price-shift")
 async def items_price_shift(
     body: _ItemPriceShiftIn,
@@ -3013,19 +3084,27 @@ async def items_price_shift(
 
     dyn_disabled = False
     async with httpx.AsyncClient() as http:
-        # Preflight: detect active Precificação Dinâmica BEFORE blindly
-        # PUT'ing the new price. Without this check, ML often returns 200 OK
-        # for the PUT but the dyn-pricing algorithm rewrites the price back
-        # within minutes — the seller sees a new sale at the OLD price and
-        # has no way to tell the raise didn't stick. Reported by user
-        # 2026-05-16: clicked +10% (got success toast), then 1h later a new
-        # order arrived at the original price.
+        # Auto-fix flow: if ML Dynamic Pricing blocks our PUT, transparently
+        # disable the automation and retry once. No more confirmation dialog —
+        # the seller's intent is to change the price; we do whatever ML
+        # requires to make that happen. User feedback 2026-05-17: previous
+        # dialog UX was a friction point and the retry-after-confirm path
+        # itself sometimes failed (ML state hadn't settled after DELETE).
         #
-        # The existing post-PUT branch (line ~3087) only triggers when ML
-        # returns 400 item.price.not_modifiable, which it does NOT do in
-        # this silent-revert path. Preflight + dialog is the only reliable
-        # way to catch it.
-        if not body.disable_dyn:
+        # Flow:
+        #   1. (optional) preflight GET pricing-automation → if active, do
+        #      DELETE immediately so the PUT lands on a clean state.
+        #   2. PUT new price.
+        #   3. If PUT 400's with item.price.not_modifiable, DELETE automation
+        #      and retry PUT once after a short settle delay.
+        #   4. If still 400 — return regular error.
+        # `disable_dyn=True` forces the disable in step 1 even if preflight
+        # says nothing (callback from legacy confirm flow; kept for back-compat).
+
+        # Step 1: optional preflight disable (only if dyn is detected
+        # active, or caller explicitly requested).
+        should_disable_upfront = bool(body.disable_dyn)
+        if not should_disable_upfront:
             try:
                 pa_resp = await http.get(
                     f"https://api.mercadolibre.com/pricing-automation/items/{mlb}/automation",
@@ -3036,77 +3115,18 @@ async def items_price_shift(
                     pa = pa_resp.json() or {}
                     item_rule = pa.get("item_rule") or {}
                     if item_rule.get("rule_id") or pa.get("status") == "active":
-                        return {
-                            "ok": False,
-                            "needs_dyn_confirm": True,
-                            "reason": "dynamic_pricing_active_preflight",
-                            "item_id": mlb,
-                            "old_price": base_price,
-                            "attempted_new_price": new_price,
-                            "delta_pct": float(body.delta_pct),
-                        }
+                        should_disable_upfront = True
             except Exception:  # noqa: BLE001
-                pass  # best-effort — fall through to PUT, ML will still
-                      # error with 400 if Dyn blocks the write
+                pass  # best-effort — fall through, retry-after-block will catch it
 
-        # Optional preflight: disable Dynamic Pricing if user confirmed via
-        # TG button. Saves prev rule into ml_user_pricing_history.
-        if body.disable_dyn:
-            try:
-                gar = await http.get(
-                    f"https://api.mercadolibre.com/pricing-automation/items/{mlb}/automation",
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=15.0,
-                )
-                if gar.status_code == 200:
-                    cur_auto = gar.json() or {}
-                    rule = (cur_auto.get("item_rule") or {}).get("rule_id") or "INT_EXT"
-                    try:
-                        min_p = float(cur_auto.get("min_price") or 0)
-                    except (TypeError, ValueError):
-                        min_p = 0.0
-                    try:
-                        max_p = float(cur_auto.get("max_price") or 0)
-                    except (TypeError, ValueError):
-                        max_p = 0.0
-                    async with pool.acquire() as conn:
-                        await conn.execute(
-                            """
-                            CREATE TABLE IF NOT EXISTS ml_user_pricing_history (
-                              user_id INTEGER NOT NULL,
-                              item_id TEXT NOT NULL,
-                              rule_id TEXT,
-                              min_price NUMERIC,
-                              max_price NUMERIC,
-                              raw JSONB,
-                              disabled_at TIMESTAMPTZ DEFAULT NOW()
-                            );
-                            """
-                        )
-                        await conn.execute(
-                            """
-                            INSERT INTO ml_user_pricing_history
-                              (user_id, item_id, rule_id, min_price, max_price, raw)
-                            VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-                            """,
-                            body.user_id, mlb, rule, min_p, max_p,
-                            json.dumps(cur_auto, default=str),
-                        )
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                dr = await http.delete(
-                    f"https://api.mercadolibre.com/pricing-automation/items/{mlb}/automation",
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=15.0,
-                )
-                if dr.status_code in (200, 204, 404):
-                    dyn_disabled = True
-            except Exception as err:  # noqa: BLE001
-                return {"error": "ml_dyn_disable_failed", "detail": str(err)}
+        if should_disable_upfront:
+            dyn_disabled = await _auto_disable_dyn_pricing(
+                http, pool, body.user_id, mlb, token,
+            )
+            await asyncio.sleep(0.3)  # let ML state propagate
 
-        try:
-            pr = await http.put(
+        async def _try_put() -> "httpx.Response":
+            return await http.put(
                 item_url,
                 json={"price": new_price},
                 headers={
@@ -3115,25 +3135,44 @@ async def items_price_shift(
                 },
                 timeout=15.0,
             )
+
+        # Step 2: PUT new price.
+        try:
+            pr = await _try_put()
         except Exception as err:  # noqa: BLE001
             return {"error": "ml_price_update_failed", "detail": str(err)}
+
+        # Step 3: if PUT was blocked by Dyn Pricing (preflight missed it
+        # or upstream cache lag), auto-disable + retry once.
+        if (
+            pr.status_code == 400
+            and "item.price.not_modifiable" in (pr.text or "")
+            and not dyn_disabled
+        ):
+            dyn_disabled = await _auto_disable_dyn_pricing(
+                http, pool, body.user_id, mlb, token,
+            )
+            await asyncio.sleep(0.5)
+            try:
+                pr = await _try_put()
+            except Exception as err:  # noqa: BLE001
+                return {"error": "ml_price_update_failed",
+                        "detail": f"after_dyn_disable: {err}",
+                        "dyn_disabled": dyn_disabled}
+
     if pr.status_code >= 400:
-        # Detect Dynamic Pricing block — return needs_dyn_confirm so TG
-        # webhook can render confirmation prompt instead of an error toast.
-        if pr.status_code == 400 and "item.price.not_modifiable" in (pr.text or ""):
-            return {
-                "ok": False,
-                "needs_dyn_confirm": True,
-                "reason": "dynamic_pricing_active",
-                "item_id": mlb,
-                "old_price": base_price,
-                "attempted_new_price": new_price,
-                "delta_pct": float(body.delta_pct),
-            }
-        return {"error": "ml_price_update_rejected",
-                "status": pr.status_code, "detail": pr.text[:300],
-                "old_price": base_price, "attempted_new_price": new_price,
-                "dyn_disabled": dyn_disabled}
+        # All recovery attempts exhausted. Surface a clear error.
+        is_dyn = pr.status_code == 400 and "item.price.not_modifiable" in (pr.text or "")
+        return {
+            "ok": False,
+            "error": "ml_price_update_rejected",
+            "reason": "dynamic_pricing_still_blocking" if is_dyn else "ml_rejected",
+            "status": pr.status_code,
+            "detail": pr.text[:300],
+            "old_price": base_price,
+            "attempted_new_price": new_price,
+            "dyn_disabled": dyn_disabled,
+        }
 
     # Audit price-shift event (sales TG button sup:/sdn:).
     try:
@@ -3843,6 +3882,12 @@ async def promotions_tg_action(
             if old_price <= 0:
                 return {"error": "no_current_price"}
             new_price = round(old_price * (1.0 + raise_pct / 100.0), 2)
+            # Auto-fix Dyn Pricing: if the PUT is blocked because Mercado
+            # Livre's pricing-automation owns the price, transparently DELETE
+            # the automation and retry. User feedback 2026-05-17: confirm
+            # dialog flow was unreliable; the seller's intent is "accept the
+            # promo at this raised price" — we do whatever it takes.
+            dyn_disabled_raise = False
             try:
                 pr = await http.put(
                     item_url,
@@ -3855,6 +3900,30 @@ async def promotions_tg_action(
                 )
             except Exception as err:  # noqa: BLE001
                 return {"error": "ml_price_update_failed", "detail": str(err)}
+            if (
+                pr.status_code == 400
+                and "item.price.not_modifiable" in (pr.text or "")
+            ):
+                dyn_disabled_raise = await _auto_disable_dyn_pricing(
+                    http, pool, body.user_id, mlb, token,
+                )
+                await asyncio.sleep(0.5)
+                try:
+                    pr = await http.put(
+                        item_url,
+                        json={"price": new_price},
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Content-Type": "application/json",
+                        },
+                        timeout=15.0,
+                    )
+                except Exception as err:  # noqa: BLE001
+                    return {
+                        "error": "ml_price_update_failed",
+                        "detail": f"after_dyn_disable: {err}",
+                        "dyn_disabled": dyn_disabled_raise,
+                    }
             if pr.status_code >= 400:
                 return {
                     "error": "ml_price_update_rejected",
@@ -3862,6 +3931,7 @@ async def promotions_tg_action(
                     "detail": pr.text[:300],
                     "old_price": old_price,
                     "attempted_new_price": new_price,
+                    "dyn_disabled": dyn_disabled_raise,
                 }
             raise_info = {
                 "old_price": old_price,
@@ -3869,6 +3939,7 @@ async def promotions_tg_action(
                 "raise_pct": raise_pct,
                 "raise_mode": (body.raise_mode or "linear").lower(),
                 "entrada_pct": entrada_pct,
+                "dyn_disabled": dyn_disabled_raise,
             }
 
             # Re-fetch the offer with the new listing price so we accept at
@@ -4116,27 +4187,40 @@ async def promotions_tg_action(
                 )
             except Exception as err:  # noqa: BLE001
                 return {"error": "ml_price_update_failed", "detail": str(err)}
-            if pr.status_code >= 400:
-                # Detect Dynamic Pricing block — return needs_dyn_confirm so TG
-                # webhook can render confirmation prompt instead of an error.
-                detail_text = pr.text or ""
-                if (
-                    body.action == "raise_only"
-                    and pr.status_code == 400
-                    and "item.price.not_modifiable" in detail_text
-                ):
+            # Auto-fix Dyn Pricing for raise_only (same pattern as
+            # accept_with_raise / items/price-shift). raise_with_disable_dyn
+            # already disabled upfront, so we skip the auto-retry there.
+            if (
+                body.action == "raise_only"
+                and pr.status_code == 400
+                and "item.price.not_modifiable" in (pr.text or "")
+                and not dyn_disabled
+            ):
+                dyn_disabled = await _auto_disable_dyn_pricing(
+                    http, pool, body.user_id, mlb, token,
+                )
+                await asyncio.sleep(0.5)
+                try:
+                    pr = await http.put(
+                        item_url,
+                        json={"price": new_price},
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Content-Type": "application/json",
+                        },
+                        timeout=15.0,
+                    )
+                except Exception as err:  # noqa: BLE001
                     return {
-                        "ok": False,
-                        "needs_dyn_confirm": True,
-                        "reason": "dynamic_pricing_active",
-                        "old_price": old_price,
-                        "attempted_new_price": new_price,
-                        "raise_pct": raise_pct,
+                        "error": "ml_price_update_failed",
+                        "detail": f"after_dyn_disable: {err}",
+                        "dyn_disabled": dyn_disabled,
                     }
+            if pr.status_code >= 400:
                 return {
                     "error": "ml_price_update_rejected",
                     "status": pr.status_code,
-                    "detail": detail_text[:300],
+                    "detail": (pr.text or "")[:300],
                     "old_price": old_price,
                     "attempted_new_price": new_price,
                     "dyn_disabled": dyn_disabled,
@@ -4159,10 +4243,30 @@ async def promotions_tg_action(
             return {"error": "bad_action"}
 
     if r.status_code >= 400:
+        raw_detail = (r.text or "")[:300]
+        # Translate common ML rejection codes to a human-readable hint so
+        # the TG toast says something the seller can act on, instead of the
+        # raw "ERROR_CREDIBILITY_DISCOUNTED_PRICE - The discounted price..."
+        # gibberish.
+        friendly = None
+        if (
+            "CREDIBILITY_DISCOUNTED_PRICE" in raw_detail
+            or "discounted price is not credible" in raw_detail.lower()
+        ):
+            friendly = (
+                "ML отверг: цена со скидкой не прошла проверку «достоверности» "
+                "(слишком далеко от истории цены). Попробуй меньший % уценки "
+                "или сначала подними цену листинга вручную."
+            )
+        elif "promotion_not_available" in raw_detail.lower():
+            friendly = "Промо уже неактивно на ML — обнови список акций."
+        elif "deal_price_below_min" in raw_detail.lower():
+            friendly = "Цена ниже минимума, разрешённого ML. Подними её."
         return {
             "error": "ml_request_failed",
             "status": r.status_code,
-            "detail": r.text[:300],
+            "detail": friendly or raw_detail,
+            "ml_raw": raw_detail if friendly else None,
             "raise": raise_info or None,
         }
 
