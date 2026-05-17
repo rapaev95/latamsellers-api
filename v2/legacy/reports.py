@@ -398,69 +398,52 @@ def generate_opiu_estonia() -> dict:
 
     # ── Подмешиваем загруженные NFS-e (sidecar JSON-ы) ──
     # Берём только инвойсы ПОСЛЕ baseline (competência >= 2026-04), tomador SHPS,
-    # авто-определяем bracket по cumulative gross, при необходимости разбиваем на 2 части.
-    BRACKETS = [
-        (180000.0,  0.1550),   # до 180k
-        (360000.0,  0.1675),   # 180k–360k
-        (720000.0,  0.1875),   # 360k–720k
-        (1800000.0, 0.1975),   # 720k–1.8M
-    ]
-    BASELINE_CUTOFF = "2026-04"  # competência >= этой → новый инвойс
-
-    def _bracket_split(start_cum: float, gross: float) -> list[tuple[float, float]]:
-        """Разбивает инвойс на (gross_part, rate) по bracket'ам."""
-        parts: list[tuple[float, float]] = []
-        remaining = gross
-        cum = start_cum
-        for ceiling, rate in BRACKETS:
-            if cum >= ceiling:
-                continue
-            room = ceiling - cum
-            take = min(remaining, room)
-            if take > 0:
-                parts.append((take, rate))
-                cum += take
-                remaining -= take
-            if remaining <= 0:
-                break
-        if remaining > 0:
-            # Сверх 1.8M — используем последний rate (грубо)
-            parts.append((remaining, BRACKETS[-1][1]))
-        return parts
+    # автоматически считаем DAS + commission через split_invoice_tax (Anexo III
+    # effective_simples с parcela_deduzir + commission_lookup_estonia).
+    BASELINE_CUTOFF = "2026-04"
 
     cum_gross = sum(inv["gross"] for inv in invoice_lines)
     loaded_nfs = load_all_nfse()
-    # Сортируем по competência → ref_month → numero
     loaded_nfs.sort(key=lambda r: (
         r.get("competencia") or "",
         r.get("ref_month_iso") or "",
         int(r.get("numero") or 0) if str(r.get("numero") or "").isdigit() else 0,
     ))
+    # Lazy import — services_reports lives outside v2.legacy and would cause
+    # a circular import if pulled at module top.
+    from v2.services.services_reports import split_invoice_tax
     for nf in loaded_nfs:
         comp = nf.get("competencia") or ""
         if comp < BASELINE_CUTOFF:
             continue
         tomador = (nf.get("tomador") or "").upper()
         if tomador and "SHPS" not in tomador:
-            continue  # не Estonia-инвойс
+            continue
         gross = float(nf.get("valor") or 0)
         if gross <= 0:
             continue
-        # Дата для группировки: competência (период признания, по бухгалтерии).
-        # ref_month (Março в descrição) — это лишь пометка о периоде комиссии,
-        # выручка признаётся в месяце эмиссии NF.
         ref = nf.get("competencia") or nf.get("ref_month_iso")
         date_str = f"{ref}-15" if ref and len(ref) == 7 else nf.get("data_emissao", "2026-04-01")
-        for part_gross, rate in _bracket_split(cum_gross, gross):
-            invoice_lines.append({
-                "date": date_str,
-                "gross": part_gross,
-                "tax": round(part_gross * rate, 2),
-                "rate": rate,
-                "numero": nf.get("numero"),
-                "auto_loaded": True,
-            })
-            cum_gross += part_gross
+        # Single split per invoice — commission table follows the same shape
+        # as Simples faixa, so rate at cum_gross+gross applies to the whole
+        # invoice. Если invoice пересекает faixa boundary — небольшая loss
+        # of precision (~0.5% при больших инвойсах), но это совпадает с тем
+        # как Receita Federal начисляет DAS (на сумму за месяц, не split).
+        cum_after = cum_gross + gross
+        split = split_invoice_tax(gross, cum_after, anexo="III")
+        invoice_lines.append({
+            "date": date_str,
+            "gross": gross,
+            "tax": split["tax_total"],
+            "tax_das": split["das"],
+            "tax_commission": split["commission"],
+            "rate": split["total_rate_pct"],
+            "rate_eff": split["eff_pct"],
+            "rate_commission": split["commission_pct"],
+            "numero": nf.get("numero"),
+            "auto_loaded": True,
+        })
+        cum_gross = cum_after
 
     # DAS Simples Nacional payments (already paid, from approved report)
     das_payments = [
@@ -686,25 +669,55 @@ def generate_opiu_estonia() -> dict:
             "profit": bm.get("commission", 0) - das_value,
         })
 
-    # Per-invoice list for downstream consumers (DDS Поступления table).
-    # Sorted by date asc; each entry exposes the same gross/tax/rate fields
-    # used to compute the totals so the UI can show one row per invoice
-    # alongside the aggregated KPIs.
-    invoices_out = sorted(
-        [
-            {
-                "date": str(inv.get("date") or "")[:10],
-                "gross": round(float(inv.get("gross") or 0), 2),
-                "tax": round(float(inv.get("tax") or 0), 2),
-                "net": round(float(inv.get("gross") or 0) - float(inv.get("tax") or 0), 2),
-                "rate": float(inv.get("rate") or 0),
-                "numero": inv.get("numero"),
-                "auto_loaded": bool(inv.get("auto_loaded")),
-            }
-            for inv in invoice_lines
-        ],
-        key=lambda r: r["date"],
-    )
+    # Per-invoice list for downstream consumers (DDS Поступления table +
+    # ОПиУ P&L tab). Sorted by date asc. For hardcoded approved invoices
+    # (`tax_das`/`tax_commission` not pre-computed) we run split_invoice_tax
+    # at THIS invoice's cumulative rbt12 so they get the same DAS/commission
+    # decomposition the NFS-e auto-load path produces.
+    from v2.services.services_reports import split_invoice_tax as _split
+    invoices_sorted_raw = sorted(invoice_lines, key=lambda r: str(r.get("date") or ""))
+    invoices_out: list[dict] = []
+    running_cum = 0.0
+    total_das_invoices = 0.0
+    total_commission_invoices = 0.0
+    for inv in invoices_sorted_raw:
+        gross = round(float(inv.get("gross") or 0), 2)
+        running_cum += gross
+        if inv.get("tax_das") is not None and inv.get("tax_commission") is not None:
+            tax_das = float(inv["tax_das"])
+            tax_commission = float(inv["tax_commission"])
+            tax_total = round(tax_das + tax_commission, 2)
+            rate_eff = float(inv.get("rate_eff") or 0)
+            rate_comm = float(inv.get("rate_commission") or 0)
+        else:
+            split = _split(gross, running_cum, anexo="III")
+            tax_das = split["das"]
+            tax_commission = split["commission"]
+            tax_total = split["tax_total"]
+            rate_eff = split["eff_pct"]
+            rate_comm = split["commission_pct"]
+        total_das_invoices += tax_das
+        total_commission_invoices += tax_commission
+        invoices_out.append({
+            "date": str(inv.get("date") or "")[:10],
+            "gross": gross,
+            "tax": tax_total,
+            "tax_das": round(tax_das, 2),
+            "tax_commission": round(tax_commission, 2),
+            "net": round(gross - tax_total, 2),
+            "rate": round(rate_eff + rate_comm, 6),
+            "rate_eff": round(rate_eff, 6),
+            "rate_commission": round(rate_comm, 6),
+            "numero": inv.get("numero"),
+            "auto_loaded": bool(inv.get("auto_loaded")),
+        })
+
+    # Rental income in BRL — for the profit formula. USD payments came in
+    # at varied dates; here we approximate at a static FX rate (5.30) since
+    # rental_payments don't carry exchange rates. Replace with payment-time
+    # FX once we wire `rental.payments[].rate_brl` like the regular path.
+    rental_paid_brl = round(rental_paid_usd * 5.30, 2)
+    rental_pending_brl = round(rental_pending_usd * 5.30, 2)
 
     return {
         # Invoice totals
@@ -713,6 +726,13 @@ def generate_opiu_estonia() -> dict:
         "total_net_client": total_net_client,
         "invoice_count": invoice_count,
         "invoice_lines": invoices_out,
+        # DAS / Commission breakdown for invoice list — exposes the same
+        # split the per-row table shows so KPI tiles can render aggregates
+        # without re-summing on the front-end.
+        "total_das_invoices_brl": round(total_das_invoices, 2),
+        "total_commission_invoices_brl": round(total_commission_invoices, 2),
+        "rental_paid_brl": rental_paid_brl,
+        "rental_pending_brl": rental_pending_brl,
         # Balance
         "saldo_inicial": saldo_inicial,
         "total_enviado": total_enviado,

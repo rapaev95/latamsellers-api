@@ -55,6 +55,80 @@ log = logging.getLogger(__name__)
 # so the per-month iterator can pick either without branching downstream.
 
 
+# Per-rbt12 commission step-function for Estonia (services project).
+# Each tuple = (rbt12_ceiling_brl, commission_pct as fraction). Above the
+# last ceiling — commission stays at the last value (5,61% cap confirmed
+# by user). Derived from accountant's invoice rates with cumulative
+# effective subtraction; see chat history Sprint 18 for derivation.
+_ESTONIA_COMMISSION_TABLE: list[tuple[float, float]] = [
+    (210_000,    0.1058),   # 0–210k
+    (420_000,    0.0874),
+    (630_000,    0.0776),
+    (840_000,    0.0702),
+    (1_100_000,  0.0682),
+    (1_310_000,  0.0673),
+    (1_520_000,  0.0669),
+    (1_730_000,  0.0669),
+    (1_940_000,  0.0644),
+    (2_150_000,  0.0608),
+    (2_360_000,  0.0581),
+    (2_570_000,  0.0561),
+]
+_ESTONIA_COMMISSION_CAP = 0.0561
+
+
+def commission_lookup_estonia(rbt12: float) -> float:
+    """Step-function lookup — first ceiling >= rbt12 wins. Above cap → 5,61%.
+
+    Returns commission as fraction (0.0682 = 6,82%). The accountant's table
+    isn't a smooth formula, so a step-function with explicit ceilings is
+    the only way to reproduce the exact rates they invoiced.
+    """
+    if rbt12 <= 0:
+        return _ESTONIA_COMMISSION_TABLE[0][1]
+    for ceiling, comm in _ESTONIA_COMMISSION_TABLE:
+        if rbt12 <= ceiling:
+            return comm
+    return _ESTONIA_COMMISSION_CAP
+
+
+def split_invoice_tax(gross_brl: float, rbt12_after: float, anexo: str = "III") -> dict[str, float]:
+    """Compute DAS (Simples) + commission split for one invoice.
+
+    `rbt12_after` is the cumulative RBT12 immediately AFTER this invoice
+    settles (callers track cum_gross and pass it in). We apply both rates
+    at that point — no bracket-split here because user's commission table
+    is the same shape as a Simples faixa table and effective rate at
+    rbt12_after already accounts for parcela_deduzir. Symmetric with how
+    Receita Federal documents DAS: rate × gross at month of competência.
+
+    Returns BRL amounts:
+      • das        — for Receita Federal (Estonia pays this)
+      • commission — our margin (Estonia keeps this)
+      • tax_total  — what the client withholds at source (das + commission)
+      • net        — what we forward to SHPP (gross − tax_total)
+    """
+    from v2.legacy.tax_brazil import compute_simples_effective
+    eff_res = compute_simples_effective(rbt12_after, anexo)
+    eff_frac = float(eff_res["effective_pct"]) / 100.0
+    comm_frac = commission_lookup_estonia(rbt12_after)
+    das = gross_brl * eff_frac
+    commission = gross_brl * comm_frac
+    tax_total = das + commission
+    net = gross_brl - tax_total
+    return {
+        "das": round(das, 2),
+        "commission": round(commission, 2),
+        "tax_total": round(tax_total, 2),
+        "net": round(net, 2),
+        "eff_pct": round(eff_frac, 6),
+        "commission_pct": round(comm_frac, 6),
+        "total_rate_pct": round(eff_frac + comm_frac, 6),
+        "rbt12": rbt12_after,
+        "faixa": int(eff_res["faixa"]),
+    }
+
+
 def compute_progressive_rate(rbt12: float, anexo: str, margin_pct: float) -> dict[str, Any]:
     """`total_rate = effective_simples(rbt12, anexo) + margin_pct`.
 

@@ -1032,6 +1032,16 @@ class ServicesPnlOut(BaseModel):
     trade_das_rate: float = 0
     our_profit_brl: float = 0
     our_profit_brl_paid_only: float = 0
+    # DAS/commission decomposition computed per-invoice (split_invoice_tax)
+    # and aggregated here so KPI tiles can render the two streams separately:
+    # invoice-DAS is paid to Receita Federal; invoice-commission stays as
+    # Estonia's revenue. rental_*_brl is rental income converted from USD
+    # (approximate 5.30 rate; precise conversion when rental_payments carry
+    # rate_brl per payment).
+    total_das_invoices_brl: float = 0
+    total_commission_invoices_brl: float = 0
+    rental_paid_brl: float = 0
+    rental_pending_brl: float = 0
     das_payments: list[dict[str, Any]] = []
     das_pending: list[dict[str, Any]] = []
     pnl_by_month: list[dict[str, Any]] = []
