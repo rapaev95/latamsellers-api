@@ -7,7 +7,7 @@ from typing import Any, Optional, Union
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, Response, UploadFile
 
-from v2.deps import CurrentUser, current_user, get_pool
+from v2.deps import CurrentUser, current_user, get_pool, require_superadmin
 from v2.legacy import db_storage as legacy_db
 from v2.parsers import db_loader
 from v2.schemas.escalar import EscalarProductsOut, SnoozeIn, SnoozeOut
@@ -24,6 +24,7 @@ from v2.services import (
     ml_anomalies as ml_anomalies_svc,
     ml_oauth as ml_oauth_svc,
     ml_orders as ml_orders_svc,
+    ml_test_users as ml_test_users_svc,
     ml_quality as ml_quality_svc,
     ml_scraper_chat as ml_scraper_chat_svc,
     daily_summary_dispatch as daily_summary_dispatch_svc,
@@ -6034,3 +6035,61 @@ async def ai_question_probe(
             "from Next.js with the same item_id and observe response.text."
         )
     return out
+
+
+# ─── Publish flow: ML test-users (sandbox seller accounts) ────────────────
+
+
+@router.post("/publish/test-users")
+async def publish_test_users_create(
+    body: dict = Body(default_factory=dict),
+    user: CurrentUser = Depends(require_superadmin),
+    pool=Depends(get_pool),
+):
+    """Create one ML sandbox test-user under the current LS user's OAuth token.
+
+    Body: { "site_id": "MLB" }  (default MLB)
+    Returns: saved row with test_user_id, nickname, password, email.
+    Up to 10 test users per real ML account (ML platform limit).
+
+    Superadmin-only: test users carry credentials that should never leak to
+    regular users; mgmt UI also exposes the password column.
+    """
+    site_id = (body.get("site_id") or "MLB").upper()
+    await ml_test_users_svc.ensure_schema(pool)
+    try:
+        async with httpx.AsyncClient() as http:
+            row = await ml_test_users_svc.create_test_user(
+                pool, http, user.id, site_id=site_id
+            )
+    except RuntimeError as err:
+        msg = str(err)
+        if msg.startswith("ml_oauth_required"):
+            raise HTTPException(status_code=401,
+                                detail={"error": "ml_oauth_required", "message": msg})
+        raise HTTPException(status_code=502,
+                            detail={"error": "ml_create_test_user_failed", "message": msg})
+    return {"ok": True, "test_user": row}
+
+
+@router.get("/publish/test-users")
+async def publish_test_users_list(
+    user: CurrentUser = Depends(require_superadmin),
+    pool=Depends(get_pool),
+):
+    await ml_test_users_svc.ensure_schema(pool)
+    rows = await ml_test_users_svc.list_test_users(pool, user.id)
+    return {"test_users": rows}
+
+
+@router.delete("/publish/test-users/{test_user_id}")
+async def publish_test_users_delete(
+    test_user_id: int,
+    user: CurrentUser = Depends(require_superadmin),
+    pool=Depends(get_pool),
+):
+    """Removes the row from our cache only. ML has no delete endpoint —
+    the test user remains in ML but stops appearing in our list."""
+    await ml_test_users_svc.ensure_schema(pool)
+    deleted = await ml_test_users_svc.delete_test_user(pool, user.id, test_user_id)
+    return {"ok": deleted}
