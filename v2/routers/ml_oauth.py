@@ -14,7 +14,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from v2.deps import CurrentUser, current_user, get_pool
+from v2.deps import CurrentUser, current_user, get_pool, require_admin, require_superadmin
 from v2.schemas.ml_oauth import (
     MLAccessTokenOut,
     MLConfigIn,
@@ -273,3 +273,81 @@ async def delete_tokens(
     await ml_svc.ensure_schema(pool)
     deleted = await ml_svc.delete_user_tokens(pool, user.id)
     return MLDeleteResult(deleted=deleted)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Managed accounts (Type A — Sprint 1)
+# Same OAuth code-exchange contract as personal /exchange-code, but the result
+# lands in `ml_managed_accounts` instead of `ml_user_tokens`. The Next.js admin
+# page reuses its own OAuth callback flow (state + PKCE) and just routes to a
+# different exchange endpoint when the OAuth was initiated as «managed».
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@router.post("/managed/exchange-code")
+async def post_managed_exchange_code(
+    body: MLExchangeCodeIn,
+    note: Optional[str] = Query(None, max_length=200),
+    user: CurrentUser = Depends(require_superadmin),
+    pool=Depends(get_pool),
+):
+    """Server-side PKCE exchange that lands tokens into ml_managed_accounts.
+
+    Superadmin-only — managed credentials power Type A clients and can
+    publish on behalf of multiple LS managers, so the install gesture
+    is owner-scope.
+
+    Body: { code, codeVerifier, redirectUri }  (same as personal flow).
+    Query: ?note=Optional+human+label  (e.g. "Ganza", "Carlos Al").
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="no_db")
+    from v2.services import ml_managed_accounts as _mgr
+    await ml_svc.ensure_schema(pool)
+    await _mgr.ensure_schema(pool)
+
+    try:
+        row = await _mgr.exchange_authorization_code_for_managed(
+            pool,
+            owner_ls_user_id=user.id,
+            code=body.code,
+            code_verifier=body.codeVerifier,
+            redirect_uri=body.redirectUri,
+            note=note,
+        )
+    except ml_svc.MLRefreshError as err:
+        raise HTTPException(status_code=400, detail={"error": "ml_exchange_failed",
+                                                     "message": str(err)})
+    return {"ok": True, "account": row}
+
+
+@router.get("/managed/accounts")
+async def get_managed_accounts(
+    user: CurrentUser = Depends(require_admin),
+    pool=Depends(get_pool),
+):
+    """List managed ML accounts (no tokens). Admin+superadmin can view —
+    so an admin can pick which account to act as in ProjectFilter."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="no_db")
+    from v2.services import ml_managed_accounts as _mgr
+    await _mgr.ensure_schema(pool)
+    rows = await _mgr.list_accounts(pool)
+    return {"accounts": rows}
+
+
+@router.delete("/managed/accounts/{account_id}")
+async def delete_managed_account(
+    account_id: int,
+    user: CurrentUser = Depends(require_superadmin),
+    pool=Depends(get_pool),
+):
+    """Disconnect a managed account (hard delete row). Superadmin-only."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="no_db")
+    from v2.services import ml_managed_accounts as _mgr
+    await _mgr.ensure_schema(pool)
+    deleted = await _mgr.delete_account(pool, account_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail={"error": "account_not_found"})
+    return {"ok": True}

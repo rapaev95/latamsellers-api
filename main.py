@@ -580,6 +580,30 @@ async def _retirada_alerts_job() -> None:
         _ml_log.exception("retirada alerts job failed: %s", err)
 
 
+async def _mark_stale_drafts_job() -> None:
+    """Daily housekeeping for nf_publishing_drafts.
+
+    1. status='draft' AND updated_at < NOW() − 30d → status='abandoned'
+    2. status='abandoned' AND updated_at < NOW() − 90d → hard-deleted
+
+    Cheap (two UPDATE/DELETE statements), runs at 02:00 UTC to avoid peak
+    traffic. Idempotent — safe to invoke manually from a REPL for tests.
+    """
+    try:
+        from v2.services import nf_drafts as nf_drafts_svc
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("stale-drafts cleanup skipped: no DB pool")
+            return
+        result = await nf_drafts_svc.cleanup_stale(pool)
+        _ml_log.info(
+            "stale-drafts cleanup: abandoned=%s deleted=%s",
+            result.get("abandoned"), result.get("deleted"),
+        )
+    except Exception as err:  # noqa: BLE001
+        _ml_log.exception("stale-drafts job failed: %s", err)
+
+
 async def _photo_descriptions_auto_gen_job() -> None:
     """Daily auto-generate AI photo descriptions for items without them.
     Picks top-15 most-sold active items per user, throttles 4s per item.
@@ -1294,6 +1318,16 @@ async def _v2_startup() -> None:
         _retirada_alerts_job,
         CronTrigger(hour=13, minute=30, timezone="UTC"),
         id="retirada_alerts_daily",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # NF-publishing drafts housekeeping at 02:00 UTC. Abandons stale drafts
+    # (>30 days untouched) and hard-deletes long-abandoned rows (>90 days).
+    _ml_scheduler.add_job(
+        _mark_stale_drafts_job,
+        CronTrigger(hour=2, minute=0, timezone="UTC"),
+        id="nf_drafts_stale_cleanup_daily",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

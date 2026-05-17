@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import unquote
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Query, Request, status
 
 from v2.db import get_pool
 
@@ -164,3 +164,86 @@ async def require_superadmin(user: CurrentUser = Depends(current_user)) -> Curre
             detail={"code": "superadmin_required"},
         )
     return user
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ML context resolver — dual-mode (self-service vs managed) Sprint 1
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class MLContext:
+    """Resolved ML credentials for the current request.
+
+    - `source = 'self'`  → token from ml_user_tokens (Type B, owns own OAuth)
+    - `source = 'managed'` → token from ml_managed_accounts (Type A, LS-managed)
+    """
+    ml_user_id: int
+    access_token: str
+    source: Literal["self", "managed"]
+    managed_account_id: Optional[int] = None
+
+
+async def resolve_ml_context(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+    managed_account_id: Optional[int] = Query(None, alias="managed_account_id"),
+) -> MLContext:
+    """Decide which ML OAuth context to use for this request.
+
+    - If `managed_account_id` query param is present AND caller is admin/
+      superadmin → use the managed account token (Type A).
+    - Otherwise → use caller's own ml_user_tokens token (Type B).
+
+    Raises HTTPException 401 (ml_oauth_required) or 403 (permission denied).
+
+    Late imports below avoid circular dependencies — these services may
+    themselves depend on shared deps in this module.
+    """
+    if managed_account_id is not None:
+        if not _is_admin(user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "managed_account_requires_admin"},
+            )
+        from v2.services import ml_managed_accounts as _mgr
+        try:
+            token, _exp, _refreshed = await _mgr.get_valid_access_token(pool, managed_account_id)
+        except Exception as err:  # noqa: BLE001 — surface as 401 with detail
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={"code": "ml_managed_oauth_failed", "message": str(err)},
+            )
+        account = await _mgr.get_account(pool, managed_account_id)
+        if not account:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "managed_account_not_found"},
+            )
+        return MLContext(
+            ml_user_id=int(account["ml_user_id"]),
+            access_token=token,
+            source="managed",
+            managed_account_id=managed_account_id,
+        )
+
+    # Self-service path — read user's personal token.
+    from v2.services import ml_oauth as _oauth
+    try:
+        token, *_ = await _oauth.get_valid_access_token(pool, user.id)
+    except _oauth.MLRefreshError as err:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "ml_oauth_required", "message": str(err)},
+        )
+    tokens = await _oauth.load_user_tokens(pool, user.id)
+    ml_user_id = (tokens or {}).get("ml_user_id")
+    if not ml_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "no_ml_user_id"},
+        )
+    return MLContext(
+        ml_user_id=int(ml_user_id),
+        access_token=token,
+        source="self",
+    )

@@ -25,6 +25,9 @@ from v2.services import (
     ml_oauth as ml_oauth_svc,
     ml_orders as ml_orders_svc,
     ml_test_users as ml_test_users_svc,
+    nf_drafts as nf_drafts_svc,
+    nf_parser as nf_parser_svc,
+    ml_categories as ml_categories_svc,
     ml_quality as ml_quality_svc,
     ml_scraper_chat as ml_scraper_chat_svc,
     daily_summary_dispatch as daily_summary_dispatch_svc,
@@ -6035,6 +6038,483 @@ async def ai_question_probe(
             "from Next.js with the same item_id and observe response.text."
         )
     return out
+
+
+# ─── Publish flow: diagnostic probes ──────────────────────────────────────
+# All probes return RAW ML responses for shape-discovery before we write DB
+# schemas against them. Pattern mirrors quality_probe at ~L758:
+#   { url, status, headers_subset, body }   (or { error, detail, ... })
+# Auth: current_user — per Sprint 1 decision (any logged-in user).
+# Token: user's own ML OAuth via ml_oauth_svc.get_valid_access_token.
+
+
+async def _ml_get_probe(token: str, url: str) -> dict:
+    """Shared GET helper for probe endpoints."""
+    async with httpx.AsyncClient() as http:
+        try:
+            r = await http.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15.0,
+            )
+        except Exception as err:  # noqa: BLE001
+            return {"error": "network", "detail": str(err), "url": url}
+    return {
+        "url": url,
+        "status": r.status_code,
+        "headers_subset": {
+            "content-type": r.headers.get("content-type"),
+            "x-request-id": r.headers.get("x-request-id"),
+        },
+        "body": (
+            r.json()
+            if r.headers.get("content-type", "").startswith("application/json")
+            else r.text[:2000]
+        ),
+    }
+
+
+async def _ml_post_probe(token: str, url: str, body: dict) -> dict:
+    async with httpx.AsyncClient() as http:
+        try:
+            r = await http.post(
+                url,
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=15.0,
+            )
+        except Exception as err:  # noqa: BLE001
+            return {"error": "network", "detail": str(err), "url": url, "request_body": body}
+    return {
+        "url": url,
+        "request_body": body,
+        "status": r.status_code,
+        "headers_subset": {
+            "content-type": r.headers.get("content-type"),
+            "x-request-id": r.headers.get("x-request-id"),
+        },
+        "body": (
+            r.json()
+            if r.headers.get("content-type", "").startswith("application/json")
+            else r.text[:2000]
+        ),
+    }
+
+
+async def _get_user_token_or_error(pool, ls_user_id: int) -> tuple[Optional[str], Optional[int], Optional[dict]]:
+    """Returns (token, ml_user_id, error_dict). Exactly one of (token, error)
+    is set. ml_user_id is from ml_user_tokens (may be None if not set)."""
+    try:
+        token, *_ = await ml_oauth_svc.get_valid_access_token(pool, ls_user_id)
+    except ml_oauth_svc.MLRefreshError as err:
+        return None, None, {"error": "ml_oauth_required", "detail": str(err)}
+    tokens = await ml_oauth_svc.load_user_tokens(pool, ls_user_id)
+    ml_user_id = (tokens or {}).get("ml_user_id")
+    return token, ml_user_id, None
+
+
+@router.get("/publish/user-flags-probe")
+async def publish_user_flags_probe(
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Returns ML /users/{ml_user_id} for the current user's OAuth context.
+    Used to detect tag user_product_seller (UPTIN activation) before Sprint 5.
+    """
+    token, ml_user_id, err = await _get_user_token_or_error(pool, user.id)
+    if err:
+        return err
+    if not ml_user_id:
+        return {"error": "no_ml_user_id",
+                "hint": "OAuth row exists but ml_user_id is NULL; reconnect ML."}
+    return await _ml_get_probe(token, f"https://api.mercadolibre.com/users/{ml_user_id}")
+
+
+@router.get("/publish/grid-active-domains-probe")
+async def publish_grid_active_domains_probe(
+    site_id: str = Query("MLB", min_length=2, max_length=4),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Domains with tabela de medidas support for a given site.
+    See `РАБОТА С КАРТОЧКАМИ ОДЕЖДЫ И ОБУВИ ML.md` lines 37–75 for shape.
+    """
+    token, _ml_user_id, err = await _get_user_token_or_error(pool, user.id)
+    if err:
+        return err
+    url = f"https://api.mercadolibre.com/catalog/charts/{site_id.upper()}/configurations/active_domains"
+    return await _ml_get_probe(token, url)
+
+
+@router.get("/publish/domain-tech-specs-probe")
+async def publish_domain_tech_specs_probe(
+    domain_id: str = Query(..., min_length=3),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Ficha técnica of a domain (e.g. MLB-SNEAKERS). Used to discover
+    attributes with tag `grid_template_required` and value_types
+    `grid_id`/`grid_row_id`.
+    """
+    token, _ml_user_id, err = await _get_user_token_or_error(pool, user.id)
+    if err:
+        return err
+    url = f"https://api.mercadolibre.com/domains/{domain_id}/technical_specs"
+    return await _ml_get_probe(token, url)
+
+
+@router.get("/publish/category-attributes-probe")
+async def publish_category_attributes_probe(
+    category_id: str = Query(..., min_length=4),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Attribute list for a category — drives the dynamic form renderer.
+    Look for required / conditional_required / allow_variations /
+    variation_attribute / grid_template_required tags in `tags`.
+    """
+    token, _ml_user_id, err = await _get_user_token_or_error(pool, user.id)
+    if err:
+        return err
+    url = f"https://api.mercadolibre.com/categories/{category_id}/attributes"
+    return await _ml_get_probe(token, url)
+
+
+@router.post("/publish/charts-search-probe")
+async def publish_charts_search_probe(
+    body: dict = Body(...),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """POST /catalog/charts/search?offset=0&limit=100. Body shape:
+       { domain_id, site_id, type?, seller_id?, known_attributes? }.
+    Returns existing BRAND/STANDARD/SPECIFIC tables of measurements for the
+    domain. See `РАБОТА С КАРТОЧКАМИ ОДЕЖДЫ И ОБУВИ ML.md` lines 889–1020.
+    """
+    token, ml_user_id, err = await _get_user_token_or_error(pool, user.id)
+    if err:
+        return err
+    # ML expects domain_id without MLB- prefix in this endpoint (per docs example).
+    # We pass-through whatever caller sends; probe is for shape discovery.
+    if "seller_id" not in body and ml_user_id:
+        body = {**body, "seller_id": ml_user_id}
+    url = "https://api.mercadolibre.com/catalog/charts/search?offset=0&limit=100"
+    return await _ml_post_probe(token, url, body)
+
+
+@router.get("/publish/category-sale-terms-probe")
+async def publish_category_sale_terms_probe(
+    category_id: str = Query(..., min_length=4),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """sale_terms specific to a category — WARRANTY_TYPE/WARRANTY_TIME,
+    MANUFACTURING_TIME, INVOICE, etc. Items with `hierarchy: SALE_TERMS`
+    go into the body's `sale_terms` array, not `attributes`.
+    See `Sincronização e modificação de publicaçõ.md` lines 245–760.
+    """
+    token, _ml_user_id, err = await _get_user_token_or_error(pool, user.id)
+    if err:
+        return err
+    url = f"https://api.mercadolibre.com/categories/{category_id}/sale_terms"
+    return await _ml_get_probe(token, url)
+
+
+# ─── Publish flow: categories (predict + cached fetch) ────────────────────
+
+
+@router.post("/publish/categories/predict")
+async def publish_categories_predict(
+    body: dict = Body(...),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Predict ML categories for a list of free-text queries (xProd from NF).
+
+    Body: { site_id?: "MLB", queries: [{"line_n": 1, "q": "..."}], limit?: 3 }
+    Returns: { results: [{ line_n, q, predictions: [{...}], cache_hit }] }
+
+    Single call covers all NF lines so the UI can preselect categories before
+    showing the picker. Cache TTL 30d; ML rarely retrains.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    site_id = (body.get("site_id") or "MLB").upper()
+    queries = body.get("queries") or []
+    if not isinstance(queries, list) or not queries:
+        raise HTTPException(status_code=400, detail={"error": "no_queries"})
+    limit = int(body.get("limit") or 3)
+
+    await ml_categories_svc.ensure_schema(pool)
+    try:
+        access_token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "ml_oauth_required", "message": str(err)},
+        )
+
+    results: list[dict[str, Any]] = []
+    async with httpx.AsyncClient() as http:
+        for entry in queries:
+            line_n = entry.get("line_n")
+            q = (entry.get("q") or "").strip()
+            if not q:
+                results.append({"line_n": line_n, "q": q,
+                                "predictions": [], "cache_hit": False, "error": "empty_q"})
+                continue
+            try:
+                out = await ml_categories_svc.predict_for_query(
+                    pool, http, access_token, site_id=site_id, q=q, limit=limit,
+                )
+                results.append({"line_n": line_n, "q": q, **out})
+            except httpx.HTTPStatusError as err:
+                results.append({
+                    "line_n": line_n, "q": q,
+                    "predictions": [], "cache_hit": False,
+                    "error": f"ml_http_{err.response.status_code}",
+                })
+            except Exception as err:  # noqa: BLE001
+                results.append({
+                    "line_n": line_n, "q": q,
+                    "predictions": [], "cache_hit": False,
+                    "error": str(err),
+                })
+
+    return {"site_id": site_id, "results": results}
+
+
+@router.get("/publish/categories/{category_id}")
+async def publish_categories_get(
+    category_id: str,
+    bypass_cache: bool = Query(False),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Cached fetch of /categories/{id}. Returns the full ML payload + meta.
+    Used after the user confirms a category — UI grabs path/settings/domain
+    to set up the next wizard step (attributes form, grid pickers, etc).
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await ml_categories_svc.ensure_schema(pool)
+    try:
+        access_token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "ml_oauth_required", "message": str(err)},
+        )
+    try:
+        async with httpx.AsyncClient() as http:
+            out = await ml_categories_svc.get_category(
+                pool, http, access_token, category_id, bypass_cache=bypass_cache,
+            )
+    except httpx.HTTPStatusError as err:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "ml_category_failed",
+                    "status": err.response.status_code if err.response else None},
+        )
+    return out
+
+
+# ─── Publish flow: NF upload + parse ──────────────────────────────────────
+
+
+# 5 MB is plenty for an NF — XML rarely passes 200KB, DANFE PDF 2-3 MB.
+_NF_MAX_BYTES = 5 * 1024 * 1024
+
+
+@router.post("/publish/nf/parse")
+async def publish_nf_parse(
+    file: UploadFile = File(..., description="NF-e XML (preferred) or DANFE PDF"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Parse an uploaded NF and persist the upload + parsed JSON.
+
+    Returns: { upload_id, source_format, parsed: {...} }.
+    The frontend then PUTs the parsed payload into its draft's state_json.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail={"error": "empty_file"})
+    if len(file_bytes) > _NF_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={"error": "file_too_large", "max_mb": _NF_MAX_BYTES // (1024 * 1024)},
+        )
+
+    await nf_parser_svc.ensure_schema(pool)
+    try:
+        parsed, source_format = nf_parser_svc.parse_nf(
+            file_bytes,
+            filename=file.filename or "",
+            content_type=file.content_type,
+        )
+    except nf_parser_svc.NFParseError as err:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "nf_parse_failed", "message": str(err)},
+        )
+
+    # Keep the raw text for re-parse if parsing logic evolves. For XML we
+    # store the original. For PDF we store the extracted text (the original
+    # PDF blob is dropped — re-parsing a PDF from scratch isn't useful since
+    # text is what the regex worked on).
+    raw_text: Optional[str]
+    if source_format == "xml":
+        try:
+            raw_text = file_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raw_text = file_bytes.decode("latin-1", errors="replace")
+    else:
+        # We already extracted text inside parse_danfe_pdf — capture it again
+        # so the saved blob matches what we parsed (cheap on small PDFs).
+        try:
+            raw_text = nf_parser_svc.extract_pdf_text(file_bytes)
+        except Exception:  # noqa: BLE001
+            raw_text = None
+
+    upload_id = await nf_parser_svc.save_upload(
+        pool, user.id,
+        filename=file.filename or "",
+        content_type=file.content_type,
+        source_format=source_format,
+        parsed=parsed,
+        size_bytes=len(file_bytes),
+        raw_text=raw_text,
+    )
+
+    return {
+        "upload_id": upload_id,
+        "source_format": source_format,
+        "parsed": nf_parser_svc.parsed_to_dict(parsed),
+    }
+
+
+# ─── Publish flow: drafts (wizard auto-save) ──────────────────────────────
+
+
+@router.post("/publish/drafts")
+async def publish_drafts_create(
+    body: dict = Body(default_factory=dict),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Create a new draft. Body (all optional):
+      { managed_account_id?, nf_upload_id?, initial_state?, current_step? }
+    Returns the freshly created row including `id` (UUID) and `version=0`.
+    """
+    await nf_drafts_svc.ensure_schema(pool)
+    row = await nf_drafts_svc.create_draft(
+        pool,
+        ls_user_id=user.id,
+        managed_account_id=body.get("managed_account_id"),
+        nf_upload_id=body.get("nf_upload_id"),
+        initial_state=body.get("initial_state") or {},
+        current_step=body.get("current_step") or "upload",
+    )
+    return {"draft": row}
+
+
+@router.get("/publish/drafts")
+async def publish_drafts_list(
+    status_q: str = Query("draft", alias="status"),
+    limit: int = Query(50, ge=1, le=200),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    await nf_drafts_svc.ensure_schema(pool)
+    rows = await nf_drafts_svc.list_drafts(
+        pool, user.id, status=status_q, limit=limit
+    )
+    return {"drafts": rows}
+
+
+@router.get("/publish/drafts/{draft_id}")
+async def publish_drafts_get(
+    draft_id: str,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    await nf_drafts_svc.ensure_schema(pool)
+    row = await nf_drafts_svc.get_draft(pool, user.id, draft_id)
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "draft_not_found", "draft_id": draft_id},
+        )
+    return {"draft": row}
+
+
+@router.put("/publish/drafts/{draft_id}")
+async def publish_drafts_update(
+    draft_id: str,
+    body: dict = Body(...),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Optimistic-locked update. Body:
+      { expected_version: int (required),
+        state?, current_step?, current_family_idx?,
+        managed_account_id?, nf_upload_id? }
+    Returns 409 with `{ error: 'version_conflict', current: <row> }` if the
+    DB version doesn't match expected_version.
+    """
+    if "expected_version" not in body:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "missing_expected_version"},
+        )
+    try:
+        row = await nf_drafts_svc.update_draft(
+            pool,
+            ls_user_id=user.id,
+            draft_id=draft_id,
+            expected_version=int(body["expected_version"]),
+            state=body.get("state"),
+            current_step=body.get("current_step"),
+            current_family_idx=body.get("current_family_idx"),
+            managed_account_id=body.get("managed_account_id"),
+            nf_upload_id=body.get("nf_upload_id"),
+        )
+    except LookupError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "draft_not_found", "draft_id": draft_id},
+        )
+    except nf_drafts_svc.DraftVersionConflict as err:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "version_conflict", "current": err.current_row},
+        )
+    return {"draft": row}
+
+
+@router.delete("/publish/drafts/{draft_id}")
+async def publish_drafts_delete(
+    draft_id: str,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Soft delete: marks status='abandoned'. Real removal happens via the
+    nightly cron after `delete_after_days`."""
+    await nf_drafts_svc.ensure_schema(pool)
+    ok = await nf_drafts_svc.mark_abandoned(pool, user.id, draft_id)
+    if not ok:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "draft_not_found_or_already_abandoned"},
+        )
+    return {"ok": True}
 
 
 # ─── Publish flow: ML test-users (sandbox seller accounts) ────────────────
