@@ -1071,6 +1071,10 @@ class ServicesCashflowOut(BaseModel):
     # Surfaced as a separate "Поступления (выписка)" table; the aggregated
     # total also lives in inflows.bank_inflows_total.
     bank_inflows: list[dict[str, Any]] = []
+    # Per-row "❌ Скрыть" — transfers the user explicitly dismissed via the
+    # UI button. They keep their original shape plus `_hide_key` for un-hide.
+    # NOT counted in total_outflows / debito_estonia.
+    hidden_transfers: list[dict[str, Any]] = []
     needs_config: bool = Field(default=False, alias="_needs_config")
     reason: Optional[str] = Field(default=None, alias="_reason")
 

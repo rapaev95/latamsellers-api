@@ -504,6 +504,82 @@ async def get_services_reports(
     return out
 
 
+# ── Per-row hide / un-hide for services-reports transfers ──────────────────
+
+_HIDDEN_KEY_TEMPLATE = "f2_services_hidden_transfers_{project}"
+
+
+def _load_hidden_keys_for_user(project: str, user_id: int) -> list[str]:
+    """Read the per-project hidden list scoped to a specific user_id.
+    Returns an empty list when the key is unset, non-list, or DB is down."""
+    from v2.legacy.db_storage import db_load
+    raw = db_load(_HIDDEN_KEY_TEMPLATE.format(project=project), user_id=user_id)
+    if not isinstance(raw, list):
+        return []
+    return [str(x) for x in raw if isinstance(x, str) and x]
+
+
+@router.post("/services-reports/hide-transfer")
+async def services_hide_transfer(
+    body: dict[str, Any],
+    project: str = Query(..., description="Services project ID"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Dismiss a single transfer row from services DDS by its `key`.
+
+    Row stays in the data source (hardcoded / approved / auto-TS) but the
+    services-reports response drops it from `transfers` and excludes it from
+    `total_outflows` / `debito_estonia`. Persisted per user under
+    `f2_services_hidden_transfers_{project}`. Use unhide-transfer to restore.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    if not _is_superadmin(user):
+        raise HTTPException(status_code=403, detail={"code": "superadmin_required"})
+    key = str(body.get("key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail={"error": "missing_key"})
+
+    effective_user_id = await _resolve_effective_user_for_project(pool, user, project)
+    _bind_user_id(effective_user_id)
+
+    from v2.legacy.db_storage import db_save
+    cur = _load_hidden_keys_for_user(project, effective_user_id)
+    if key not in cur:
+        cur.append(key)
+        db_save(_HIDDEN_KEY_TEMPLATE.format(project=project), cur)
+    return {"ok": True, "hidden_count": len(cur)}
+
+
+@router.post("/services-reports/unhide-transfer")
+async def services_unhide_transfer(
+    body: dict[str, Any],
+    project: str = Query(..., description="Services project ID"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Reverse of hide-transfer — remove `key` from the hidden list so the
+    row reappears in transfers and rejoins total_outflows."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    if not _is_superadmin(user):
+        raise HTTPException(status_code=403, detail={"code": "superadmin_required"})
+    key = str(body.get("key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail={"error": "missing_key"})
+
+    effective_user_id = await _resolve_effective_user_for_project(pool, user, project)
+    _bind_user_id(effective_user_id)
+
+    from v2.legacy.db_storage import db_save
+    cur = _load_hidden_keys_for_user(project, effective_user_id)
+    if key in cur:
+        cur = [k for k in cur if k != key]
+        db_save(_HIDDEN_KEY_TEMPLATE.format(project=project), cur)
+    return {"ok": True, "hidden_count": len(cur)}
+
+
 def _dataclass_to_dict(obj: Any) -> Any:
     """Convert dataclass / nested dataclasses → dict for JSON serialisation."""
     from dataclasses import asdict, is_dataclass

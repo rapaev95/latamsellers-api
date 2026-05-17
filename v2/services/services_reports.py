@@ -669,16 +669,68 @@ async def compute_for_user(
         if isinstance(out.get("cashflow"), dict):
             cf = out["cashflow"]
             transfers = cf.get("transfers") or []
-            transfers.sort(key=_transfer_sort_key)
-            for i, tr in enumerate(transfers, start=1):
+            # Per-row "❌ Скрыть": filter out rows the user has dismissed.
+            # Surface them through `hidden_transfers` so the UI can list and
+            # un-hide them later; they don't contribute to total_outflows or
+            # debito_estonia.
+            hidden_keys = _load_hidden_transfer_keys(project_id)
+            visible: list[dict[str, Any]] = []
+            hidden_rows: list[dict[str, Any]] = []
+            for tr in transfers:
+                if transfer_hide_key(tr) in hidden_keys:
+                    hidden_rows.append({**tr, "_hide_key": transfer_hide_key(tr)})
+                else:
+                    visible.append(tr)
+            visible.sort(key=_transfer_sort_key)
+            for i, tr in enumerate(visible, start=1):
                 tr["n"] = i
-            cf["transfers"] = transfers
+                tr["_hide_key"] = transfer_hide_key(tr)
+            cf["transfers"] = visible
+            cf["hidden_transfers"] = hidden_rows
+            if hidden_rows:
+                cf["total_outflows"] = round(sum(float(t.get("brl") or 0) for t in visible), 2)
+                inflows = cf.get("inflows") or {}
+                saldo = float(inflows.get("saldo_inicial") or 0)
+                net = float(inflows.get("invoices_net") or 0)
+                bank_in = float(inflows.get("bank_inflows_total") or 0)
+                cf["debito_estonia"] = round(saldo + net + bank_in - cf["total_outflows"], 2)
     try:
         out["balance"] = await bal_task
     except Exception as err:  # noqa: BLE001
         out["balance_error"] = f"{type(err).__name__}: {err}"
 
     return out
+
+
+def transfer_hide_key(tr: dict[str, Any]) -> str:
+    """Stable identifier for a single transfer row, used by the per-row
+    "❌ Скрыть" feature. Same date+canal+brl always hashes to the same key
+    regardless of source (hardcoded / approved / auto-TS), so hiding from the
+    UI persists across recomputes.
+    """
+    date_s = str(tr.get("date") or "")
+    canal_s = str(tr.get("canal") or "").strip()
+    try:
+        brl = round(float(tr.get("brl") or 0), 2)
+    except (TypeError, ValueError):
+        brl = 0.0
+    return f"{date_s}|{canal_s}|{brl:.2f}"
+
+
+def _load_hidden_transfer_keys(project_id: str) -> set[str]:
+    """Per-project list of transfer hide-keys the user dismissed via the
+    "❌ Скрыть" button. Stored as JSONB list under
+    `f2_services_hidden_transfers_{project_id}`.
+    """
+    try:
+        from v2.legacy.db_storage import db_load
+        raw = db_load(f"f2_services_hidden_transfers_{project_id}")
+    except Exception as err:  # noqa: BLE001
+        log.warning("hidden_transfers load failed for %s: %s", project_id, err)
+        return set()
+    if not isinstance(raw, list):
+        return set()
+    return {str(x) for x in raw if isinstance(x, str) and x}
 
 
 def _transfer_sort_key(tr: dict[str, Any]) -> date:
