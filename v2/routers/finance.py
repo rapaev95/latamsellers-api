@@ -451,6 +451,19 @@ async def get_services_reports(
             detail={"error": "services_reports_unavailable", "reason": str(err)},
         )
 
+    # Prefetch bank classifications into the contextvar so
+    # generate_dds_estonia can pull income-tagged rows from the user's
+    # statements (Pix recebido de SHPP, …) into the ДДС inflows section.
+    # Mirrors the /reports prefetch block — same rationale: Railway FS is
+    # ephemeral, the legacy disk path returns empty in prod.
+    if pool is not None:
+        try:
+            from v2.services import bank_classifications as _bank_cls
+            prefetched = await _bank_cls.prefetch_for_user(pool, effective_user_id)
+            _bank_cls.set_prefetched(prefetched)
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _compute_async() -> dict[str, Any]:
         bundle = await services_svc.compute_for_user(
             pool, effective_user_id, project, period_from=pf, period_to=pt,
