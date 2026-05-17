@@ -2960,6 +2960,89 @@ class _ItemPriceShiftIn(__import__("pydantic").BaseModel):
     disable_dyn: Optional[bool] = False
 
 
+async def _reenable_dyn_pricing(
+    http: httpx.AsyncClient,
+    pool: Any,
+    user_id: int,
+    mlb: str,
+    token: str,
+) -> dict[str, Any]:
+    """Re-arm ML pricing-automation for an item.
+
+    Reads previous rule (rule_id, min, max) from `ml_user_pricing_history`
+    — the row saved when `_auto_disable_dyn_pricing` DELETE'd the rule.
+    If no history (or stale/invalid range), derives ±15% range from the
+    current listing price.
+
+    Returns the same shape used by the promo path so callers can render
+    success / error uniformly:
+      {"ok": True, "dyn_reenabled": True, "rule_id", "min_price",
+       "max_price"} on success, or {"ok": False, "error", ...} on failure.
+    """
+    async with pool.acquire() as conn:
+        hist = await conn.fetchrow(
+            """
+            SELECT rule_id, min_price, max_price
+              FROM ml_user_pricing_history
+             WHERE user_id = $1 AND item_id = $2
+             ORDER BY disabled_at DESC LIMIT 1
+            """,
+            user_id, mlb,
+        )
+    rule_id = (hist["rule_id"] if hist else None) or "INT_EXT"
+    min_price = float(hist["min_price"]) if hist and hist["min_price"] is not None else None
+    max_price = float(hist["max_price"]) if hist and hist["max_price"] is not None else None
+
+    if not min_price or not max_price or min_price <= 0 or max_price <= min_price:
+        # Derive ±15% range from current item price.
+        try:
+            gr = await http.get(
+                f"https://api.mercadolibre.com/items/{mlb}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15.0,
+            )
+        except Exception as err:  # noqa: BLE001
+            return {"ok": False, "error": "ml_item_fetch_failed", "detail": str(err)}
+        cur_price = float((gr.json() or {}).get("price") or 0.0) if gr.status_code < 400 else 0.0
+        if cur_price <= 0:
+            return {"ok": False, "error": "no_current_price_for_range"}
+        min_price = round(cur_price * 0.85, 2)
+        max_price = round(cur_price * 1.15, 2)
+
+    payload = {
+        "rule_id": rule_id,
+        "min_price": float(min_price),
+        "max_price": float(max_price),
+    }
+    try:
+        r = await http.post(
+            f"https://api.mercadolibre.com/pricing-automation/items/{mlb}/automation",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            timeout=15.0,
+        )
+    except Exception as err:  # noqa: BLE001
+        return {"ok": False, "error": "ml_dyn_reenable_failed", "detail": str(err)}
+    if r.status_code >= 400:
+        return {
+            "ok": False,
+            "error": "ml_dyn_reenable_rejected",
+            "status": r.status_code,
+            "detail": (r.text or "")[:300],
+            "attempted_payload": payload,
+        }
+    return {
+        "ok": True,
+        "dyn_reenabled": True,
+        "rule_id": rule_id,
+        "min_price": float(min_price),
+        "max_price": float(max_price),
+    }
+
+
 async def _auto_disable_dyn_pricing(
     http: httpx.AsyncClient,
     pool: Any,
@@ -3203,6 +3286,58 @@ async def items_price_shift(
         "base": body.base or "sale",
         "dyn_disabled": dyn_disabled,
     }
+
+
+class _DynReenableIn(__import__("pydantic").BaseModel):
+    user_id: int
+    item_id: str
+
+
+@router.post("/items/dyn-pricing/reenable")
+async def items_dyn_pricing_reenable(
+    body: _DynReenableIn,
+    pool=Depends(get_pool),
+):
+    """Re-arm ML pricing-automation for a single item.
+
+    Mirrors the promo `reenable_dynamic_pricing` action but does not
+    require a promotion_id — it's called from the sale-card "↩️ Habilitar
+    Dyn Pricing" button which appears after a successful sale-card price
+    shift that disabled Dyn Pricing as a side effect.
+
+    Reads previous rule/range from ml_user_pricing_history; falls back to
+    ±15% around current price if no history.
+    """
+    if pool is None:
+        return {"ok": False, "error": "no_db"}
+    try:
+        token, _exp, _refreshed = await ml_oauth_svc.get_valid_access_token(pool, body.user_id)
+    except ml_oauth_svc.MLRefreshError as err:
+        return {"ok": False, "error": "ml_oauth_required", "detail": str(err)}
+
+    mlb = body.item_id.upper()
+    async with httpx.AsyncClient() as http:
+        result = await _reenable_dyn_pricing(http, pool, body.user_id, mlb, token)
+
+    if result.get("ok"):
+        try:
+            from v2.services import escalar_audit as _audit
+            await _audit.log_event(
+                pool,
+                user_id=body.user_id,
+                action="dyn_pricing_on",
+                target_type="item",
+                target_id=mlb,
+                user_action="sale_card_reenable",
+                metadata={
+                    "rule_id": result.get("rule_id"),
+                    "min_price": result.get("min_price"),
+                    "max_price": result.get("max_price"),
+                },
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return {**result, "item_id": mlb}
 
 
 class _PromoActionIn(__import__("pydantic").BaseModel):
@@ -4013,63 +4148,23 @@ async def promotions_tg_action(
             )
         elif body.action == "reenable_dynamic_pricing":
             # User wants ML Pricing Automation back ON for this item.
-            # Reads previous rule (rule_id, min, max) from
-            # ml_user_pricing_history (saved when DELETE'ed). If no history
-            # — falls back to INT_EXT with ±15% range from current price.
-            async with pool.acquire() as conn:
-                hist = await conn.fetchrow(
-                    """
-                    SELECT rule_id, min_price, max_price
-                      FROM ml_user_pricing_history
-                     WHERE user_id = $1 AND item_id = $2
-                     ORDER BY disabled_at DESC LIMIT 1
-                    """,
-                    body.user_id, mlb,
-                )
-            rule_id = (hist["rule_id"] if hist else None) or "INT_EXT"
-            min_price = float(hist["min_price"]) if hist and hist["min_price"] is not None else None
-            max_price = float(hist["max_price"]) if hist and hist["max_price"] is not None else None
-
-            if not min_price or not max_price or min_price <= 0 or max_price <= min_price:
-                # Derive ±15% range from current item price.
-                gr = await http.get(
-                    f"https://api.mercadolibre.com/items/{mlb}",
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=15.0,
-                )
-                cur_price = float((gr.json() or {}).get("price") or 0.0) if gr.status_code < 400 else 0.0
-                if cur_price <= 0:
-                    return {"error": "no_current_price_for_range"}
-                min_price = round(cur_price * 0.85, 2)
-                max_price = round(cur_price * 1.15, 2)
-
-            payload = {
-                "rule_id": rule_id,
-                "min_price": float(min_price),
-                "max_price": float(max_price),
-            }
-            r = await http.post(
-                f"https://api.mercadolibre.com/pricing-automation/items/{mlb}/automation",
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-                timeout=15.0,
+            # Delegates to shared helper used by both promo and sale-card
+            # re-enable flows.
+            re_result = await _reenable_dyn_pricing(
+                http, pool, body.user_id, mlb, token,
             )
-            if r.status_code >= 400:
-                return {
-                    "error": "ml_dyn_reenable_rejected",
-                    "status": r.status_code,
-                    "detail": r.text[:300],
-                    "attempted_payload": payload,
-                }
+            if not re_result.get("ok"):
+                return re_result
             raise_info = {
                 "dyn_reenabled": True,
-                "rule_id": rule_id,
-                "min_price": float(min_price),
-                "max_price": float(max_price),
+                "rule_id": re_result.get("rule_id"),
+                "min_price": re_result.get("min_price"),
+                "max_price": re_result.get("max_price"),
             }
+            class _OkResp:
+                status_code = 200
+                text = ""
+            r = _OkResp()  # type: ignore
 
         elif body.action in ("raise_only", "raise_with_disable_dyn"):
             # Standalone price raise.
