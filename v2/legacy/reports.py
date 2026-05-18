@@ -493,13 +493,26 @@ def generate_opiu_estonia(
         month = iso_date[:7]
         if (month, gross_r) in existing_keys:
             continue  # already covered by NFS-e / baseline invoice
+        # Pre-compute tax via split_invoice_tax — same pattern as NFS-e merge.
+        # Required so the legacy aggregation loop (`inv["tax"]`) doesn't
+        # KeyError on shadow rows, and so the invoices_out builder uses these
+        # values directly via the "tax_das is not None" branch.
+        cum_after_b = cum_gross + gross_r
+        split_b = split_invoice_tax(gross_r, cum_after_b, anexo="III")
         bank_candidates.append({
             "date": iso_date,
             "gross": gross_r,
+            "tax": split_b["tax_total"],
+            "tax_das": split_b["das"],
+            "tax_commission": split_b["commission"],
+            "rate": split_b["total_rate_pct"],
+            "rate_eff": split_b["eff_pct"],
+            "rate_commission": split_b["commission_pct"],
             "numero": None,
             "from_bank": True,
             "bank_source": str(tx.get("Класс.") or tx.get("Descrição") or tx.get("Описание") or ""),
         })
+        cum_gross = cum_after_b
         existing_keys.add((month, gross_r))  # avoid dup if same amount twice in same month
     invoice_lines.extend(bank_candidates)
 
