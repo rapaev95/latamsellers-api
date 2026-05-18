@@ -15,12 +15,50 @@ from typing import Optional
 
 
 def detect_source(filename: str, file_bytes: bytes = b"") -> Optional[str]:
-    """Resolve source_key using filename first, then column sniff."""
+    """Resolve source_key using filename first, then column / PDF sniff."""
     hit = detect_source_from_filename(filename)
     if hit:
         return hit
     if file_bytes:
+        # PDFs first — the column sniff is CSV-only and would return None.
+        if (filename or "").lower().endswith(".pdf"):
+            pdf_hit = detect_source_from_pdf_content(file_bytes)
+            if pdf_hit:
+                return pdf_hit
         return detect_source_from_columns(filename, file_bytes)
+    return None
+
+
+def detect_source_from_pdf_content(file_bytes: bytes) -> Optional[str]:
+    """Peek inside a PDF to find a source_key hint.
+
+    Handles two common cases where the filename gives nothing useful:
+      - NFS-e PDFs named after the 50-digit chave de acesso
+        (e.g. `35097002245659520000149...pdf`).
+      - DAS Simples PDFs renamed by accountants to arbitrary names.
+
+    Reads only the first page text to keep this cheap on the upload path.
+    """
+    try:
+        import pdfplumber
+        from io import BytesIO
+        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+            if not pdf.pages:
+                return None
+            text = (pdf.pages[0].extract_text() or "")
+    except Exception:  # noqa: BLE001 — fall through to "ambiguous" prompt
+        return None
+    if not text:
+        return None
+    blob = text.lower()
+    if "nfs-e" in blob or "nfse" in blob or "nota fiscal de servi" in blob:
+        return "nfse_shps"
+    if (
+        "pgdasd" in blob
+        or "documento de arrecada" in blob
+        or ("simples nacional" in blob and "das" in blob)
+    ):
+        return "das_simples"
     return None
 
 
