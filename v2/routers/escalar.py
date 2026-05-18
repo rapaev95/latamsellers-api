@@ -7142,6 +7142,10 @@ async def publish_nf_parse(
         "upload_id": upload_id,
         "source_format": source_format,
         "parsed": nf_parser_svc.parsed_to_dict(parsed),
+        # Debug aid: include raw text up to 6KB so the user can paste it
+        # back when parse_danfe_pdf returns empty lines. Costs ~6KB per
+        # response — acceptable for an auth-gated debug endpoint.
+        "raw_text_preview": (raw_text[:6000] if raw_text else None),
     }
 
 
