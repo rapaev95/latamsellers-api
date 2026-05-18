@@ -359,7 +359,7 @@ def generate_balance_ecom(project: str, months: list[str] | None = None) -> dict
 # OPiU / DDS / BALANCE — SERVICES (Estonia/Ganza)
 # ─────────────────────────────────────────────
 
-def generate_opiu_estonia() -> dict:
+def generate_opiu_estonia(loaded_nfs: list | None = None) -> dict:
     """
     Generate OPiU for Estonia from OUR COMPANY perspective.
 
@@ -403,7 +403,11 @@ def generate_opiu_estonia() -> dict:
     BASELINE_CUTOFF = "2026-04"
 
     cum_gross = sum(inv["gross"] for inv in invoice_lines)
-    loaded_nfs = load_all_nfse()
+    # `loaded_nfs` arg is passed by services_reports.compute_for_user — it
+    # already merged DB uploads (Railway) with disk sidecars (local dev).
+    # Fallback `load_all_nfse()` keeps Streamlit/legacy call sites working.
+    if loaded_nfs is None:
+        loaded_nfs = load_all_nfse()
     loaded_nfs.sort(key=lambda r: (
         r.get("competencia") or "",
         r.get("ref_month_iso") or "",
@@ -1249,25 +1253,18 @@ def parse_das_pdf(file_path: Path, original_filename: str | None = None) -> dict
         return None
 
 
-def parse_nfse_pdf(file_path: Path, original_filename: str | None = None) -> dict | None:
-    """
-    Parse NFS-e (Nota Fiscal de Serviço eletrônica) PDF.
-    Returns: {numero, competencia, data_emissao, valor, tomador, descricao, ref_month}
+def _parse_nfse_pdf_text(text: str) -> dict | None:
+    """Extract structured NFS-e fields from already-extracted PDF text.
+
+    Shared core for `parse_nfse_pdf` (file path) and `parse_nfse_pdf_bytes`
+    (in-memory upload). Returns None if the text doesn't look like an NFS-e
+    or no valor is found.
     """
     try:
-        import pdfplumber
         import re
-
-        with pdfplumber.open(file_path) as pdf:
-            text = ""
-            for page in pdf.pages:
-                t = page.extract_text()
-                if t:
-                    text += t + "\n"
 
         if not text:
             return None
-
         if "NFS-e" not in text and "Nota Fiscal" not in text:
             return None
 
@@ -1374,6 +1371,38 @@ def parse_nfse_pdf(file_path: Path, original_filename: str | None = None) -> dic
                     result["ref_month"] = f"{month_name.capitalize()}/{yr}"
 
         return result if result["valor"] > 0 else None
+    except Exception:
+        return None
+
+
+def parse_nfse_pdf(file_path: Path, original_filename: str | None = None) -> dict | None:
+    """Parse NFS-e PDF from disk. Thin wrapper over `_parse_nfse_pdf_text`."""
+    try:
+        import pdfplumber
+        with pdfplumber.open(file_path) as pdf:
+            text = ""
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    text += t + "\n"
+        return _parse_nfse_pdf_text(text)
+    except Exception:
+        return None
+
+
+def parse_nfse_pdf_bytes(file_bytes: bytes, original_filename: str | None = None) -> dict | None:
+    """Parse NFS-e PDF from in-memory bytes (upload flow). Same shape as
+    `parse_nfse_pdf`."""
+    try:
+        import pdfplumber
+        from io import BytesIO
+        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+            text = ""
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    text += t + "\n"
+        return _parse_nfse_pdf_text(text)
     except Exception:
         return None
 

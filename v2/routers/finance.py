@@ -2009,6 +2009,21 @@ async def create_upload(
         except Exception as e:
             das_parsed = {"error": f"{type(e).__name__}: {e}"}
 
+    # NFS-e Estonia (Nota Fiscal de Serviço — DANFSe PDF emitida para SHPS):
+    # parse → store {numero, competencia, valor, tomador, ref_month_iso, ...}
+    # in `parsed_meta`. services_reports.load_nfse_uploads_for_user reads this
+    # at compute time so OPiU Estonia auto-includes uploaded invoices without
+    # waiting for the legacy disk sidecar (which doesn't survive Railway deploys).
+    nfse_parsed: Optional[dict[str, Any]] = None
+    if resolved_key == "nfse_shps":
+        try:
+            from v2.legacy.reports import parse_nfse_pdf_bytes
+            nfse_parsed = parse_nfse_pdf_bytes(file_bytes, filename)
+            if nfse_parsed:
+                await uploads_storage.set_parsed_meta(pool, upload_id, nfse_parsed)
+        except Exception as e:
+            nfse_parsed = {"error": f"{type(e).__name__}: {e}"}
+
     return {
         "id": upload_id,
         "filename": filename,
@@ -2019,6 +2034,7 @@ async def create_upload(
         "unlocked": unlocked_pwd is not None,
         "dados_fiscais_sync": dados_fiscais_sync,
         "das_parsed": das_parsed,
+        "nfse_parsed": nfse_parsed,
     }
 
 

@@ -566,16 +566,23 @@ def _validate_project(project_id: str) -> tuple[bool, Optional[str]]:
 # ── Public API ──────────────────────────────────────────────────────────────
 
 
-def generate_services_pnl_sync(project_id: str) -> dict[str, Any]:
+def generate_services_pnl_sync(
+    project_id: str, *, loaded_nfs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Sync — the legacy generator under the hood is fully sync. Caller from
-    async context wraps in `asyncio.to_thread`."""
+    async context wraps in `asyncio.to_thread`.
+
+    `loaded_nfs` lets compute_for_user pre-load NFS-e uploads from the DB
+    (Railway disk is ephemeral, so `load_all_nfse()` alone finds nothing in
+    prod). When None, legacy generator falls back to disk-only scan.
+    """
     ok, reason = _validate_project(project_id)
     if not ok:
         return _empty_pnl(reason or "unknown")
 
     if _is_legacy_hardcoded(project_id):
         from v2.legacy.reports import generate_opiu_estonia
-        result = generate_opiu_estonia()
+        result = generate_opiu_estonia(loaded_nfs=loaded_nfs)
         result["_needs_config"] = False
         return result
 
@@ -659,6 +666,64 @@ def generate_services_balance_sync(project_id: str) -> dict[str, Any]:
 # ── Async wrappers — endpoint calls these via asyncio.to_thread ─────────────
 
 
+async def load_nfse_uploads_for_user(
+    pool: asyncpg.Pool, user_id: int,
+) -> list[dict[str, Any]]:
+    """Read all NFS-e PDFs uploaded by `user_id` via the uploads table.
+
+    Production path for Railway (disk-based sidecars don't survive deploys).
+    Prefers `parsed_meta` (filled at upload time by the `nfse_shps` branch in
+    /finance/uploads). Falls back to parsing `file_bytes` on the fly so older
+    uploads predating the parser still surface in OPiU.
+
+    Dedup by `numero` (matches `load_all_nfse()` behaviour for legacy disk
+    sidecars). Rows without a numero are kept separately so they still appear
+    in the invoice list.
+    """
+    if pool is None:
+        return []
+    rows = await pool.fetch(
+        """
+        SELECT id, filename, file_bytes, parsed_meta
+          FROM uploads
+         WHERE user_id = $1 AND source_key = 'nfse_shps'
+           AND file_bytes IS NOT NULL
+        """,
+        user_id,
+    )
+    if not rows:
+        return []
+
+    from v2.legacy.reports import parse_nfse_pdf_bytes
+
+    by_numero: dict[str, dict[str, Any]] = {}
+    no_numero: list[dict[str, Any]] = []
+    for r in rows:
+        rec: Optional[dict[str, Any]] = None
+        meta = r["parsed_meta"]
+        if isinstance(meta, dict) and meta.get("valor"):
+            rec = dict(meta)
+        elif isinstance(meta, str) and meta.strip():
+            try:
+                import json as _json
+                parsed = _json.loads(meta)
+                if isinstance(parsed, dict) and parsed.get("valor"):
+                    rec = parsed
+            except Exception:  # noqa: BLE001
+                rec = None
+        if rec is None:
+            # Fallback — parse bytes inline so we still surface the invoice.
+            rec = parse_nfse_pdf_bytes(bytes(r["file_bytes"]), r["filename"])
+        if not rec:
+            continue
+        num = str(rec.get("numero") or "").strip()
+        if num:
+            by_numero[num] = rec
+        else:
+            no_numero.append(rec)
+    return list(by_numero.values()) + no_numero
+
+
 async def compute_for_user(
     pool: asyncpg.Pool,
     user_id: int,
@@ -696,7 +761,34 @@ async def compute_for_user(
             log.warning("services_reports.%s failed for %s: %s", label, project_id, err)
             return None, err
 
-    pnl_task = asyncio.create_task(asyncio.to_thread(generate_services_pnl_sync, project_id))
+    # Pre-load NFS-e uploads from DB (production path) and merge with disk
+    # sidecars before handing off to the sync PnL generator. Disk path stays
+    # for local dev; DB path is the only one that works on Railway. Dedup by
+    # numero so re-uploading the same invoice doesn't double-count.
+    try:
+        db_nfs = await load_nfse_uploads_for_user(pool, user_id)
+    except Exception as err:  # noqa: BLE001
+        log.warning("services_reports.load_nfse_uploads_for_user failed for user=%s: %s", user_id, err)
+        db_nfs = []
+    try:
+        from v2.legacy.reports import load_all_nfse
+        disk_nfs = await asyncio.to_thread(load_all_nfse)
+    except Exception as err:  # noqa: BLE001
+        log.warning("services_reports.load_all_nfse (disk) failed: %s", err)
+        disk_nfs = []
+    merged_by_num: dict[str, dict[str, Any]] = {}
+    merged_no_num: list[dict[str, Any]] = []
+    for rec in list(disk_nfs) + list(db_nfs):
+        num = str((rec or {}).get("numero") or "").strip()
+        if num:
+            merged_by_num[num] = rec  # DB wins on collision (last-write)
+        else:
+            merged_no_num.append(rec)
+    merged_nfs = list(merged_by_num.values()) + merged_no_num
+
+    pnl_task = asyncio.create_task(asyncio.to_thread(
+        generate_services_pnl_sync, project_id, loaded_nfs=merged_nfs,
+    ))
     cf_task = asyncio.create_task(asyncio.to_thread(
         generate_services_cashflow_sync, project_id,
         include_hardcoded_outflows=include_hardcoded_outflows,
