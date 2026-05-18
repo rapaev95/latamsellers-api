@@ -900,6 +900,7 @@ def generate_opiu_estonia(
 def generate_dds_estonia(
     include_hardcoded_outflows: bool = True,
     project_id: str = "ESTONIA",
+    rate_overrides: dict | None = None,
 ) -> dict:
     """Generate cash flow for Estonia project from approved report.
 
@@ -914,7 +915,7 @@ def generate_dds_estonia(
     project=project_id) so a Pix recebido tagged ESTONIA on the bank
     statement actually shows up on the ДДС instead of getting lost.
     """
-    opiu = generate_opiu_estonia(project_id=project_id)
+    opiu = generate_opiu_estonia(project_id=project_id, rate_overrides=rate_overrides)
 
     # Bank inflows — bank-statement rows the user classified as
     # category=income with this project. Loaded from the same prefetched

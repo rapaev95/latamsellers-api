@@ -389,6 +389,11 @@ class UploadSaveOut(BaseModel):
     # vencimento, irpj/csll/cofins/pis/inss/iss/icms). Persisted в
     # uploads.parsed_meta JSONB; UI читает через /uploads listing.
     das_parsed: Optional[dict[str, Any]] = None
+    # Только для source_key="nfse_shps" — извлечённые поля DANFSe (numero,
+    # competencia, valor, tomador, ref_month, ...). Persisted в
+    # uploads.parsed_meta JSONB; services_reports.load_nfse_uploads_for_user
+    # читает оттуда при сборке OPiU.
+    nfse_parsed: Optional[dict[str, Any]] = None
 
 
 class SourceCatalogEntry(BaseModel):
