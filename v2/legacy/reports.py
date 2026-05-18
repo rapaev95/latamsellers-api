@@ -744,11 +744,15 @@ def generate_opiu_estonia(
             "rate_overridden": overridden_fields,  # [] | ["rate_eff"] | ["rate_commission"] | both
         })
 
-    # If any per-invoice override fired, re-derive downstream totals from
-    # invoices_out so DDS KPI tiles ("После налога") and the monthly P&L
-    # table reflect the overridden rates. Without this, total_tax /
-    # total_net_client / by_month would silently keep the pre-override sums.
-    if invoices_out and any(i["rate_overridden"] for i in invoices_out):
+    # Always re-derive downstream totals from invoices_out (not just when an
+    # override fires). The aggregation loop above uses legacy hardcoded `tax`
+    # fields (combined-rate 15.50/16.75/18.75%) for baseline rows, while
+    # invoices_out recomputes them via split_invoice_tax (Anexo III effective
+    # + commission step-function). Without this pass the OPiU table sum and
+    # the DDS "После налога" KPI tile disagree by ~R$ 215 — confusing because
+    # both views show the same source data. Recompute unconditionally so the
+    # split-based numbers are the single source of truth.
+    if invoices_out:
         total_tax = round(sum(i["tax"] for i in invoices_out), 2)
         total_net_client = round(total_gross - total_tax, 2)
         # Rebuild per-month aggregations from invoices_out, preserving the
