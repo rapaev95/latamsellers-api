@@ -1556,8 +1556,19 @@ def auto_detect_source(df: pd.DataFrame, filename: str) -> str | None:
         return "vendas_ml"
     if "vendas" in fname:
         return "vendas_ml"
-    if "anuncios" in fname or "patrocinados" in fname:
+    # Ads reports — ML changed the filename convention in 2026 from
+    # «Relatorio_anuncios_patrocinados_*.xlsx» to «report-pads_report-*.xlsx»
+    # (Padrão) and «report-sales_report-*.xlsx» (Por anúncios vendidos).
+    # Only Padrão has `Investimento` — that's what we parse.
+    if "anuncios" in fname or "patrocinados" in fname or "publicidade" in fname:
         return "ads_publicidade"
+    if "report-pads_report" in fname or fname.startswith("report-pads"):
+        return "ads_publicidade"
+    if "report-sales_report" in fname or fname.startswith("report-sales"):
+        # Sales-report shape has different columns (no Investimento) and is
+        # NOT the one we need. Detect so the uploader can surface a clear
+        # error rather than failing on parse silently.
+        return "ads_publicidade_sales_unsupported"
     if "armazenamento" in fname or "armazenagem" in fname:
         return "armazenagem_full"
     if "stock_general" in fname or "stock_full" in fname or fname.startswith("stock"):
@@ -1893,10 +1904,34 @@ async def analyze_file(file: UploadFile = File(...)):
         if ext in ("csv", "txt", "tsv", ""):
             df = try_read_csv(file_bytes, nrows=5)
 
-        # Try xlsx
+        # Try xlsx — sheet-aware: ML reports often have multiple sheets
+        # (Ajuda / Glossário / actual data). Prefer the one whose name
+        # hints at being the data sheet. Also try header=1 to skip meta
+        # row when the first row is a single-cell title.
         if df is None and ext in ("xlsx", "xls"):
             try:
-                df = pd.read_excel(io.BytesIO(file_bytes), nrows=5)
+                xl = pd.ExcelFile(io.BytesIO(file_bytes))
+                preferred = None
+                for sn in xl.sheet_names:
+                    sn_low = sn.lower()
+                    if "ajuda" in sn_low or "gloss" in sn_low or "help" in sn_low:
+                        continue
+                    if "relat" in sn_low or "anúnc" in sn_low or "anunc" in sn_low or "patroc" in sn_low:
+                        preferred = sn
+                        break
+                target_sheet = preferred or xl.sheet_names[0]
+                # First try header=0, then fall back to header=1 if first
+                # row is mostly empty (signals meta row before real header).
+                df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet, nrows=5)
+                if df is not None and len(df.columns) > 0:
+                    non_null_in_header = sum(
+                        1 for c in df.columns if not str(c).startswith("Unnamed:")
+                    )
+                    if non_null_in_header <= 2:
+                        df = pd.read_excel(
+                            io.BytesIO(file_bytes), sheet_name=target_sheet,
+                            header=1, nrows=5,
+                        )
             except Exception:
                 pass
 
