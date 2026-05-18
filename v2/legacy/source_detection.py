@@ -84,9 +84,18 @@ def detect_source_from_filename(filename: str) -> Optional[str]:
     if "account_statement" in fname:
         return "extrato_mp"
 
-    # Ads
-    if "anuncios" in fname or "patrocinados" in fname:
+    # Ads — ML changed the report filename convention in 2026:
+    #   old: «Relatorio_anuncios_patrocinados_*.xlsx»  (Padrão)
+    #   new: «report-pads_report-<advertiserId>-<reportId>.xlsx»  (Padrão)
+    #   new: «report-sales_report-<...>.xlsx»  (Por anúncios vendidos)
+    # The sales-report shape lacks the «Investimento» column we need, so
+    # we tag it explicitly so callers can refuse it with a useful error.
+    if "anuncios" in fname or "patrocinados" in fname or "publicidade" in fname:
         return "ads_publicidade"
+    if "report-pads_report" in fname or fname.startswith("report-pads"):
+        return "ads_publicidade"
+    if "report-sales_report" in fname or fname.startswith("report-sales"):
+        return "ads_publicidade"  # let the parser fail with a clearer reason
 
     # ML fiscal catalog — SKU × MLB × NCM × Origem × Custo
     if "dados_fiscais" in fname or "dados-fiscais" in fname:
@@ -154,10 +163,58 @@ def detect_source_from_columns(filename: str, file_bytes: bytes) -> Optional[str
     """Column-signature sniff for CSV/XLSX. Returns source_key or None.
 
     Cheap: reads only the first few rows. Mirrors `auto_detect_source:329-356`.
-    Only enabled for CSV (fast to parse); XLSX fallback requires openpyxl which
-    is heavier — skip here, let the UI manual selector handle it.
+    For XLSX we also do a sheet-aware probe — ML's modern reports have 3+
+    sheets (Ajuda / Glossário / actual data) and the data header sits on
+    row 2 (row 1 is a meta title cell).
     """
     fname = (filename or "").lower()
+
+    # ── XLSX path: handle ML reports with multiple sheets + meta title row ──
+    if fname.endswith(".xlsx") or fname.endswith(".xls"):
+        try:
+            import pandas as pd
+            xl = pd.ExcelFile(io.BytesIO(file_bytes))
+            # Pick the most likely data sheet — skip help/glossary.
+            target = None
+            for sn in xl.sheet_names:
+                low = sn.lower()
+                if "ajuda" in low or "gloss" in low or "help" in low:
+                    continue
+                if "relat" in low or "anúnc" in low or "anunc" in low or "patroc" in low:
+                    target = sn
+                    break
+            if target is None:
+                # Pick last non-help sheet, falling back to the last sheet.
+                non_help = [
+                    sn for sn in xl.sheet_names
+                    if not any(k in sn.lower() for k in ("ajuda", "gloss", "help"))
+                ]
+                target = (non_help or xl.sheet_names)[-1]
+            # Try header=0 then header=1 — ML's «pads_report» has a meta row.
+            for header_row in (0, 1):
+                try:
+                    df = pd.read_excel(
+                        io.BytesIO(file_bytes), sheet_name=target,
+                        header=header_row, nrows=3,
+                    )
+                except Exception:
+                    continue
+                cols = {str(c).strip().lower() for c in df.columns
+                        if not str(c).startswith("Unnamed:")}
+                if len(cols) < 2:
+                    continue
+
+                def has_xlsx(sub: str) -> bool:
+                    return any(sub in c for c in cols)
+
+                if has_xlsx("investimento") and (has_xlsx("acos") or has_xlsx("roas")):
+                    return "ads_publicidade"
+                if has_xlsx("código do anúncio") or has_xlsx("codigo do anuncio"):
+                    return "ads_publicidade"
+        except Exception:
+            pass
+        return None
+
     if not fname.endswith(".csv"):
         return None
     try:
