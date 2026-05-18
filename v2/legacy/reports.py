@@ -359,7 +359,10 @@ def generate_balance_ecom(project: str, months: list[str] | None = None) -> dict
 # OPiU / DDS / BALANCE — SERVICES (Estonia/Ganza)
 # ─────────────────────────────────────────────
 
-def generate_opiu_estonia(loaded_nfs: list | None = None) -> dict:
+def generate_opiu_estonia(
+    loaded_nfs: list | None = None,
+    rate_overrides: dict | None = None,
+) -> dict:
     """
     Generate OPiU for Estonia from OUR COMPANY perspective.
 
@@ -679,11 +682,13 @@ def generate_opiu_estonia(loaded_nfs: list | None = None) -> dict:
     # at THIS invoice's cumulative rbt12 so they get the same DAS/commission
     # decomposition the NFS-e auto-load path produces.
     from v2.services.services_reports import split_invoice_tax as _split
+    from v2.services.services_reports import make_invoice_key as _mk_inv_key
     invoices_sorted_raw = sorted(invoice_lines, key=lambda r: str(r.get("date") or ""))
     invoices_out: list[dict] = []
     running_cum = 0.0
     total_das_invoices = 0.0
     total_commission_invoices = 0.0
+    overrides = rate_overrides or {}
     for inv in invoices_sorted_raw:
         gross = round(float(inv.get("gross") or 0), 2)
         running_cum += gross
@@ -700,6 +705,27 @@ def generate_opiu_estonia(loaded_nfs: list | None = None) -> dict:
             tax_total = split["tax_total"]
             rate_eff = split["eff_pct"]
             rate_comm = split["commission_pct"]
+
+        # Per-invoice user override. Partial edits allowed — if only
+        # rate_eff is overridden, rate_commission keeps its computed value.
+        # We recompute tax_das/tax_commission from the (possibly overridden)
+        # rates so downstream totals + DDS pick it up automatically (DDS
+        # reads `tax` which we recompute here as the sum).
+        inv_key = _mk_inv_key(inv.get("numero"), inv.get("date"), gross)
+        ov = overrides.get(inv_key) if isinstance(overrides, dict) else None
+        overridden_fields: list[str] = []
+        if isinstance(ov, dict):
+            if "rate_eff" in ov:
+                rate_eff = float(ov["rate_eff"])
+                overridden_fields.append("rate_eff")
+            if "rate_commission" in ov:
+                rate_comm = float(ov["rate_commission"])
+                overridden_fields.append("rate_commission")
+            if overridden_fields:
+                tax_das = gross * rate_eff
+                tax_commission = gross * rate_comm
+                tax_total = round(tax_das + tax_commission, 2)
+
         total_das_invoices += tax_das
         total_commission_invoices += tax_commission
         invoices_out.append({
@@ -714,7 +740,29 @@ def generate_opiu_estonia(loaded_nfs: list | None = None) -> dict:
             "rate_commission": round(rate_comm, 6),
             "numero": inv.get("numero"),
             "auto_loaded": bool(inv.get("auto_loaded")),
+            "invoice_key": inv_key,
+            "rate_overridden": overridden_fields,  # [] | ["rate_eff"] | ["rate_commission"] | both
         })
+
+    # If any per-invoice override fired, re-derive downstream totals from
+    # invoices_out so DDS KPI tiles ("После налога") and the monthly P&L
+    # table reflect the overridden rates. Without this, total_tax /
+    # total_net_client / by_month would silently keep the pre-override sums.
+    if invoices_out and any(i["rate_overridden"] for i in invoices_out):
+        total_tax = round(sum(i["tax"] for i in invoices_out), 2)
+        total_net_client = round(total_gross - total_tax, 2)
+        # Rebuild per-month aggregations from invoices_out, preserving the
+        # `count` and `das` keys the aggregation loop already set above.
+        for m in by_month:
+            by_month[m]["tax"] = 0
+            by_month[m]["net_client"] = 0
+        for inv in invoices_out:
+            m = inv["date"][:7]
+            if m in by_month:
+                by_month[m]["tax"] += inv["tax"]
+                by_month[m]["net_client"] += inv["net"]
+        # debito_estonia depends on total_net_client → recompute too.
+        debito_estonia = (saldo_inicial + total_net_client) - total_enviado
 
     # Rental income in BRL — for the profit formula. USD payments came in
     # at varied dates; here we approximate at a static FX rate (5.30) since

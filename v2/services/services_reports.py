@@ -488,6 +488,58 @@ def _load_approved_transfers(project_id: str) -> list[dict[str, Any]]:
     return out
 
 
+def make_invoice_key(numero: Any, date: Any, gross: Any) -> str:
+    """Stable identifier for an invoice row in services-reports OPiU.
+
+    NFS-e invoices always have a `numero` from the prefecture portal → use
+    it verbatim (uniqueness guaranteed by source). Baseline hardcoded rows
+    without numero → SHA1(`date|gross`) first 8 hex chars. Keys must stay
+    stable across compute_for_user invocations so per-invoice overrides
+    written by /edit-invoice-rate keep targeting the same row.
+    """
+    num = str(numero or "").strip()
+    if num:
+        return f"n:{num}"
+    import hashlib
+    d = str(date or "")[:10]
+    g = f"{float(gross or 0):.2f}"
+    h = hashlib.sha1(f"{d}|{g}".encode("utf-8")).hexdigest()[:8]
+    return f"h:{h}"
+
+
+def _load_invoice_rate_overrides(project_id: str) -> dict[str, dict[str, float]]:
+    """Per-invoice rate overrides for a services project.
+
+    Shape: `{invoice_key: {rate_eff?, rate_commission?}}`. Either field may
+    be absent — partial overrides are valid (user edits DAS% only or
+    Commission% only). Stored under `f2_services_invoice_rate_overrides_{project}`,
+    same pattern as `_load_transfer_edits`. The UI triggers a fresh fetch
+    after edit so the cache bypass is automatic.
+    """
+    try:
+        from v2.legacy.db_storage import db_load
+        raw = db_load(f"f2_services_invoice_rate_overrides_{project_id}")
+    except Exception as err:  # noqa: BLE001
+        log.warning("invoice_rate_overrides load failed for %s: %s", project_id, err)
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, float]] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not isinstance(v, dict):
+            continue
+        entry: dict[str, float] = {}
+        for field in ("rate_eff", "rate_commission"):
+            if field in v and v[field] is not None:
+                try:
+                    entry[field] = float(v[field])
+                except (TypeError, ValueError):
+                    continue
+        if entry:
+            out[k] = entry
+    return out
+
+
 def _load_operating_expenses(project_id: str) -> dict[str, Any]:
     """Pull manual operating expenses for a services project from projects_db.
 
@@ -567,7 +619,10 @@ def _validate_project(project_id: str) -> tuple[bool, Optional[str]]:
 
 
 def generate_services_pnl_sync(
-    project_id: str, *, loaded_nfs: list[dict[str, Any]] | None = None,
+    project_id: str,
+    *,
+    loaded_nfs: list[dict[str, Any]] | None = None,
+    rate_overrides: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     """Sync — the legacy generator under the hood is fully sync. Caller from
     async context wraps in `asyncio.to_thread`.
@@ -575,6 +630,11 @@ def generate_services_pnl_sync(
     `loaded_nfs` lets compute_for_user pre-load NFS-e uploads from the DB
     (Railway disk is ephemeral, so `load_all_nfse()` alone finds nothing in
     prod). When None, legacy generator falls back to disk-only scan.
+
+    `rate_overrides` — per-invoice user-edited DAS / commission rates from
+    the project record. Shape: `{invoice_key: {rate_eff?, rate_commission?}}`.
+    When None, falls back to the project-record load so legacy callers
+    (Streamlit) still pick up overrides.
     """
     ok, reason = _validate_project(project_id)
     if not ok:
@@ -582,7 +642,11 @@ def generate_services_pnl_sync(
 
     if _is_legacy_hardcoded(project_id):
         from v2.legacy.reports import generate_opiu_estonia
-        result = generate_opiu_estonia(loaded_nfs=loaded_nfs)
+        if rate_overrides is None:
+            rate_overrides = _load_invoice_rate_overrides(project_id)
+        result = generate_opiu_estonia(
+            loaded_nfs=loaded_nfs, rate_overrides=rate_overrides,
+        )
         result["_needs_config"] = False
         return result
 
@@ -786,8 +850,14 @@ async def compute_for_user(
             merged_no_num.append(rec)
     merged_nfs = list(merged_by_num.values()) + merged_no_num
 
+    # Per-invoice rate overrides (user edits in OPiU). Loaded sync since
+    # legacy_config.load_projects() is sync — cheap (single read of
+    # f2_projects user_data row) and keeps the signature clean.
+    rate_overrides = _load_invoice_rate_overrides(project_id)
+
     pnl_task = asyncio.create_task(asyncio.to_thread(
-        generate_services_pnl_sync, project_id, loaded_nfs=merged_nfs,
+        generate_services_pnl_sync, project_id,
+        loaded_nfs=merged_nfs, rate_overrides=rate_overrides,
     ))
     cf_task = asyncio.create_task(asyncio.to_thread(
         generate_services_cashflow_sync, project_id,

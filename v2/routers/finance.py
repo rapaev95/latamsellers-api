@@ -645,6 +645,133 @@ async def services_edit_transfer(
     return {"ok": True, "edits_count": len(edits)}
 
 
+_INVOICE_RATE_KEY_TEMPLATE = "f2_services_invoice_rate_overrides_{project}"
+_INVOICE_RATE_FIELDS = {"rate_eff", "rate_commission"}
+
+
+@router.post("/services-reports/edit-invoice-rate")
+async def services_edit_invoice_rate(
+    body: dict[str, Any],
+    project: str = Query(..., description="Services project ID"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Override the DAS or commission rate on a single invoice row in OPiU.
+
+    Body: `{key, patch: {rate_eff?, rate_commission?}}`. Rates are fractions
+    (0.06 = 6%, not "6"). Partial overrides allowed — sending only `rate_eff`
+    keeps the auto-computed `rate_commission`. Empty patch clears the
+    override so the row reverts to Anexo III + commission-table defaults.
+
+    Bumping a rate here recomputes tax_das / tax_commission / net for that
+    invoice, refreshes the per-month P&L breakdown, and flows into DDS
+    KPI tiles (`После налога` / `debito_estonia`).
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    if not _is_superadmin(user):
+        raise HTTPException(status_code=403, detail={"code": "superadmin_required"})
+    key = str(body.get("key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail={"error": "missing_key"})
+    raw_patch = body.get("patch") or {}
+    if not isinstance(raw_patch, dict):
+        raise HTTPException(status_code=400, detail={"error": "patch_must_be_object"})
+
+    effective_user_id = await _resolve_effective_user_for_project(pool, user, project)
+    _bind_user_id(effective_user_id)
+
+    clean: dict[str, float] = {}
+    for f, v in raw_patch.items():
+        if f not in _INVOICE_RATE_FIELDS:
+            continue
+        if v is None or v == "":
+            continue  # absent field — caller is leaving it auto-computed
+        try:
+            rv = float(v)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "bad_rate", "field": f, "value": v},
+            )
+        # Sanity bound — rates are fractions (0..1). Anything outside is
+        # almost certainly a user typo (passed 6 meaning 6% instead of 0.06).
+        if rv < 0 or rv > 1:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "rate_out_of_range", "field": f, "value": rv,
+                        "hint": "rate is a fraction; 6% → 0.06"},
+            )
+        clean[f] = rv
+
+    from v2.legacy.db_storage import db_load, db_save
+    overrides = db_load(
+        _INVOICE_RATE_KEY_TEMPLATE.format(project=project),
+        user_id=effective_user_id,
+    )
+    if not isinstance(overrides, dict):
+        overrides = {}
+    if clean:
+        # Merge with any existing override for this key so partial edits
+        # don't blow away the other field. E.g., user first sets rate_eff,
+        # then later sets rate_commission — both should stick.
+        prior = overrides.get(key) if isinstance(overrides.get(key), dict) else {}
+        merged = {**prior, **clean}
+        overrides[key] = merged
+    else:
+        overrides.pop(key, None)
+    db_save(_INVOICE_RATE_KEY_TEMPLATE.format(project=project), overrides)
+    return {"ok": True, "overrides_count": len(overrides)}
+
+
+@router.post("/services-reports/reset-invoice-rate")
+async def services_reset_invoice_rate(
+    body: dict[str, Any],
+    project: str = Query(..., description="Services project ID"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Clear an invoice's rate override so the row falls back to defaults
+    (Anexo III effective_simples + ESTONIA_COMMISSION_TABLE step function).
+
+    Body: `{key, field?}`. With `field` ∈ {rate_eff, rate_commission} —
+    clears only that field. Without `field` — drops the whole entry.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    if not _is_superadmin(user):
+        raise HTTPException(status_code=403, detail={"code": "superadmin_required"})
+    key = str(body.get("key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail={"error": "missing_key"})
+    field = str(body.get("field") or "").strip() or None
+    if field and field not in _INVOICE_RATE_FIELDS:
+        raise HTTPException(status_code=400, detail={"error": "bad_field", "field": field})
+
+    effective_user_id = await _resolve_effective_user_for_project(pool, user, project)
+    _bind_user_id(effective_user_id)
+
+    from v2.legacy.db_storage import db_load, db_save
+    overrides = db_load(
+        _INVOICE_RATE_KEY_TEMPLATE.format(project=project),
+        user_id=effective_user_id,
+    )
+    if not isinstance(overrides, dict):
+        overrides = {}
+    if field is None:
+        overrides.pop(key, None)
+    else:
+        cur = overrides.get(key)
+        if isinstance(cur, dict):
+            cur.pop(field, None)
+            if cur:
+                overrides[key] = cur
+            else:
+                overrides.pop(key, None)
+    db_save(_INVOICE_RATE_KEY_TEMPLATE.format(project=project), overrides)
+    return {"ok": True, "overrides_count": len(overrides)}
+
+
 def _dataclass_to_dict(obj: Any) -> Any:
     """Convert dataclass / nested dataclasses → dict for JSON serialisation."""
     from dataclasses import asdict, is_dataclass
