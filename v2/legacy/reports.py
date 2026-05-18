@@ -926,16 +926,16 @@ def generate_dds_estonia(
     # category=income with this project. Loaded from the same prefetched
     # transaction list compute_cashflow uses for ecom projects.
     #
-    # Dedup vs OPiU shadow invoices: generate_opiu_estonia now merges these
-    # same bank rows into invoice_lines as virtual invoices (with from_bank
-    # flag) so revenue without an NFS-e still contributes to DAS/commission
-    # and cum_gross brackets. Skip the bank tx here if its (month, gross)
-    # already appears in invoice_lines as a shadow — otherwise DDS would
-    # double-count the income row (once as shadow invoice, once as bank).
+    # Dedup vs ALL OPiU invoices (shadow OR auto_loaded NFS-e OR baseline).
+    # generate_opiu_estonia merges bank-income rows as shadow invoices, then
+    # NFS-e PDFs replace shadows with real numero'd entries. Either way, the
+    # invoice already shows in DDS via opiu.invoice_lines — listing the bank
+    # tx again as its own «🏦 ВЫПИСКА» row double-counts: user sees two rows
+    # at R$ 207.242,22 for the same Pix recebido. Match by (year-month, gross
+    # ±0.01); drop the bank tx if anything in invoice_lines covers it.
     shadow_keys: set[tuple[str, float]] = {
         (str(inv.get("date") or "")[:7], round(float(inv.get("gross") or 0), 2))
         for inv in (opiu.get("invoice_lines") or [])
-        if inv.get("from_bank")
     }
     bank_inflows: list[dict] = []
     bank_inflows_total = 0.0
