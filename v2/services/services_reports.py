@@ -664,6 +664,7 @@ def generate_services_cashflow_sync(
     *,
     include_hardcoded_outflows: bool = True,
     rate_overrides: dict[str, dict[str, float]] | None = None,
+    loaded_nfs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     ok, reason = _validate_project(project_id)
     if not ok:
@@ -677,6 +678,7 @@ def generate_services_cashflow_sync(
             include_hardcoded_outflows=include_hardcoded_outflows,
             project_id=project_id,
             rate_overrides=rate_overrides,
+            loaded_nfs=loaded_nfs,
         )
         result["_needs_config"] = False
         result["operating_expenses"] = _load_operating_expenses(project_id)
@@ -882,6 +884,7 @@ async def compute_for_user(
         generate_services_cashflow_sync, project_id,
         include_hardcoded_outflows=include_hardcoded_outflows,
         rate_overrides=rate_overrides,
+        loaded_nfs=merged_nfs,
     ))
     bal_task = asyncio.create_task(asyncio.to_thread(generate_services_balance_sync, project_id))
 
