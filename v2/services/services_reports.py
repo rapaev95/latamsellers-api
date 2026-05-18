@@ -646,6 +646,7 @@ def generate_services_pnl_sync(
             rate_overrides = _load_invoice_rate_overrides(project_id)
         result = generate_opiu_estonia(
             loaded_nfs=loaded_nfs, rate_overrides=rate_overrides,
+            project_id=project_id,
         )
         result["_needs_config"] = False
         return result

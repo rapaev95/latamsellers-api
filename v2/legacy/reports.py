@@ -362,6 +362,7 @@ def generate_balance_ecom(project: str, months: list[str] | None = None) -> dict
 def generate_opiu_estonia(
     loaded_nfs: list | None = None,
     rate_overrides: dict | None = None,
+    project_id: str = "ESTONIA",
 ) -> dict:
     """
     Generate OPiU for Estonia from OUR COMPANY perspective.
@@ -451,6 +452,56 @@ def generate_opiu_estonia(
             "auto_loaded": True,
         })
         cum_gross = cum_after
+
+    # ── Shadow invoices from bank statements (DDS «🏦 ВЫПИСКА» income rows) ──
+    # Surfaces income-classified bank inflows in OPiU as virtual invoice
+    # rows so revenue without an NFS-e PDF still counts toward DAS/commission
+    # and cum_gross brackets. Dedup vs real invoices (baseline + NFS-e) by
+    # (year-month, gross ±0.01): if a real invoice covers the payment, skip.
+    # User can drop the bank classification (or upload NFS-e) to control
+    # which representation wins.
+    try:
+        bank_agg = aggregate_classified_by_project(project_id) or {}
+    except Exception:  # noqa: BLE001 — prefetch may be unset in legacy callers
+        bank_agg = {}
+    bank_txs = bank_agg.get("transactions") or []
+    # Normalise existing invoices into (month, gross) tuples for fast dedup.
+    existing_keys = {
+        (str(inv.get("date") or "")[:7], round(float(inv.get("gross") or 0), 2))
+        for inv in invoice_lines
+    }
+    bank_candidates: list[dict] = []
+    for tx in bank_txs:
+        cat = str(tx.get("Категория") or "").lower()
+        if cat != "income":
+            continue
+        try:
+            val = float(tx.get("Valor", 0) or 0)
+        except (ValueError, TypeError):
+            val = 0
+        if val <= 0:
+            continue
+        raw_date = str(tx.get("Data") or "")
+        # Normalise DD/MM/YYYY → YYYY-MM-DD for the sort key in invoices_out.
+        iso_date = raw_date
+        m_ddmy = re.match(r"^(\d{2})/(\d{2})/(\d{2,4})", raw_date)
+        if m_ddmy:
+            d, mo, yr = m_ddmy.groups()
+            yr_full = f"20{yr}" if len(yr) == 2 else yr
+            iso_date = f"{yr_full}-{mo}-{d}"
+        gross_r = round(val, 2)
+        month = iso_date[:7]
+        if (month, gross_r) in existing_keys:
+            continue  # already covered by NFS-e / baseline invoice
+        bank_candidates.append({
+            "date": iso_date,
+            "gross": gross_r,
+            "numero": None,
+            "from_bank": True,
+            "bank_source": str(tx.get("Класс.") or tx.get("Descrição") or tx.get("Описание") or ""),
+        })
+        existing_keys.add((month, gross_r))  # avoid dup if same amount twice in same month
+    invoice_lines.extend(bank_candidates)
 
     # DAS Simples Nacional payments (already paid, from approved report)
     das_payments = [
@@ -740,6 +791,8 @@ def generate_opiu_estonia(
             "rate_commission": round(rate_comm, 6),
             "numero": inv.get("numero"),
             "auto_loaded": bool(inv.get("auto_loaded")),
+            "from_bank": bool(inv.get("from_bank")),
+            "bank_source": inv.get("bank_source") or None,
             "invoice_key": inv_key,
             "rate_overridden": overridden_fields,  # [] | ["rate_eff"] | ["rate_commission"] | both
         })
@@ -838,11 +891,23 @@ def generate_dds_estonia(
     project=project_id) so a Pix recebido tagged ESTONIA on the bank
     statement actually shows up on the ДДС instead of getting lost.
     """
-    opiu = generate_opiu_estonia()
+    opiu = generate_opiu_estonia(project_id=project_id)
 
     # Bank inflows — bank-statement rows the user classified as
     # category=income with this project. Loaded from the same prefetched
     # transaction list compute_cashflow uses for ecom projects.
+    #
+    # Dedup vs OPiU shadow invoices: generate_opiu_estonia now merges these
+    # same bank rows into invoice_lines as virtual invoices (with from_bank
+    # flag) so revenue without an NFS-e still contributes to DAS/commission
+    # and cum_gross brackets. Skip the bank tx here if its (month, gross)
+    # already appears in invoice_lines as a shadow — otherwise DDS would
+    # double-count the income row (once as shadow invoice, once as bank).
+    shadow_keys: set[tuple[str, float]] = {
+        (str(inv.get("date") or "")[:7], round(float(inv.get("gross") or 0), 2))
+        for inv in (opiu.get("invoice_lines") or [])
+        if inv.get("from_bank")
+    }
     bank_inflows: list[dict] = []
     bank_inflows_total = 0.0
     try:
@@ -857,6 +922,15 @@ def generate_dds_estonia(
                 val = 0
             if val <= 0:
                 continue
+            raw_date = str(tx.get("Data") or "")
+            iso_dt = raw_date
+            m_dd = re.match(r"^(\d{2})/(\d{2})/(\d{2,4})", raw_date)
+            if m_dd:
+                d, mo, yr = m_dd.groups()
+                yr_full = f"20{yr}" if len(yr) == 2 else yr
+                iso_dt = f"{yr_full}-{mo}-{d}"
+            if (iso_dt[:7], round(val, 2)) in shadow_keys:
+                continue  # already represented as shadow invoice in OPiU
             bank_inflows.append(tx)
             bank_inflows_total += val
     except Exception:  # noqa: BLE001 — bank prefetch missing is fine
