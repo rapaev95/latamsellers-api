@@ -772,6 +772,79 @@ async def services_reset_invoice_rate(
     return {"ok": True, "overrides_count": len(overrides)}
 
 
+_PAYMENT_KEY_TEMPLATE = "f2_services_invoice_payment_overrides_{project}"
+
+
+@router.post("/services-reports/mark-invoice-paid")
+async def services_mark_invoice_paid(
+    body: dict[str, Any],
+    project: str = Query(..., description="Services project ID"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Manually mark an invoice as paid (or pending) — overrides auto-detection.
+
+    Body: `{key, status?}`. `status` ∈ {paid, pending}; default = paid.
+    Use when a payment came outside the classified bank statement and the
+    user wants the invoice to count in «Дебит клиента» anyway.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    if not _is_superadmin(user):
+        raise HTTPException(status_code=403, detail={"code": "superadmin_required"})
+    key = str(body.get("key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail={"error": "missing_key"})
+    status = str(body.get("status") or "paid").strip().lower()
+    if status not in ("paid", "pending"):
+        raise HTTPException(status_code=400, detail={"error": "bad_status", "status": status})
+
+    effective_user_id = await _resolve_effective_user_for_project(pool, user, project)
+    _bind_user_id(effective_user_id)
+
+    from v2.legacy.db_storage import db_load, db_save
+    overrides = db_load(
+        _PAYMENT_KEY_TEMPLATE.format(project=project),
+        user_id=effective_user_id,
+    )
+    if not isinstance(overrides, dict):
+        overrides = {}
+    overrides[key] = status
+    db_save(_PAYMENT_KEY_TEMPLATE.format(project=project), overrides)
+    return {"ok": True, "overrides_count": len(overrides), "status": status}
+
+
+@router.post("/services-reports/unmark-invoice-paid")
+async def services_unmark_invoice_paid(
+    body: dict[str, Any],
+    project: str = Query(..., description="Services project ID"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Clear an invoice's payment-status override → revert to auto-detection."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    if not _is_superadmin(user):
+        raise HTTPException(status_code=403, detail={"code": "superadmin_required"})
+    key = str(body.get("key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail={"error": "missing_key"})
+
+    effective_user_id = await _resolve_effective_user_for_project(pool, user, project)
+    _bind_user_id(effective_user_id)
+
+    from v2.legacy.db_storage import db_load, db_save
+    overrides = db_load(
+        _PAYMENT_KEY_TEMPLATE.format(project=project),
+        user_id=effective_user_id,
+    )
+    if not isinstance(overrides, dict):
+        overrides = {}
+    overrides.pop(key, None)
+    db_save(_PAYMENT_KEY_TEMPLATE.format(project=project), overrides)
+    return {"ok": True, "overrides_count": len(overrides)}
+
+
 def _dataclass_to_dict(obj: Any) -> Any:
     """Convert dataclass / nested dataclasses → dict for JSON serialisation."""
     from dataclasses import asdict, is_dataclass

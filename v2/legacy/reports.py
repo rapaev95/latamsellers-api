@@ -363,6 +363,7 @@ def generate_opiu_estonia(
     loaded_nfs: list | None = None,
     rate_overrides: dict | None = None,
     project_id: str = "ESTONIA",
+    payment_overrides: dict | None = None,
 ) -> dict:
     """
     Generate OPiU for Estonia from OUR COMPANY perspective.
@@ -465,6 +466,29 @@ def generate_opiu_estonia(
     except Exception:  # noqa: BLE001 — prefetch may be unset in legacy callers
         bank_agg = {}
     bank_txs = bank_agg.get("transactions") or []
+    # Build (month, gross) set of ALL income bank-txs BEFORE the dedup step
+    # strips matched ones — invoices_out builder uses this to mark
+    # payment_status='paid' on baseline/NFS-e rows that have a real bank
+    # arrival behind them. Without this, the dedup would consume the bank
+    # tx and we'd lose the "this invoice was actually paid" signal.
+    bank_keys_for_match: set[tuple[str, float]] = set()
+    for tx in bank_txs:
+        cat = str(tx.get("Категория") or "").lower()
+        if cat != "income":
+            continue
+        try:
+            v = float(tx.get("Valor", 0) or 0)
+        except (ValueError, TypeError):
+            v = 0
+        if v <= 0:
+            continue
+        raw_d = str(tx.get("Data") or "")
+        iso = raw_d
+        m_d = re.match(r"^(\d{2})/(\d{2})/(\d{2,4})", raw_d)
+        if m_d:
+            d_, mo_, yr_ = m_d.groups()
+            iso = f"{('20' + yr_) if len(yr_) == 2 else yr_}-{mo_}-{d_}"
+        bank_keys_for_match.add((iso[:7], round(v, 2)))
     # Normalise existing invoices into (month, gross) tuples for fast dedup.
     existing_keys = {
         (str(inv.get("date") or "")[:7], round(float(inv.get("gross") or 0), 2))
@@ -800,8 +824,41 @@ def generate_opiu_estonia(
 
         total_das_invoices += tax_das
         total_commission_invoices += tax_commission
+
+        # ── Payment status: paid / pending / manual_paid ─────────────────
+        # Auto-detection rules (in order):
+        #   1. from_bank=True (shadow) → the bank tx IS the row → paid
+        #   2. (month, gross) matches an income bank tx → paid (bank arrived)
+        #   3. Baseline (no numero, not auto_loaded, not from_bank) with date
+        #      strictly BEFORE the approved-balanco cutoff 2026-03-19 → paid
+        #      (hardcoded transfers list covers everything up to that date)
+        #   4. Otherwise → pending
+        # User override (payment_overrides[inv_key]) wins over auto.
+        inv_date_str = str(inv.get("date") or "")[:10]
+        inv_month_gross = (inv_date_str[:7], gross)
+        is_shadow = bool(inv.get("from_bank"))
+        is_auto_loaded = bool(inv.get("auto_loaded"))
+        has_bank_match = inv_month_gross in bank_keys_for_match
+        is_baseline = not is_shadow and not is_auto_loaded
+        is_pre_cutoff_baseline = is_baseline and inv_date_str < "2026-03-19"
+
+        if is_shadow or has_bank_match:
+            auto_status = "paid"
+        elif is_pre_cutoff_baseline:
+            auto_status = "paid"
+        else:
+            auto_status = "pending"
+
+        override = (payment_overrides or {}).get(inv_key)
+        if override == "paid" and auto_status != "paid":
+            payment_status = "manual_paid"
+        elif override == "pending":
+            payment_status = "pending"
+        else:
+            payment_status = auto_status
+
         invoices_out.append({
-            "date": str(inv.get("date") or "")[:10],
+            "date": inv_date_str,
             "gross": gross,
             "tax": tax_total,
             "tax_das": round(tax_das, 2),
@@ -811,11 +868,12 @@ def generate_opiu_estonia(
             "rate_eff": round(rate_eff, 6),
             "rate_commission": round(rate_comm, 6),
             "numero": inv.get("numero"),
-            "auto_loaded": bool(inv.get("auto_loaded")),
-            "from_bank": bool(inv.get("from_bank")),
+            "auto_loaded": is_auto_loaded,
+            "from_bank": is_shadow,
             "bank_source": inv.get("bank_source") or None,
             "invoice_key": inv_key,
             "rate_overridden": overridden_fields,  # [] | ["rate_eff"] | ["rate_commission"] | both
+            "payment_status": payment_status,      # "paid" | "pending" | "manual_paid"
         })
 
     # Always re-derive downstream totals from invoices_out (not just when an
@@ -902,6 +960,7 @@ def generate_dds_estonia(
     project_id: str = "ESTONIA",
     rate_overrides: dict | None = None,
     loaded_nfs: list | None = None,
+    payment_overrides: dict | None = None,
 ) -> dict:
     """Generate cash flow for Estonia project from approved report.
 
@@ -920,6 +979,7 @@ def generate_dds_estonia(
         project_id=project_id,
         rate_overrides=rate_overrides,
         loaded_nfs=loaded_nfs,
+        payment_overrides=payment_overrides,
     )
 
     # Bank inflows — bank-statement rows the user classified as
@@ -995,21 +1055,36 @@ def generate_dds_estonia(
             "trafficstars_credit": 598.69 + 582.76,
         }
         total_outflows = round(sum(float(t.get("brl") or 0) for t in transfers), 2)
-        debito_estonia = round(
-            float(opiu["saldo_inicial"]) + float(opiu["total_net_client"])
-            + bank_inflows_total - total_outflows,
-            2,
-        )
     else:
-        # No hardcoded outflows — debito = saldo + invoices_net + bank_inflows
-        # (no withdrawals baked in). ApprovedDataCard rows and auto-TS
-        # transfers will be added by compute_for_user and total_outflows /
-        # debito will be recomputed there as the new entries arrive.
+        # No hardcoded outflows — ApprovedDataCard rows and auto-TS transfers
+        # will be added by compute_for_user.
         total_outflows = 0.0
-        debito_estonia = round(
-            float(opiu["saldo_inicial"]) + float(opiu["total_net_client"]) + bank_inflows_total,
-            2,
-        )
+
+    # ── Cash-basis split: paid vs pending invoices ─────────────────────────
+    # Дебит клиента считается ТОЛЬКО по paid+manual_paid инвойсам — pending
+    # (NFS-e без банковского inflow) учитываются как "future revenue", не
+    # уменьшают долг. Когда bank-inflow на эту сумму придёт — статус
+    # автоматически переключится в paid и дебит пересчитается.
+    inv_lines_ds = opiu.get("invoice_lines") or []
+    paid_invoices_net = sum(
+        float(i.get("net") or 0)
+        for i in inv_lines_ds
+        if i.get("payment_status") in ("paid", "manual_paid")
+    )
+    pending_invoices_net = sum(
+        float(i.get("net") or 0)
+        for i in inv_lines_ds
+        if i.get("payment_status") == "pending"
+    )
+    pending_invoices_gross = sum(
+        float(i.get("gross") or 0)
+        for i in inv_lines_ds
+        if i.get("payment_status") == "pending"
+    )
+    debito_estonia = round(
+        float(opiu["saldo_inicial"]) + paid_invoices_net + bank_inflows_total - total_outflows,
+        2,
+    )
 
     return {
         "inflows": {
@@ -1017,6 +1092,9 @@ def generate_dds_estonia(
             "invoices_gross": opiu["total_gross"],
             "invoices_tax": -opiu["total_tax_retained"],
             "invoices_net": opiu["total_net_client"],
+            "invoices_net_paid": round(paid_invoices_net, 2),
+            "invoices_net_pending": round(pending_invoices_net, 2),
+            "invoices_gross_pending": round(pending_invoices_gross, 2),
             "bank_inflows_total": round(bank_inflows_total, 2),
         },
         "outflows": outflows,
@@ -1025,8 +1103,9 @@ def generate_dds_estonia(
         "debito_estonia": round(float(debito_estonia), 2),
         "by_month": opiu["by_month"],
         # Per-invoice breakdown for the DDS "Поступления (инвойсы)" section.
-        # Each entry: {date, gross, tax, net, rate, numero, auto_loaded}.
-        "invoice_lines": opiu.get("invoice_lines") or [],
+        # Each entry: {date, gross, tax, net, rate, numero, auto_loaded,
+        # payment_status}.
+        "invoice_lines": inv_lines_ds,
         # Bank-statement income lines tagged with this project. UI renders
         # them as a separate "Поступления (выписка)" table below invoices.
         "bank_inflows": bank_inflows,

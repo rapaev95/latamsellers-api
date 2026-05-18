@@ -507,6 +507,29 @@ def make_invoice_key(numero: Any, date: Any, gross: Any) -> str:
     return f"h:{h}"
 
 
+def _load_invoice_payment_overrides(project_id: str) -> dict[str, str]:
+    """Per-invoice payment-status overrides set via «✓ Получено» / «↺ Снять».
+
+    Shape: `{invoice_key: 'paid' | 'pending'}`. Stored under
+    `f2_services_invoice_payment_overrides_{project}`. Applied AFTER the
+    auto-detection (bank match / baseline cutoff) so manual marks always
+    win — even on baseline rows the user wants to flag as unpaid.
+    """
+    try:
+        from v2.legacy.db_storage import db_load
+        raw = db_load(f"f2_services_invoice_payment_overrides_{project_id}")
+    except Exception as err:  # noqa: BLE001
+        log.warning("invoice_payment_overrides load failed for %s: %s", project_id, err)
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        if isinstance(k, str) and isinstance(v, str) and v in ("paid", "pending"):
+            out[k] = v
+    return out
+
+
 def _load_invoice_rate_overrides(project_id: str) -> dict[str, dict[str, float]]:
     """Per-invoice rate overrides for a services project.
 
@@ -623,6 +646,7 @@ def generate_services_pnl_sync(
     *,
     loaded_nfs: list[dict[str, Any]] | None = None,
     rate_overrides: dict[str, dict[str, float]] | None = None,
+    payment_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Sync — the legacy generator under the hood is fully sync. Caller from
     async context wraps in `asyncio.to_thread`.
@@ -644,9 +668,11 @@ def generate_services_pnl_sync(
         from v2.legacy.reports import generate_opiu_estonia
         if rate_overrides is None:
             rate_overrides = _load_invoice_rate_overrides(project_id)
+        if payment_overrides is None:
+            payment_overrides = _load_invoice_payment_overrides(project_id)
         result = generate_opiu_estonia(
             loaded_nfs=loaded_nfs, rate_overrides=rate_overrides,
-            project_id=project_id,
+            project_id=project_id, payment_overrides=payment_overrides,
         )
         result["_needs_config"] = False
         return result
@@ -665,6 +691,7 @@ def generate_services_cashflow_sync(
     include_hardcoded_outflows: bool = True,
     rate_overrides: dict[str, dict[str, float]] | None = None,
     loaded_nfs: list[dict[str, Any]] | None = None,
+    payment_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     ok, reason = _validate_project(project_id)
     if not ok:
@@ -674,11 +701,14 @@ def generate_services_cashflow_sync(
         from v2.legacy.reports import generate_dds_estonia
         if rate_overrides is None:
             rate_overrides = _load_invoice_rate_overrides(project_id)
+        if payment_overrides is None:
+            payment_overrides = _load_invoice_payment_overrides(project_id)
         result = generate_dds_estonia(
             include_hardcoded_outflows=include_hardcoded_outflows,
             project_id=project_id,
             rate_overrides=rate_overrides,
             loaded_nfs=loaded_nfs,
+            payment_overrides=payment_overrides,
         )
         result["_needs_config"] = False
         result["operating_expenses"] = _load_operating_expenses(project_id)
@@ -704,7 +734,11 @@ def generate_services_cashflow_sync(
             #                             + bank_inflows_total − total_outflows.
             inflows = result.get("inflows") or {}
             saldo = float(inflows.get("saldo_inicial") or 0)
-            net = float(inflows.get("invoices_net") or 0)
+            # Cash-basis: count only paid + manual_paid invoices in debit.
+            # `invoices_net_paid` is published by generate_dds_estonia after
+            # status detection. Fallback to total net for backward compat
+            # when the older shape (without _paid split) is still in cache.
+            net = float(inflows.get("invoices_net_paid", inflows.get("invoices_net") or 0) or 0)
             bank_in = float(inflows.get("bank_inflows_total") or 0)
             result["debito_estonia"] = round(saldo + net + bank_in - new_total, 2)
 
@@ -863,6 +897,9 @@ async def compute_for_user(
     # legacy_config.load_projects() is sync — cheap (single read of
     # f2_projects user_data row) and keeps the signature clean.
     rate_overrides = _load_invoice_rate_overrides(project_id)
+    # Per-invoice payment_status overrides (Sprint 23) — manual «✓ Получено»
+    # marks. Loaded here once so PNL + CF tasks reuse the same dict.
+    payment_overrides = _load_invoice_payment_overrides(project_id)
     # Diagnostic — surface effective_user_id + loaded override map in the
     # response so we can verify save/load is on the same user namespace.
     try:
@@ -879,12 +916,14 @@ async def compute_for_user(
     pnl_task = asyncio.create_task(asyncio.to_thread(
         generate_services_pnl_sync, project_id,
         loaded_nfs=merged_nfs, rate_overrides=rate_overrides,
+        payment_overrides=payment_overrides,
     ))
     cf_task = asyncio.create_task(asyncio.to_thread(
         generate_services_cashflow_sync, project_id,
         include_hardcoded_outflows=include_hardcoded_outflows,
         rate_overrides=rate_overrides,
         loaded_nfs=merged_nfs,
+        payment_overrides=payment_overrides,
     ))
     bal_task = asyncio.create_task(asyncio.to_thread(generate_services_balance_sync, project_id))
 
@@ -921,7 +960,7 @@ async def compute_for_user(
                 cf["total_outflows"] = round(float(cf.get("total_outflows") or 0) + extra_brl, 2)
                 inflows = cf.get("inflows") or {}
                 saldo = float(inflows.get("saldo_inicial") or 0)
-                net = float(inflows.get("invoices_net") or 0)
+                net = float(inflows.get("invoices_net_paid", inflows.get("invoices_net") or 0) or 0)
                 bank_in = float(inflows.get("bank_inflows_total") or 0)
                 cf["debito_estonia"] = round(saldo + net + bank_in - cf["total_outflows"], 2)
         # Sort the full transfers list chronologically and renumber. Without
@@ -969,7 +1008,7 @@ async def compute_for_user(
                 cf["total_outflows"] = round(sum(float(t.get("brl") or 0) for t in visible), 2)
                 inflows = cf.get("inflows") or {}
                 saldo = float(inflows.get("saldo_inicial") or 0)
-                net = float(inflows.get("invoices_net") or 0)
+                net = float(inflows.get("invoices_net_paid", inflows.get("invoices_net") or 0) or 0)
                 bank_in = float(inflows.get("bank_inflows_total") or 0)
                 cf["debito_estonia"] = round(saldo + net + bank_in - cf["total_outflows"], 2)
     try:
