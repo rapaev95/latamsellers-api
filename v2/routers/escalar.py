@@ -6295,6 +6295,104 @@ async def publish_categories_predict(
     return {"site_id": site_id, "results": results}
 
 
+@router.post("/publish/categories/from-url")
+async def publish_categories_from_url(
+    body: dict = Body(...),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Resolve category from an existing ML listing URL or item_id.
+
+    Use-case: predictor fails on generic xProd descriptions. User finds a
+    similar product on mercadolivre.com.br, copies the URL, pastes here →
+    we extract the category from THAT item.
+
+    Body: { "input": "https://produto.mercadolivre.com.br/MLB-12345-..." }
+       or { "input": "MLB12345" }
+    Returns: { category_id, category_name, domain_id, source_item }
+    """
+    raw = (body.get("input") or body.get("url") or body.get("item_id") or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail={"error": "missing_input"})
+
+    # Extract MLB-id from any of these shapes:
+    #   MLB1234567890
+    #   MLB-1234567890
+    #   https://produto.mercadolivre.com.br/MLB-1234567890-title-_JM
+    #   https://www.mercadolivre.com.br/.../-/MLB-1234567890
+    #   https://articulo.mercadolibre.com.ar/MLA-1234567890-...
+    import re as _re
+    m = _re.search(r"ML[A-Z][-]?(\d{6,})", raw, _re.IGNORECASE)
+    if not m:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "no_mlb_id_found",
+                    "hint": "Send ML product URL or MLB12345... id."},
+        )
+    item_id = (m.group(0)).upper().replace("-", "")
+    # Normalise to canonical (e.g. «MLB-1234» → «MLB1234»)
+
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    try:
+        access_token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "ml_oauth_required", "message": str(err)},
+        )
+
+    async with httpx.AsyncClient() as http:
+        r = await http.get(
+            f"https://api.mercadolibre.com/items/{item_id}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=15.0,
+        )
+    if r.status_code != 200:
+        body_preview = None
+        try:
+            body_preview = r.json()
+        except Exception:  # noqa: BLE001
+            body_preview = {"raw": r.text[:300]}
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "ml_item_fetch_failed",
+                    "status": r.status_code, "item_id": item_id,
+                    "body": body_preview},
+        )
+    item = r.json() or {}
+    category_id = item.get("category_id")
+    if not category_id:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "no_category_in_item", "item_id": item_id},
+        )
+
+    # Bonus: resolve category name + domain via our cache.
+    await ml_categories_svc.ensure_schema(pool)
+    try:
+        async with httpx.AsyncClient() as http2:
+            cat = await ml_categories_svc.get_category(
+                pool, http2, access_token, category_id,
+            )
+    except Exception:  # noqa: BLE001
+        cat = {"name": None, "domain_id": None}
+
+    return {
+        "category_id": category_id,
+        "category_name": cat.get("name"),
+        "domain_id": cat.get("domain_id"),
+        "source_item": {
+            "id": item.get("id"),
+            "title": item.get("title"),
+            "permalink": item.get("permalink"),
+            "seller_id": item.get("seller_id"),
+            "thumbnail": item.get("thumbnail"),
+            "price": item.get("price"),
+        },
+    }
+
+
 @router.get("/publish/categories/{category_id}")
 async def publish_categories_get(
     category_id: str,
