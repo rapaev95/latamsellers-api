@@ -880,6 +880,10 @@ async def compute_for_user(
 
     try:
         out["pnl"] = await pnl_task
+        # Lift the generator-internal diag up to the bundle level so it
+        # survives the ServicesPnlOut extra=ignore filter.
+        if isinstance(out["pnl"], dict):
+            out["diag_inside_gen"] = out["pnl"].get("_diag_inside_gen")
     except Exception as err:  # noqa: BLE001
         out["pnl_error"] = f"{type(err).__name__}: {err}"
     try:
