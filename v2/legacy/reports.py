@@ -753,6 +753,14 @@ def generate_opiu_estonia(
     total_das_invoices = 0.0
     total_commission_invoices = 0.0
     overrides = rate_overrides or {}
+    # Diagnostic — verify the override map is what we think it is at this
+    # point in the call chain. Remove once Sprint 21 override flow is
+    # confirmed working end-to-end on prod.
+    _diag_inside_gen = {
+        "overrides_type": type(overrides).__name__,
+        "overrides_keys": list(overrides.keys()) if isinstance(overrides, dict) else None,
+        "overrides_raw": overrides if isinstance(overrides, dict) else None,
+    }
     for inv in invoices_sorted_raw:
         gross = round(float(inv.get("gross") or 0), 2)
         running_cum += gross
@@ -884,6 +892,8 @@ def generate_opiu_estonia(
         "cumulative_gross": total_gross,
         # Monthly
         "by_month": by_month,
+        # Transient diag — Sprint 21 override flow
+        "_diag_inside_gen": _diag_inside_gen,
     }
 
 
