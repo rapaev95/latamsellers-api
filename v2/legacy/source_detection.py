@@ -139,6 +139,14 @@ def detect_source_from_filename(filename: str) -> Optional[str]:
     if "nfs" in fname or "nfse" in fname or fname.startswith("nf "):
         return "nfse_shps"
 
+    # NFS-e chave de acesso — 44 or 50 digit numeric .pdf (SEFAZ download).
+    # Some prefectures auto-name DANFSe PDFs with the access key only;
+    # other clues are usually absent. Match conservatively (PDF only).
+    if fname.endswith(".pdf"):
+        stem = fname.rsplit(".", 1)[0]
+        if stem.isdigit() and len(stem) in (44, 50):
+            return "nfse_shps"
+
     return None
 
 
