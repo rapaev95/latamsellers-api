@@ -28,6 +28,14 @@ from v2.services import (
     nf_drafts as nf_drafts_svc,
     nf_parser as nf_parser_svc,
     ml_categories as ml_categories_svc,
+    ml_category_attributes as ml_attrs_svc,
+    ml_grid_charts as ml_grid_svc,
+    nf_publishing_plans as nf_plans_svc,
+    ml_sale_terms as ml_sale_terms_svc,
+    ml_listing_types as ml_listing_types_svc,
+    ml_publisher as ml_publisher_svc,
+    ml_description_llm as ml_desc_svc,
+    ml_bulk_actions as ml_bulk_svc,
     ml_quality as ml_quality_svc,
     ml_scraper_chat as ml_scraper_chat_svc,
     daily_summary_dispatch as daily_summary_dispatch_svc,
@@ -6317,6 +6325,743 @@ async def publish_categories_get(
         raise HTTPException(
             status_code=502,
             detail={"error": "ml_category_failed",
+                    "status": err.response.status_code if err.response else None},
+        )
+    return out
+
+
+# ─── Publish flow: bulk post-publication actions (Sprint 8) ───────────────
+
+
+@router.post("/publish/items/bulk-action")
+async def publish_items_bulk_action(
+    body: dict = Body(...),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Run a batch action across one or more published items.
+
+    Body: {
+      action: 'pause'|'activate'|'close'|'change_qty'|'change_price',
+      item_ids: ['MLB123', ...],
+      payload?: {amount?, qty?, currency_id?, channel?, by_item?: {ID: {...}}},
+      managed_account_id?: int
+    }
+
+    Returns: {action, totals: {success, error}, results: [...]}
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    action = body.get("action")
+    item_ids = body.get("item_ids") or []
+    if action not in ml_bulk_svc.ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_action", "allowed": sorted(ml_bulk_svc.ACTIONS)},
+        )
+    if not isinstance(item_ids, list) or not item_ids:
+        raise HTTPException(status_code=400, detail={"error": "missing_item_ids"})
+
+    # Token resolution mirrors the publish endpoint.
+    managed_account_id = body.get("managed_account_id")
+    if managed_account_id:
+        try:
+            from v2.services import ml_managed_accounts as _mgr
+            token, *_ = await _mgr.get_valid_access_token(pool, int(managed_account_id))
+        except Exception as err:  # noqa: BLE001
+            raise HTTPException(
+                status_code=401,
+                detail={"error": "managed_oauth_failed", "message": str(err)},
+            )
+    else:
+        try:
+            token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+        except ml_oauth_svc.MLRefreshError as err:
+            raise HTTPException(
+                status_code=401,
+                detail={"error": "ml_oauth_required", "message": str(err)},
+            )
+
+    return await ml_bulk_svc.run_bulk(
+        token=token,
+        item_ids=[str(x) for x in item_ids],
+        action=action,
+        payload=body.get("payload") or {},
+    )
+
+
+# ─── Publish flow: LLM description generator (Sprint 7) ───────────────────
+
+
+@router.post("/publish/description/generate")
+async def publish_description_generate(
+    body: dict = Body(...),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """LLM description generator for a family.
+
+    Body: { family_name, brand?, model?, cores?: [...], tamanhos?: [...],
+            keywords?: [...], supplier_text?: str, extra_attrs?: {k: v} }
+    Returns: { description, model, usage } or { error, status }.
+
+    `supplier_text` is the plain-text extract of the supplier doc the user
+    uploaded. The frontend can also send the raw textarea content if the
+    user typed it themselves. Either way, the LLM produces a clean pt_BR
+    body up to 1500 chars.
+    """
+    family_name = (body.get("family_name") or "").strip()
+    if not family_name:
+        raise HTTPException(status_code=400, detail={"error": "missing_family_name"})
+    result = await ml_desc_svc.generate_description(
+        pool,
+        ls_user_id=user.id,
+        family_name=family_name,
+        brand=body.get("brand"),
+        model=body.get("model"),
+        cores=body.get("cores") or [],
+        tamanhos=body.get("tamanhos") or [],
+        keywords=body.get("keywords") or [],
+        supplier_text=body.get("supplier_text"),
+        extra_attrs=body.get("extra_attrs") or {},
+    )
+    if result.get("error"):
+        # Pass-through with appropriate HTTP code.
+        st = int(result.get("status") or 502)
+        raise HTTPException(status_code=st, detail=result)
+    return result
+
+
+# ─── Publish flow: publish to ML (Sprint 7) ───────────────────────────────
+
+
+@router.post("/publish/plans/{plan_id}/publish")
+async def publish_plan_publish(
+    plan_id: int,
+    body: dict = Body(default_factory=dict),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Bulk-publish all Items derived from a saved plan.
+
+    Body (optional):
+      { only_up_ids: ["f-1-0-0", ...],         // retry subset; omit = all
+        managed_account_id: int }              // route to managed token
+
+    Returns:
+      { plan_id, totals: {success, warning, error, skipped}, items: [...] }
+
+    Each Item attempt is logged to nf_publishing_attempts. UI polls (or
+    just re-renders after this call returns since we publish sequentially
+    and the call may take 30+ seconds for large plans).
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await nf_plans_svc.ensure_schema(pool)
+    plan = await nf_plans_svc.get_plan(pool, user.id, plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail={"error": "plan_not_found"})
+
+    state = plan.get("state_json") or {}
+    if isinstance(state, str):
+        try:
+            state = json.loads(state)
+        except Exception:  # noqa: BLE001
+            state = {}
+    preview = nf_plans_svc.build_plan_preview(state)
+    items = preview.get("items") or []
+    if not items:
+        return {"plan_id": plan_id, "totals": {"success": 0, "warning": 0,
+                "error": 0, "skipped": 0}, "items": []}
+
+    only = body.get("only_up_ids")
+    only_set: Optional[set[str]] = None
+    if isinstance(only, list) and only:
+        only_set = {str(x) for x in only}
+
+    # Token resolution: managed_account_id branch or self.
+    managed_account_id = body.get("managed_account_id")
+    token: Optional[str] = None
+    if managed_account_id:
+        try:
+            from v2.services import ml_managed_accounts as _mgr
+            token, *_ = await _mgr.get_valid_access_token(pool, int(managed_account_id))
+        except Exception as err:  # noqa: BLE001
+            raise HTTPException(
+                status_code=401,
+                detail={"error": "managed_oauth_failed", "message": str(err)},
+            )
+    else:
+        try:
+            token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+        except ml_oauth_svc.MLRefreshError as err:
+            raise HTTPException(
+                status_code=401,
+                detail={"error": "ml_oauth_required", "message": str(err)},
+            )
+
+    result = await ml_publisher_svc.publish_plan_items(
+        pool,
+        token=token,
+        plan_id=plan_id,
+        items=items,
+        only_up_ids=only_set,
+    )
+    return result
+
+
+@router.get("/publish/plans/{plan_id}/attempts")
+async def publish_plan_attempts(
+    plan_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """List nf_publishing_attempts for a plan. UI uses this for retry UX +
+    history."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    plan = await nf_plans_svc.get_plan(pool, user.id, plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail={"error": "plan_not_found"})
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, family_id, up_id, ml_item_id, status, http_status,
+                   cause_array, created_at
+            FROM nf_publishing_attempts
+            WHERE plan_id = $1
+            ORDER BY created_at DESC
+            """,
+            plan_id,
+        )
+    return {
+        "plan_id": plan_id,
+        "attempts": [dict(r) for r in rows],
+    }
+
+
+# ─── Publish flow: sale_terms / listing_types / pictures (Sprint 6) ───────
+
+
+@router.get("/publish/categories/{category_id}/sale-terms")
+async def publish_categories_sale_terms(
+    category_id: str,
+    bypass_cache: bool = Query(False),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Cached fetch of /categories/{id}/sale_terms.
+
+    Returns `{category_id, sale_terms, cache_hit, fetched_at}`. TTL 7d.
+    The frontend builds the SaleTermsSection form from this list.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await ml_sale_terms_svc.ensure_schema(pool)
+    try:
+        access_token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "ml_oauth_required", "message": str(err)},
+        )
+    try:
+        async with httpx.AsyncClient() as http:
+            out = await ml_sale_terms_svc.get_sale_terms(
+                pool, http, access_token, category_id, bypass_cache=bypass_cache,
+            )
+    except httpx.HTTPStatusError as err:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "ml_sale_terms_failed",
+                    "status": err.response.status_code if err.response else None},
+        )
+    return out
+
+
+@router.get("/publish/categories/{category_id}/listing-types")
+async def publish_categories_listing_types(
+    category_id: str,
+    site_id: str = Query("MLB"),
+    bypass_cache: bool = Query(False),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Listing types + commissions for THIS seller in THIS category.
+
+    Combines /users/{seller}/available_listing_types + /sites/{site}/listing_types/{id}
+    into a single payload so the UI can render Premium/Clássico cards with
+    the correct commission %.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await ml_listing_types_svc.ensure_schema(pool)
+    try:
+        access_token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "ml_oauth_required", "message": str(err)},
+        )
+    tokens = await ml_oauth_svc.load_user_tokens(pool, user.id)
+    ml_user_id = (tokens or {}).get("ml_user_id")
+    if not ml_user_id:
+        raise HTTPException(status_code=400, detail={"error": "no_ml_user_id"})
+    try:
+        async with httpx.AsyncClient() as http:
+            out = await ml_listing_types_svc.get_listing_types(
+                pool, http, access_token,
+                site_id=site_id, category_id=category_id,
+                ml_user_id=int(ml_user_id),
+                bypass_cache=bypass_cache,
+            )
+    except httpx.HTTPStatusError as err:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "ml_listing_types_failed",
+                    "status": err.response.status_code if err.response else None},
+        )
+    return out
+
+
+@router.post("/publish/pictures/upload")
+async def publish_pictures_upload(
+    file: UploadFile = File(..., description="Image JPG/PNG ≤ 10MB"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Upload an image to ML's /pictures/items/upload and return the public URLs.
+
+    The image URL is then attached to a UP / Item via `pictures: [{source: url}]`
+    when we POST /items in Sprint 7. We do NOT bind it to a specific item now —
+    the URL is item-agnostic for 24h, plenty for the wizard flow.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail={"error": "empty_file"})
+    if len(file_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail={"error": "file_too_large", "max_mb": 10},
+        )
+    try:
+        access_token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "ml_oauth_required", "message": str(err)},
+        )
+
+    async with httpx.AsyncClient(timeout=60.0) as http:
+        files = {"file": (file.filename or "image.jpg",
+                          file_bytes, file.content_type or "image/jpeg")}
+        r = await http.post(
+            "https://api.mercadolibre.com/pictures/items/upload",
+            files=files,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+    body: Any
+    try:
+        body = r.json()
+    except Exception:  # noqa: BLE001
+        body = {"raw": r.text[:500]}
+    if r.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "ml_picture_upload_failed",
+                    "status": r.status_code, "body": body},
+        )
+    # Normalise the URL shape — ML returns a richly-nested response.
+    variations = (body or {}).get("variations") or []
+    pic_id = (body or {}).get("id")
+    secure_url = None
+    for v in variations:
+        if isinstance(v, dict) and v.get("secure_url"):
+            secure_url = v["secure_url"]
+            break
+    return {
+        "id": pic_id,
+        "secure_url": secure_url,
+        "variations": variations,
+        "ml_response": body,
+    }
+
+
+# ─── Publish flow: publishing plans (UPTIN — Sprint 5) ────────────────────
+
+
+@router.post("/publish/plans/auto-group")
+async def publish_plans_auto_group(
+    body: dict = Body(...),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Greedy NCM + xProd-similarity bucketing.
+
+    Body: { lines: [{ n_item, ncm, description }] , similarity?: 0.55 }
+    Returns: { groups: [[n_item, n_item, ...], ...] }.
+
+    Stateless helper — UI calls once when entering the grouping step;
+    the user can then reshape the suggestion manually.
+    """
+    lines = body.get("lines") or []
+    if not isinstance(lines, list) or not lines:
+        return {"groups": []}
+    threshold = float(body.get("similarity") or 0.55)
+    groups = nf_plans_svc.auto_group_lines(lines, similarity_threshold=threshold)
+    return {"groups": groups}
+
+
+@router.post("/publish/plans")
+async def publish_plans_upsert(
+    body: dict = Body(...),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Create or update a publishing plan.
+
+    Body: { plan_id?: int, draft_id?: uuid, nf_upload_id?: int, state: {...} }
+    Returns: { plan: {...row...} }
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    state = body.get("state") or {}
+    if not isinstance(state, dict):
+        raise HTTPException(status_code=400, detail={"error": "state_must_be_object"})
+    await nf_plans_svc.ensure_schema(pool)
+    try:
+        plan = await nf_plans_svc.upsert_plan(
+            pool,
+            ls_user_id=user.id,
+            draft_id=body.get("draft_id"),
+            nf_upload_id=body.get("nf_upload_id"),
+            state=state,
+            plan_id=body.get("plan_id"),
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail={"error": "plan_not_found"})
+    return {"plan": plan}
+
+
+@router.get("/publish/plans/{plan_id}")
+async def publish_plans_get(
+    plan_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await nf_plans_svc.ensure_schema(pool)
+    plan = await nf_plans_svc.get_plan(pool, user.id, plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail={"error": "plan_not_found"})
+    return {"plan": plan}
+
+
+@router.post("/publish/plans/preview")
+async def publish_plans_preview(
+    body: dict = Body(...),
+    user: CurrentUser = Depends(current_user),
+):
+    """Builds the flat Item-body preview from a (possibly unsaved) state.
+
+    Body: { state: {...full plan state...} }
+    Returns: { site_id, families_count, items_count, total_quantity, items: [...] }
+    """
+    state = body.get("state") or {}
+    if not isinstance(state, dict):
+        raise HTTPException(status_code=400, detail={"error": "state_must_be_object"})
+    return nf_plans_svc.build_plan_preview(state)
+
+
+# ─── Publish flow: grids (tabela de medidas) ──────────────────────────────
+
+
+@router.get("/publish/grids/active-domains")
+async def publish_grids_active_domains(
+    site_id: str = Query("MLB", min_length=2, max_length=4),
+    bypass_cache: bool = Query(False),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Domains on `site_id` that support tabela de medidas. Cached 7d.
+    UI uses this to decide whether to show the GridTemplatePicker at all
+    for the line's domain."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await ml_grid_svc.ensure_schema(pool)
+    try:
+        access_token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "ml_oauth_required", "message": str(err)},
+        )
+    try:
+        async with httpx.AsyncClient() as http:
+            out = await ml_grid_svc.get_active_domains(
+                pool, http, access_token, site_id, bypass_cache=bypass_cache,
+            )
+    except httpx.HTTPStatusError as err:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "ml_active_domains_failed",
+                    "status": err.response.status_code if err.response else None},
+        )
+    return out
+
+
+@router.post("/publish/grids/find-for-listing")
+async def publish_grids_find_for_listing(
+    body: dict = Body(...),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """BRAND-first then STANDARD chart lookup for a listing.
+
+    Body: { site_id?, domain_id, known_attributes?: [{id,value_id,value_name}] }
+    Returns: { suggestion?: {chart, type}, brand: {...}, standard: {...} }.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    site_id = (body.get("site_id") or "MLB").upper()
+    domain_id = body.get("domain_id")
+    if not domain_id:
+        raise HTTPException(status_code=400, detail={"error": "missing_domain_id"})
+    await ml_grid_svc.ensure_schema(pool)
+    try:
+        access_token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "ml_oauth_required", "message": str(err)},
+        )
+    tokens = await ml_oauth_svc.load_user_tokens(pool, user.id)
+    seller_id = (tokens or {}).get("ml_user_id")
+
+    try:
+        async with httpx.AsyncClient() as http:
+            out = await ml_grid_svc.find_chart_for_listing(
+                pool, http, access_token,
+                site_id=site_id,
+                domain_id=domain_id,
+                known_attributes=body.get("known_attributes") or [],
+                seller_id=seller_id,
+            )
+    except httpx.HTTPStatusError as err:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "ml_find_chart_failed",
+                    "status": err.response.status_code if err.response else None,
+                    "ml_body": (err.response.text[:300] if err.response else None)},
+        )
+    return out
+
+
+@router.post("/publish/grids/spec")
+async def publish_grids_spec(
+    body: dict = Body(...),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Fetch SPECIFIC-chart creation schema (which measurements + units the
+    user must fill in per size row).
+
+    Body: { site_id?, domain_id, known_attributes?: [{id, value_id?, value_name?}] }
+    Returns: ML's raw response body (used by SpecificChartEditor UI).
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    site_id = (body.get("site_id") or "MLB").upper()
+    domain_id = body.get("domain_id")
+    if not domain_id:
+        raise HTTPException(status_code=400, detail={"error": "missing_domain_id"})
+    try:
+        access_token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "ml_oauth_required", "message": str(err)},
+        )
+    tokens = await ml_oauth_svc.load_user_tokens(pool, user.id)
+    seller_id = (tokens or {}).get("ml_user_id")
+    try:
+        async with httpx.AsyncClient() as http:
+            out = await ml_grid_svc.fetch_chart_spec(
+                http, access_token,
+                domain_id=domain_id, site_id=site_id,
+                known_attributes=body.get("known_attributes") or [],
+                seller_id=seller_id,
+            )
+    except httpx.HTTPStatusError as err:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "ml_chart_spec_failed",
+                    "status": err.response.status_code if err.response else None,
+                    "body_preview": (err.response.text[:300] if err.response else None)},
+        )
+    return out
+
+
+@router.post("/publish/grids")
+async def publish_grids_create(
+    body: dict = Body(...),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Create a SPECIFIC chart. Body must already match ML's expected shape
+    (the SpecificChartEditor builds it from the spec + user inputs).
+
+    Bust the search cache for this (site, domain) so the picker sees the
+    fresh chart immediately.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    if not isinstance(body, dict) or not body:
+        raise HTTPException(status_code=400, detail={"error": "empty_body"})
+    try:
+        access_token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "ml_oauth_required", "message": str(err)},
+        )
+    async with httpx.AsyncClient() as http:
+        result = await ml_grid_svc.create_chart(http, access_token, body=body)
+
+    if result.get("http_status", 0) >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "ml_chart_create_failed",
+                    "status": result["http_status"], "body": result.get("body")},
+        )
+
+    # Best-effort cache bust so the next find_for_listing sees the new chart.
+    try:
+        domain_id = body.get("domain_id")
+        site_id = (body.get("site_id") or "MLB").upper()
+        if domain_id:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """DELETE FROM ml_grid_charts_search
+                       WHERE site_id = $1 AND domain_id = $2""",
+                    site_id, domain_id,
+                )
+    except Exception:  # noqa: BLE001
+        pass
+
+    return result
+
+
+@router.get("/publish/grids/{chart_id}")
+async def publish_grids_get(
+    chart_id: str,
+    bypass_cache: bool = Query(False),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Full chart payload including rows (SIZE_GRID_ROW_ID candidates)."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await ml_grid_svc.ensure_schema(pool)
+    try:
+        access_token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "ml_oauth_required", "message": str(err)},
+        )
+    try:
+        async with httpx.AsyncClient() as http:
+            out = await ml_grid_svc.get_chart_details(
+                pool, http, access_token, chart_id, bypass_cache=bypass_cache,
+            )
+    except httpx.HTTPStatusError as err:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "ml_chart_details_failed",
+                    "status": err.response.status_code if err.response else None},
+        )
+    return out
+
+
+# ─── Publish flow: category attributes (dynamic form schema) ──────────────
+
+
+@router.get("/publish/categories/{category_id}/attributes")
+async def publish_categories_attributes(
+    category_id: str,
+    bypass_cache: bool = Query(False),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Cached fetch of /categories/{id}/attributes — the per-category
+    «ficha técnica» that drives the dynamic form renderer.
+
+    Returns `{category_id, attributes, required_ids, cache_hit, fetched_at}`.
+    TTL 24h. The frontend rendering branch is in `lib/escalar/attribute-tags.ts`.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await ml_attrs_svc.ensure_schema(pool)
+    try:
+        access_token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "ml_oauth_required", "message": str(err)},
+        )
+    try:
+        async with httpx.AsyncClient() as http:
+            out = await ml_attrs_svc.get_attributes(
+                pool, http, access_token, category_id, bypass_cache=bypass_cache,
+            )
+    except httpx.HTTPStatusError as err:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "ml_attributes_failed",
+                    "status": err.response.status_code if err.response else None},
+        )
+    return out
+
+
+@router.post("/publish/domains/{domain_id}/attributes/{attribute_id}/top-values")
+async def publish_domain_attribute_top_values(
+    domain_id: str,
+    attribute_id: str,
+    body: dict = Body(default_factory=dict),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Top values for a domain attribute — autocomplete source for BrandPicker
+    and similar list-typed inputs.
+
+    `body` may contain `known_attributes` for context-narrowed suggestions
+    (e.g. MODEL filtered by a chosen BRAND).
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    try:
+        access_token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+    except ml_oauth_svc.MLRefreshError as err:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "ml_oauth_required", "message": str(err)},
+        )
+    try:
+        async with httpx.AsyncClient() as http:
+            out = await ml_attrs_svc.fetch_top_values(
+                http, access_token,
+                domain_id=domain_id,
+                attribute_id=attribute_id,
+                body=body,
+            )
+    except httpx.HTTPStatusError as err:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "ml_top_values_failed",
                     "status": err.response.status_code if err.response else None},
         )
     return out
