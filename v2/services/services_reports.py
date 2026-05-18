@@ -855,6 +855,18 @@ async def compute_for_user(
     # legacy_config.load_projects() is sync — cheap (single read of
     # f2_projects user_data row) and keeps the signature clean.
     rate_overrides = _load_invoice_rate_overrides(project_id)
+    # Diagnostic — surface effective_user_id + loaded override map in the
+    # response so we can verify save/load is on the same user namespace.
+    try:
+        from v2.legacy.db_storage import _current_user_id as _legacy_uid  # noqa: SLF001
+        _diag_uid = _legacy_uid()
+    except Exception:  # noqa: BLE001
+        _diag_uid = None
+    out["_diag_overrides"] = {
+        "user_id_bound": _diag_uid,
+        "user_id_arg": user_id,
+        "rate_overrides_loaded": rate_overrides,
+    }
 
     pnl_task = asyncio.create_task(asyncio.to_thread(
         generate_services_pnl_sync, project_id,
