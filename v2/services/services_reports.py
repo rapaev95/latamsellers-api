@@ -862,7 +862,7 @@ async def compute_for_user(
         _diag_uid = _legacy_uid()
     except Exception:  # noqa: BLE001
         _diag_uid = None
-    out["_diag_overrides"] = {
+    out["diag_overrides"] = {
         "user_id_bound": _diag_uid,
         "user_id_arg": user_id,
         "rate_overrides_loaded": rate_overrides,

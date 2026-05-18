@@ -1112,7 +1112,7 @@ class ServicesBalanceOut(BaseModel):
 
 class ServicesReportsBundleOut(BaseModel):
     """Single endpoint returns three sub-reports + per-tab errors."""
-    model_config = {"populate_by_name": True}
+    model_config = {"populate_by_name": True, "extra": "allow"}
 
     project: str
     period: dict[str, Optional[str]]                  # {"from", "to"}
@@ -1122,3 +1122,4 @@ class ServicesReportsBundleOut(BaseModel):
     cashflow_error: Optional[str] = None
     balance: Optional[ServicesBalanceOut] = None
     balance_error: Optional[str] = None
+    diag_overrides: Optional[dict[str, Any]] = None  # transient diag — remove once override loader verified
