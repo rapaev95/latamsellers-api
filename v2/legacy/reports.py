@@ -1071,6 +1071,11 @@ def generate_dds_estonia(
         for i in inv_lines_ds
         if i.get("payment_status") in ("paid", "manual_paid")
     )
+    paid_invoices_gross = sum(
+        float(i.get("gross") or 0)
+        for i in inv_lines_ds
+        if i.get("payment_status") in ("paid", "manual_paid")
+    )
     pending_invoices_net = sum(
         float(i.get("net") or 0)
         for i in inv_lines_ds
@@ -1089,7 +1094,8 @@ def generate_dds_estonia(
     return {
         "inflows": {
             "saldo_inicial": opiu["saldo_inicial"],
-            "invoices_gross": opiu["total_gross"],
+            "invoices_gross": opiu["total_gross"],               # accrual: ВСЕ инвойсы
+            "invoices_gross_paid": round(paid_invoices_gross, 2),  # cash: только paid+manual_paid
             "invoices_tax": -opiu["total_tax_retained"],
             "invoices_net": opiu["total_net_client"],
             "invoices_net_paid": round(paid_invoices_net, 2),
