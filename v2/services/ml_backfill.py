@@ -295,6 +295,40 @@ async def _enrich_order_with_margin(
         log.debug("margin recompute failed for %s: %s", item_id, err)
         return
 
+    # Negative-margin snooze check — если seller добавил этот SKU в snooze
+    # list (через TG button «🤐 Não notificar este SKU»), не показываем
+    # prejuízo-alert в TG. ml_normalize прочитает enriched._negative_margin_snoozed
+    # и пропустит alert-блок + не добавит кнопки.
+    try:
+        seller_sku_raw = ""
+        if isinstance(inner, dict):
+            seller_sku_raw = str(inner.get("seller_sku") or "").strip()
+        if not seller_sku_raw:
+            seller_sku_raw = str(first.get("seller_sku") or "").strip()
+        if seller_sku_raw:
+            async with pool.acquire() as conn_snz:
+                snz_row = await conn_snz.fetchrow(
+                    "SELECT data_value FROM user_data "
+                    "WHERE user_id = $1 AND data_key = 'f2_neg_margin_snoozed_skus' LIMIT 1",
+                    user_id,
+                )
+            snoozed: list[str] = []
+            if snz_row:
+                _val = snz_row["data_value"]
+                if isinstance(_val, list):
+                    snoozed = [str(x).strip() for x in _val if x]
+                elif isinstance(_val, str):
+                    try:
+                        _parsed = json.loads(_val)
+                        if isinstance(_parsed, list):
+                            snoozed = [str(x).strip() for x in _parsed if x]
+                    except Exception:  # noqa: BLE001
+                        pass
+            if seller_sku_raw in snoozed:
+                enriched["_negative_margin_snoozed"] = True
+    except Exception as err:  # noqa: BLE001
+        log.debug("negative margin snooze check failed: %s", err)
+
     # ── Velocity adjustment ───────────────────────────────────────────────
     # Cached margin uses vendas CSV для units_sold count, который юзер
     # обновляет вручную раз в N дней. Когда продажи ускорились (например

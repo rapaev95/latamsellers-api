@@ -304,57 +304,54 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
                 desc_lines.append("")
                 desc_lines.append("⚠ *Esta venda é negativa* — preço abaixo do custo variável")
 
-            # ── Net margin block (после fixed overhead allocation) ──────
-            # Net = variable - fixed_overhead_per_unit. Показывает реальную
-            # прибыль после распределения publi/armaz/aluguel/fulfillment/
-            # manual fixed costs на каждую единицу из месячного объёма.
-            #
-            # В TG показываем monthly project total (real BRL/мес) — per-unit
-            # цифра ничего не говорит продавцу. Breakdown — только non-zero
-            # статьи, чтобы видно что реально кушает в проекте.
-            if profit_net_pu is not None and qty > 0:
-                total_profit_net = float(profit_net_pu) * qty
-                net_str = f"{margin_net_pct}%" if margin_net_pct is not None else "—"
-                emoji = "💰" if (margin_net_pct or 0) >= 0 else "📉"
+            # ── Receita líquida (cash inflow / «Поступит») ──────────────
+            # User feedback: показывать не Lucro líquido (которое incl. COGS
+            # + fixed overhead), а сколько реально упадёт на счёт. Это
+            # price − (ml_fee + envios + das), БЕЗ вычета себестоимости.
+            # Cogs остаётся отдельной строкой выше (Custo produto), seller
+            # знает свой product cost.
+            if cogs_pu is not None and qty > 0 and sale_price > 0:
+                _ml_fee_total = float(ml_fee_pu or 0) * qty
+                _envios_total = float(envios_pu or 0)
+                _das_total = float(das_pu or 0) * qty
+                _revenue_total = sale_price * qty
+                cash_inflow = _revenue_total - _ml_fee_total - _envios_total - _das_total
+                cash_pct = round(cash_inflow / _revenue_total * 100, 1) if _revenue_total else 0
+                emoji_cash = "💰" if cash_inflow >= 0 else "📉"
                 desc_lines.append("")
                 desc_lines.append(
-                    f"{emoji} *Lucro líquido: {net_str} ({_money(total_profit_net)})*"
+                    f"{emoji_cash} *Receita líquida (cai na conta): "
+                    f"{cash_pct}% ({_money(cash_inflow)})*"
                 )
-                # Monthly fixed costs — только то что пользователь явно ввёл
-                # в проекте (`fixed_costs_monthly` через UI). НЕ подмешиваем
-                # computed shares (publi из ads, armaz из reports, и т.д.) —
-                # юзер требовал чтобы блок отражал только его настройки.
-                # Если ни одной категории не заполнено — блок не показываем.
-                fc_user = unit.get("manual_fc_user_breakdown") or {}
-                fixed_total_m = float(unit.get("manual_fc_user_total") or 0)
+                desc_lines.append(
+                    "   _Custo do produto separado — desconte para ver lucro real_"
+                )
 
-                if fixed_total_m > 0 and isinstance(fc_user, dict):
-                    LABELS_PT = {
-                        "aluguel": "Aluguel",
-                        "armazenagem": "Armaz",
-                        "salaries": "Salários",
-                        "utilities": "Utilidades",
-                        "software": "Software",
-                        "outros": "Outros",
-                    }
-                    parts: list[str] = []
-                    for key, label in LABELS_PT.items():
-                        v = float(fc_user.get(key) or 0)
-                        if v > 0:
-                            parts.append(f"{label} {_money(v)}")
-                    breakdown = " · ".join(parts)
-                    if breakdown:
-                        desc_lines.append(
-                            f"   • Custos fixos /mês: {_money(fixed_total_m)} ({breakdown})"
-                        )
-                    else:
-                        desc_lines.append(
-                            f"   • Custos fixos /mês: {_money(fixed_total_m)}"
-                        )
-                if margin_net_pct is not None and float(margin_net_pct) < 0:
-                    desc_lines.append(
-                        "   ⚠ Sem cobrir overhead — considere subir preço ou cortar custos fixos"
-                    )
+            # ── ВНИМАНИЕ: ОТРИЦАТЕЛЬНАЯ ПРИБЫЛЬ ─────────────────────────
+            # Когда product продаётся ниже variable cost (margin_variable < 0),
+            # каждая такая продажа — реальная потеря денег. Не количество
+            # покрывает, а нужно либо повысить цену, либо отозвать товар.
+            # Snooze flag (_negative_margin_snoozed) injected в
+            # _enrich_order_with_margin когда SKU в user's snooze list.
+            if (
+                margin_variable_pct is not None
+                and float(margin_variable_pct) < 0
+                and not enriched.get("_negative_margin_snoozed")
+            ):
+                _per_unit_loss = float(profit_variable_pu or unit_profit or 0)
+                _sku_display = seller_sku or item_id or "—"
+                desc_lines.append("")
+                desc_lines.append(
+                    f"🚨 *ATENÇÃO: PREJUÍZO NESTE SKU {_sku_display}*"
+                )
+                desc_lines.append(
+                    f"   Margem variável {unit_margin_pct}% — você perde "
+                    f"{_money(abs(_per_unit_loss))}/unidade nesta venda."
+                )
+                desc_lines.append(
+                    f"   _Suba o preço para cobrir custo variável, ou "
+                    f"silencie alertas deste SKU pelos botões abaixo._"
+                )
 
             # ── Break-even explainer (когда net < 0) ─────────────────────
             # Источник фикс расходов — ТОЛЬКО user-entered «Ручные фикс.
@@ -594,12 +591,24 @@ def normalize_event(topic: str, resource: str | None, enriched: dict[str, Any]) 
         if permalink:
             actions.append({"label": "Ver pedido", "url": permalink})
 
+        # Compute tags. Add NEGATIVE_VARIABLE so telegram_notify adds
+        # the snooze button («Não notificar este SKU»).
+        _tags = ["ORDERS"]
+        if status:
+            _tags.append(status.upper())
+        if (
+            margin_variable_pct is not None
+            and float(margin_variable_pct) < 0
+            and not enriched.get("_negative_margin_snoozed")
+        ):
+            _tags.append("NEGATIVE_VARIABLE")
+
         return {
             **base,
             "label": f"Nova venda {_brl(total)} — {status}",
             "description": "\n".join(x for x in desc_lines if x),
             "from_date": enriched.get("date_created") or enriched.get("last_updated"),
-            "tags": [t for t in ["ORDERS", status.upper()] if t],
+            "tags": _tags,
             "actions": actions,
         }
 

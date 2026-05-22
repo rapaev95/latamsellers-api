@@ -568,6 +568,26 @@ async def send_notice(
                 {"text": dn_label, "callback_data": f"sdn:{sale_item_id}:{sp_str}"},
             ]
             keyboard: list[list[dict]] = [buttons_row1]
+
+            # Negative-variable margin: показываем snooze-кнопку. SKU
+            # узнаём из enriched raw — берём seller_sku из первой позиции.
+            tags_list = notice.get("tags") or []
+            if isinstance(tags_list, list) and "NEGATIVE_VARIABLE" in tags_list:
+                _seller_sku_b = ""
+                if isinstance(inner, dict):
+                    _seller_sku_b = str(inner.get("seller_sku") or "").strip()
+                if not _seller_sku_b:
+                    _seller_sku_b = str(first.get("seller_sku") or "").strip()
+                if _seller_sku_b:
+                    snz_label = {
+                        "ru": "🤐 Не уведомлять об убытках этого SKU",
+                        "en": "🤐 Stop loss alerts for this SKU",
+                        "pt": "🤐 Não notificar prejuízo deste SKU",
+                    }.get(language, "🤐 Não notificar prejuízo deste SKU")
+                    keyboard.append([
+                        {"text": snz_label, "callback_data": f"snz:{_seller_sku_b}"},
+                    ])
+
             permalink = None
             for a in actions_block:
                 if isinstance(a, dict):
