@@ -2184,6 +2184,21 @@ async def create_upload(
         except Exception as e:
             nfse_parsed = {"error": f"{type(e).__name__}: {e}"}
 
+    # Generic invoice/NF parser for any PDF/XML that wasn't already handled
+    # above (das_simples, nfse_shps). Stores structured data in parsed_meta
+    # for future AI-powered search across all uploaded documents.
+    generic_parsed: Optional[dict[str, Any]] = None
+    if das_parsed is None and nfse_parsed is None:
+        ct = (file.content_type or "").lower()
+        fn_lower = (filename or "").lower()
+        if 'pdf' in ct or fn_lower.endswith('.pdf') or 'xml' in ct or fn_lower.endswith('.xml'):
+            try:
+                generic_parsed = _try_parse_invoice(file_bytes, filename, ct)
+                if generic_parsed:
+                    await uploads_storage.set_parsed_meta(pool, upload_id, generic_parsed)
+            except Exception as e:
+                generic_parsed = {"error": f"{type(e).__name__}: {e}"}
+
     return {
         "id": upload_id,
         "filename": filename,
@@ -2195,6 +2210,7 @@ async def create_upload(
         "dados_fiscais_sync": dados_fiscais_sync,
         "das_parsed": das_parsed,
         "nfse_parsed": nfse_parsed,
+        "generic_parsed": generic_parsed,
     }
 
 @router.delete("/uploads/{upload_id}")
