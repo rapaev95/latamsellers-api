@@ -58,7 +58,6 @@ _COMPUTE_TIMEOUT_SECONDS = 90  # legacy compute can scan many files; cap respons
 
 T = TypeVar("T")
 
-
 def _run_parallel_with_timeout(
     tasks: dict[str, Callable[[], Any]],
     timeout: int = _COMPUTE_TIMEOUT_SECONDS,
@@ -93,17 +92,14 @@ def _run_parallel_with_timeout(
     pool.shutdown(wait=False, cancel_futures=True)
     return out
 
-
 def _bind_user(user: CurrentUser) -> None:
     """Make legacy code see the current user_id (used by db_storage internals)."""
     legacy_db.set_current_user_id(user.id)
-
 
 def _bind_user_id(user_id: int) -> None:
     """Bind any user_id — used to swap to the project owner when the caller
     is reading data through a project membership."""
     legacy_db.set_current_user_id(user_id)
-
 
 async def _resolve_primary_owner(pool, caller: CurrentUser) -> int:
     """For global per-user endpoints (sku-mapping, rules) when there's no
@@ -126,7 +122,6 @@ async def _resolve_primary_owner(pool, caller: CurrentUser) -> int:
         return caller.id
     owner_ids = sorted({m["owner_id"] for m in memberships if m.get("owner_id")})
     return owner_ids[0] if owner_ids else caller.id
-
 
 async def _resolve_effective_user_for_upload(
     pool, caller: CurrentUser, upload_id: int,
@@ -161,7 +156,6 @@ async def _resolve_effective_user_for_upload(
     except Exception:
         return caller.id
 
-
 async def _resolve_effective_user_for_project(
     pool, caller: CurrentUser, project: str,
 ) -> int:
@@ -183,7 +177,6 @@ async def _resolve_effective_user_for_project(
     except Exception:
         return caller.id
 
-
 @router.get("/projects", response_model=ProjectsListOut)
 async def list_projects(
     user: CurrentUser = Depends(current_user),
@@ -196,7 +189,8 @@ async def list_projects(
     metadata (sku_prefixes, launch_date, etc.) matches what the owner sees.
     """
     # Own projects
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     projects: dict = dict(legacy_config.load_projects() or {})
 
     # Projects inherited via memberships — load from each inviter's namespace
@@ -226,7 +220,6 @@ async def list_projects(
 
     return {"projects": projects, "count": len(projects)}
 
-
 def _parse_iso(s: Optional[str]) -> Optional[date]:
     if not s:
         return None
@@ -234,7 +227,6 @@ def _parse_iso(s: Optional[str]) -> Optional[date]:
         return datetime.strptime(s, "%Y-%m-%d").date()
     except ValueError:
         return None
-
 
 @router.get("/reports", response_model=ReportsBundleOut)
 async def get_reports(
@@ -365,7 +357,6 @@ async def get_reports(
     out.update(bundle)
     response.headers["X-Cache"] = status
     return out
-
 
 @router.get("/services-reports", response_model=ServicesReportsBundleOut)
 async def get_services_reports(
@@ -503,11 +494,9 @@ async def get_services_reports(
     response.headers["X-Cache"] = cache_status
     return out
 
-
 # ── Per-row hide / un-hide for services-reports transfers ──────────────────
 
 _HIDDEN_KEY_TEMPLATE = "f2_services_hidden_transfers_{project}"
-
 
 def _load_hidden_keys_for_user(project: str, user_id: int) -> list[str]:
     """Read the per-project hidden list scoped to a specific user_id.
@@ -517,7 +506,6 @@ def _load_hidden_keys_for_user(project: str, user_id: int) -> list[str]:
     if not isinstance(raw, list):
         return []
     return [str(x) for x in raw if isinstance(x, str) and x]
-
 
 @router.post("/services-reports/hide-transfer")
 async def services_hide_transfer(
@@ -551,7 +539,6 @@ async def services_hide_transfer(
         db_save(_HIDDEN_KEY_TEMPLATE.format(project=project), cur)
     return {"ok": True, "hidden_count": len(cur)}
 
-
 @router.post("/services-reports/unhide-transfer")
 async def services_unhide_transfer(
     body: dict[str, Any],
@@ -579,10 +566,8 @@ async def services_unhide_transfer(
         db_save(_HIDDEN_KEY_TEMPLATE.format(project=project), cur)
     return {"ok": True, "hidden_count": len(cur)}
 
-
 _EDITS_KEY_TEMPLATE = "f2_services_transfer_edits_{project}"
 _EDITABLE_FIELDS = {"date", "canal", "brl", "usd", "vet"}
-
 
 @router.post("/services-reports/edit-transfer")
 async def services_edit_transfer(
@@ -644,10 +629,8 @@ async def services_edit_transfer(
     db_save(_EDITS_KEY_TEMPLATE.format(project=project), edits)
     return {"ok": True, "edits_count": len(edits)}
 
-
 _INVOICE_RATE_KEY_TEMPLATE = "f2_services_invoice_rate_overrides_{project}"
 _INVOICE_RATE_FIELDS = {"rate_eff", "rate_commission"}
-
 
 @router.post("/services-reports/edit-invoice-rate")
 async def services_edit_invoice_rate(
@@ -723,7 +706,6 @@ async def services_edit_invoice_rate(
     db_save(_INVOICE_RATE_KEY_TEMPLATE.format(project=project), overrides)
     return {"ok": True, "overrides_count": len(overrides)}
 
-
 @router.post("/services-reports/reset-invoice-rate")
 async def services_reset_invoice_rate(
     body: dict[str, Any],
@@ -771,9 +753,7 @@ async def services_reset_invoice_rate(
     db_save(_INVOICE_RATE_KEY_TEMPLATE.format(project=project), overrides)
     return {"ok": True, "overrides_count": len(overrides)}
 
-
 _PAYMENT_KEY_TEMPLATE = "f2_services_invoice_payment_overrides_{project}"
-
 
 @router.post("/services-reports/mark-invoice-paid")
 async def services_mark_invoice_paid(
@@ -813,7 +793,6 @@ async def services_mark_invoice_paid(
     db_save(_PAYMENT_KEY_TEMPLATE.format(project=project), overrides)
     return {"ok": True, "overrides_count": len(overrides), "status": status}
 
-
 @router.post("/services-reports/unmark-invoice-paid")
 async def services_unmark_invoice_paid(
     body: dict[str, Any],
@@ -844,7 +823,6 @@ async def services_unmark_invoice_paid(
     db_save(_PAYMENT_KEY_TEMPLATE.format(project=project), overrides)
     return {"ok": True, "overrides_count": len(overrides)}
 
-
 def _dataclass_to_dict(obj: Any) -> Any:
     """Convert dataclass / nested dataclasses → dict for JSON serialisation."""
     from dataclasses import asdict, is_dataclass
@@ -856,7 +834,6 @@ def _dataclass_to_dict(obj: Any) -> Any:
         return {k: _dataclass_to_dict(v) for k, v in obj.items()}
     return obj
 
-
 # ── SKU Mapping ─────────────────────────────────────────────────────────────
 # 1:1 port of Streamlit page _admin/app.py:2848-3104 («Маппинг SKU → Проект»).
 # - SKU list = vendas SKUs (titles + MLB) overlaid with catalog (project, cost, supplier)
@@ -865,7 +842,6 @@ def _dataclass_to_dict(obj: Any) -> Any:
 # Storage: legacy `sku_catalog` user_data key (shared with Streamlit).
 
 import re as _re_sku
-
 
 async def _query_ml_items_sku_map(pool, user_id: int) -> dict[str, dict[str, str]]:
     """SELECT по ml_user_items + парсинг raw JSONB. Возвращает пустой dict
@@ -932,7 +908,6 @@ async def _query_ml_items_sku_map(pool, user_id: int) -> dict[str, dict[str, str
 
     return result
 
-
 async def _load_ml_items_sku_map(pool, user_id: int) -> dict[str, dict[str, str]]:
     """seller_sku → {mlb, link, title} из ml_user_items.
 
@@ -950,7 +925,6 @@ async def _load_ml_items_sku_map(pool, user_id: int) -> dict[str, dict[str, str]
     except Exception:  # noqa: BLE001
         return {}
     return await _query_ml_items_sku_map(pool, user_id)
-
 
 def _build_sku_mapping(user_id: int, ml_sku_map: dict[str, dict[str, str]] | None = None) -> dict[str, Any]:
     """Build the merged SKU view: vendas + ml-cache overlay + catalog + groupings.
@@ -1146,7 +1120,6 @@ def _build_sku_mapping(user_id: int, ml_sku_map: dict[str, dict[str, str]] | Non
         "total": len(all_skus),
     }
 
-
 @router.get("/cache/stats")
 def get_cache_stats(
     scope: str = Query("user", pattern="^(user|global)$"),
@@ -1162,7 +1135,6 @@ def get_cache_stats(
         return finance_cache.stats_sync(user_id=None)
     return finance_cache.stats_sync(user_id=user.id)
 
-
 @router.post("/cache/cleanup")
 def post_cache_cleanup(
     max_age_days: int = Query(14, ge=1, le=365),
@@ -1171,7 +1143,6 @@ def post_cache_cleanup(
     """Manual cleanup of cache rows older than max_age_days. Cron-callable too."""
     deleted = finance_cache.cleanup_stale_sync(max_age_days=max_age_days)
     return {"deleted": deleted, "max_age_days": max_age_days}
-
 
 @router.get("/sku-mapping", response_model=SkuMappingOut)
 async def get_sku_mapping(
@@ -1185,7 +1156,6 @@ async def get_sku_mapping(
     ml_sku_map = await _load_ml_items_sku_map(pool, effective_user_id)
     return _build_sku_mapping(effective_user_id, ml_sku_map)
 
-
 @router.get("/pnl-gap-debug")
 async def debug_pnl_gap(
     project: str = Query(..., description="Project ID, e.g. 'ARTUR'"),
@@ -1196,7 +1166,8 @@ async def debug_pnl_gap(
     """Диагностика гэпа в PnL: показывает что лежит в vendas для project+month
     + что висит в NAO_CLASSIFICADO/пусто за этот месяц + orphan-пакеты.
     Помогает понять где недостающая выручка."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.reports import load_vendas_ml_report, parse_brl
     from v2.legacy.config import mlb_url
     import pandas as pd
@@ -1375,7 +1346,6 @@ async def debug_pnl_gap(
         ),
     }
 
-
 @router.post("/pnl-gap-fix")
 async def fix_pnl_gap(
     project: str = Query(..., description="Project ID кому привязать MLB, e.g. 'ARTHUR'"),
@@ -1389,7 +1359,8 @@ async def fix_pnl_gap(
 
     Возвращает: количество добавленных MLB + те что уже были в fallback.
     """
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.reports import load_vendas_ml_report, parse_brl, invalidate_vendas_cache
     from v2.legacy.config import (
         load_projects, update_project, _invalidate_projects_cache,
@@ -1477,7 +1448,6 @@ async def fix_pnl_gap(
         "month": month,
     }
 
-
 @router.get("/sku-mapping-debug")
 async def debug_sku_mapping(
     sku: str = Query(..., description="SKU для диагностики, e.g. 'A21191-1'"),
@@ -1486,7 +1456,8 @@ async def debug_sku_mapping(
 ):
     """Диагностика — почему конкретный SKU не получил MLB/link.
     Проверяет все 4 источника + статус OAuth-токена."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.sku_catalog import normalize_sku, load_catalog
     from v2.legacy.reports import load_vendas_ml_report, load_stock_full
     from v2.services import ml_oauth as ml_oauth_svc
@@ -1699,7 +1670,6 @@ async def debug_sku_mapping(
 
     return report
 
-
 @router.get("/pnl-matrix", response_model=PnlMatrixOut)
 async def get_pnl_matrix(
     response: Response,
@@ -1748,7 +1718,6 @@ async def get_pnl_matrix(
     # Strip internal marker before returning to UI.
     payload.pop("_error", None)
     return payload
-
 
 @router.post("/sku-mapping/save", response_model=SkuBulkSaveOut)
 async def save_sku_mapping(body: SkuBulkSaveIn, user: CurrentUser = Depends(current_user), pool=Depends(get_pool)):
@@ -1803,13 +1772,11 @@ async def save_sku_mapping(body: SkuBulkSaveIn, user: CurrentUser = Depends(curr
     invalidate_vendas_cache(user.id)
     return {"saved": saved, "catalog_total": len(by_key)}
 
-
 # ── Orphan Pacotes (multi-item ML orders with no child-SKU rows) ────────────
 # Mirrors Streamlit flow in _admin/report_views.py:1695-1768 + upload_page.py:1126-1204.
 # Storage: per-user `f2_orphan_assignments` in user_data (DB mode) or fs fallback.
 
 _ML_ORDER_URL = "https://www.mercadolivre.com.br/vendas/{oid}/detalhe"
-
 
 @router.get("/orphan-pacotes", response_model=OrphanPacotesResponse)
 async def get_orphan_pacotes(
@@ -1864,7 +1831,6 @@ async def get_orphan_pacotes(
         "available_projects": available,
     }
 
-
 @router.post("/orphan-pacotes/save", response_model=OrphanSaveOut)
 async def save_orphan_pacotes(
     body: OrphanSaveIn,
@@ -1887,7 +1853,6 @@ async def save_orphan_pacotes(
     changed = save_orphan_assignments_bulk(body.assignments or {})
     total = len(load_orphan_assignments() or {})
     return {"saved": changed, "total_assignments": total}
-
 
 # ── Retirada Overrides (per-row политика «списание / в обороте») ────────────
 
@@ -1913,7 +1878,6 @@ async def get_retirada_overrides(
     }
     return {"project": project, "overrides": canon, "saved_count": 0}
 
-
 @router.get("/retirada/preview", response_model=RetiradaPreviewOut)
 async def get_retirada_preview(
     user: CurrentUser = Depends(current_user),
@@ -1932,7 +1896,6 @@ async def get_retirada_preview(
     rows = list_all_retirada_rows() or []
     projects = sorted({str(r.get("project") or "").strip() for r in rows if r.get("project")})
     return {"rows": rows, "rows_count": len(rows), "projects": projects}
-
 
 @router.post("/retirada-overrides")
 async def save_retirada_overrides_endpoint(
@@ -1969,13 +1932,11 @@ async def save_retirada_overrides_endpoint(
     }
     return {"project": body.project, "overrides": canon, "saved_count": len(canon)}
 
-
 # ── Uploads (Phase 4 — /finance/upload) ─────────────────────────────────────
 # Thin wrappers around `v2/storage/uploads_storage` — the SHA-dedupe upsert,
 # list-by-source query, and per-row delete are already implemented there.
 
 _ALLOWED_SOURCES = set(legacy_config.DATA_SOURCES.keys())
-
 
 @router.get("/upload-sources", response_model=SourceCatalogOut)
 def list_upload_sources(user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
@@ -1996,7 +1957,6 @@ def list_upload_sources(user: CurrentUser = Depends(current_user)) -> dict[str, 
             "description": str(meta.get("description", "")),
         })
     return {"sources": entries}
-
 
 @router.get("/uploads", response_model=UploadsListOut)
 async def list_uploads(
@@ -2069,9 +2029,7 @@ async def list_uploads(
         total += count
     return {"sources": groups, "total_count": total}
 
-
 _MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB — comfortable headroom over ~1.5 MB vendas snapshots
-
 
 @router.post("/uploads", response_model=UploadSaveOut)
 async def create_upload(
@@ -2238,7 +2196,6 @@ async def create_upload(
         "nfse_parsed": nfse_parsed,
     }
 
-
 @router.delete("/uploads/{upload_id}")
 async def delete_upload(
     upload_id: int,
@@ -2289,7 +2246,6 @@ async def delete_upload(
 
     return {"deleted": True}
 
-
 @router.get("/uploads/{upload_id}/preview", response_model=UploadPreviewOut)
 async def preview_upload(
     upload_id: int,
@@ -2305,7 +2261,8 @@ async def preview_upload(
     """
     if pool is None:
         raise HTTPException(status_code=503, detail="db_unavailable")
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
 
     import io
     import pandas as pd
@@ -2412,13 +2369,11 @@ async def preview_upload(
 
     return out
 
-
 # ── Classification + Bank Rules (Phase 5) ───────────────────────────────────
 # Thin wrappers around `v2/legacy/config.{load,save}_transaction_rules` + the
 # new `v2/legacy/bank_tx.parse_bank_tx_bytes` CSV sniffer.
 
 _BANK_SOURCES = {"extrato_mp", "extrato_nubank", "extrato_c6_brl", "extrato_c6_usd"}
-
 
 @router.get("/rules", response_model=RulesOut)
 async def get_rules(
@@ -2435,7 +2390,6 @@ async def get_rules(
     from v2.legacy.config import load_transaction_rules
     rules = load_transaction_rules() or []
     return {"rules": rules, "count": len(rules)}
-
 
 @router.put("/rules", response_model=RulesOut)
 async def put_rules(
@@ -2455,10 +2409,8 @@ async def put_rules(
     rules = load_transaction_rules() or []
     return {"rules": rules, "count": len(rules)}
 
-
 def _overrides_key(upload_id: int) -> str:
     return f"f2_classifications_{upload_id}"
-
 
 @router.get("/transactions/{upload_id}", response_model=TransactionsOut)
 async def get_transactions(
@@ -2529,7 +2481,6 @@ async def get_transactions(
         "format_error": format_error,
     }
 
-
 @router.post("/transactions/{upload_id}/save", response_model=ClassificationSaveOut)
 async def save_transactions(
     upload_id: int,
@@ -2581,7 +2532,6 @@ async def save_transactions(
     db_save(_overrides_key(upload_id), current)
     return {"saved": saved, "total_overrides": len(current)}
 
-
 # ── Grouped (per-bank) transactions (#1) ────────────────────────────────────
 # Same data as /transactions/{upload_id} but merged across ALL uploads for
 # one source_key, deduplicated by stable hash, with overrides keyed by
@@ -2596,10 +2546,8 @@ _BANK_LABELS = {
     "extrato_c6_usd": "C6 USD",
 }
 
-
 def _grouped_overrides_key(source_key: str) -> str:
     return f"{_GROUPED_OVERRIDES_KEY_PREFIX}{source_key}"
-
 
 @router.get("/bank-transactions/grouped")
 async def get_bank_transactions_grouped(
@@ -2772,7 +2720,6 @@ async def get_bank_transactions_grouped(
         "cambio": cambio_summary,
     }
 
-
 @router.post("/bank-transactions/grouped/save")
 async def save_bank_transactions_grouped(
     body: dict[str, Any],
@@ -2839,14 +2786,12 @@ async def save_bank_transactions_grouped(
     db_save(_grouped_overrides_key(source_key), current)
     return {"saved": saved, "total_overrides": len(current)}
 
-
 # ── Upload source-key diagnostic + re-detect ────────────────────────────────
 # Filename auto-detect rules evolved over time (e.g. fix(uploads): handle
 # spaces in ML export names); old uploads stayed in the DB with their
 # original — sometimes wrong — source_key, so loaders silently skipped them.
 # These endpoints let the user see the mismatch and fix it without
 # re-uploading the file.
-
 
 @router.get("/uploads/source-debug")
 async def uploads_source_debug(
@@ -2906,7 +2851,6 @@ async def uploads_source_debug(
         "total_uploads": len(out),
         "mismatches": mismatches,
     }
-
 
 @router.post("/uploads/source-fix")
 async def uploads_source_fix(
@@ -2976,7 +2920,6 @@ async def uploads_source_fix(
         "would_fix_count": len(plan) if dry_run else 0,
         "changes": plan,
     }
-
 
 @router.get("/uploads/diag-retirada")
 async def uploads_diag_retirada(
@@ -3071,7 +3014,6 @@ async def uploads_diag_retirada(
         },
     }
 
-
 @router.get("/uploads/{upload_id}/inspect")
 async def upload_inspect(
     upload_id: int,
@@ -3159,7 +3101,6 @@ async def upload_inspect(
     out["rows_preview"] = preview
     return out
 
-
 @router.get("/uploads/diag-mappings")
 async def uploads_diag_mappings(
     project: str = Query(..., description="Project ID, e.g. ARTUR"),
@@ -3172,7 +3113,8 @@ async def uploads_diag_mappings(
     отсутствует в catalog (cost+project mapping)."""
     if pool is None:
         raise HTTPException(status_code=503, detail="db_unavailable")
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
 
     from v2.legacy.reports import load_armazenagem_report, load_retirada_estoque_report
 
@@ -3235,7 +3177,6 @@ async def uploads_diag_mappings(
 
     return out
 
-
 @router.get("/uploads/diag-armazenagem-period")
 async def uploads_diag_armazenagem_period(
     project: str = Query(...),
@@ -3249,7 +3190,8 @@ async def uploads_diag_armazenagem_period(
     в df_armazenagem попадают в период и сколько каждый SKU/день даёт."""
     if pool is None:
         raise HTTPException(status_code=503, detail="db_unavailable")
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
 
     from datetime import date as _date, datetime as _dt
     from v2.legacy.reports import load_armazenagem_report, get_armazenagem_by_period
@@ -3336,7 +3278,6 @@ async def uploads_diag_armazenagem_period(
 
     return out
 
-
 @router.get("/uploads/diag-retirada-period")
 async def uploads_diag_retirada_period(
     project: str = Query(...),
@@ -3350,7 +3291,8 @@ async def uploads_diag_retirada_period(
     Сравнение с pnl-matrix позволяет точечно локализовать баг."""
     if pool is None:
         raise HTTPException(status_code=503, detail="db_unavailable")
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
 
     from datetime import date as _date
     import unicodedata
@@ -3430,7 +3372,6 @@ async def uploads_diag_retirada_period(
 
     return out
 
-
 @router.get("/uploads/diag-armazenagem")
 async def uploads_diag_armazenagem(
     user: CurrentUser = Depends(current_user),
@@ -3489,9 +3430,7 @@ async def uploads_diag_armazenagem(
         },
     }
 
-
 # ── Bank balance anchors (manual + reconciliation) ──────────────────────────
-
 
 @router.get("/bank-balances")
 async def get_bank_balance(
@@ -3509,7 +3448,8 @@ async def get_bank_balance(
         raise HTTPException(status_code=503, detail="db_unavailable")
     if source_key not in _BANK_SOURCES:
         raise HTTPException(status_code=400, detail="unsupported_source")
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     await bank_balances_svc.ensure_schema(pool)
 
     anchor = await bank_balances_svc.get_active(pool, user.id, source_key)
@@ -3551,7 +3491,6 @@ async def get_bank_balance(
         "history": history,
     }
 
-
 @router.post("/bank-balances")
 async def post_bank_balance(
     body: dict[str, Any],
@@ -3565,7 +3504,8 @@ async def post_bank_balance(
     """
     if pool is None:
         raise HTTPException(status_code=503, detail="db_unavailable")
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     await bank_balances_svc.ensure_schema(pool)
 
     source_key = (body or {}).get("source_key")
@@ -3593,7 +3533,6 @@ async def post_bank_balance(
         notes=(body or {}).get("notes"),
     )
 
-
 @router.delete("/bank-balances")
 async def delete_bank_balance(
     source_key: str = Query(...),
@@ -3605,9 +3544,9 @@ async def delete_bank_balance(
         raise HTTPException(status_code=503, detail="db_unavailable")
     if source_key not in _BANK_SOURCES:
         raise HTTPException(status_code=400, detail="unsupported_source")
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     return await bank_balances_svc.delete_balance(pool, user.id, source_key)
-
 
 # ── Manual external USD inflows (Phase 3 câmbio) ─────────────────────────────
 # CRUD over the user's hand-entered BRL→USD conversion records (Bybit USDT,
@@ -3620,7 +3559,6 @@ async def delete_bank_balance(
 # the FIFO costs. Reject loudly so the user notices.
 _MANUAL_INFLOW_RATE_MIN = 3.5
 _MANUAL_INFLOW_RATE_MAX = 8.0
-
 
 def _validate_inflow_payload(body: ManualInflowIn) -> tuple[date, float, float, str, str]:
     """Parse + range-check a POST/PUT body. Raises HTTPException on invalid input.
@@ -3654,7 +3592,6 @@ def _validate_inflow_payload(body: ManualInflowIn) -> tuple[date, float, float, 
     note = (body.note or "").strip()
     return d, body.usd_received, body.brl_paid, source, note
 
-
 def _inflow_to_out(row: manual_inflows_svc.ManualInflow) -> dict[str, Any]:
     """Dataclass → dict shaped for ManualInflowOut. Computes `rate` here so
     the UI doesn't have to re-divide every render."""
@@ -3669,7 +3606,6 @@ def _inflow_to_out(row: manual_inflows_svc.ManualInflow) -> dict[str, Any]:
         "created_at": row.created_at.isoformat() if row.created_at else "",
         "updated_at": row.updated_at.isoformat() if row.updated_at else "",
     }
-
 
 @router.get("/manual-usd-inflows", response_model=ManualInflowsListOut)
 async def list_manual_inflows(
@@ -3692,7 +3628,6 @@ async def list_manual_inflows(
         "avg_rate": avg_rate,
     }
 
-
 @router.post("/manual-usd-inflows", response_model=ManualInflowOut)
 async def create_manual_inflow(
     body: ManualInflowIn,
@@ -3714,7 +3649,6 @@ async def create_manual_inflow(
         note=note,
     )
     return _inflow_to_out(row)
-
 
 @router.put("/manual-usd-inflows/{inflow_id}", response_model=ManualInflowOut)
 async def update_manual_inflow(
@@ -3740,7 +3674,6 @@ async def update_manual_inflow(
     if row is None:
         raise HTTPException(status_code=404, detail="inflow_not_found")
     return _inflow_to_out(row)
-
 
 @router.delete("/manual-usd-inflows/{inflow_id}")
 async def delete_manual_inflow(
@@ -3777,7 +3710,6 @@ async def delete_manual_inflow(
         raise HTTPException(status_code=404, detail="inflow_not_found")
     return {"deleted": True, "id": inflow_id}
 
-
 # ── Onboarding Wizard (Phase 6) ─────────────────────────────────────────────
 # Port of Streamlit _admin/onboarding.py. State lives in two user_data keys:
 #   f2_onboarding_step  → {step, completed}
@@ -3787,11 +3719,11 @@ _ONBOARDING_STEP_KEY = "f2_onboarding_step"
 _ONBOARDING_DATA_KEY = "f2_onboarding_data"
 _TOTAL_STEPS = 10
 
-
 @router.get("/onboarding/state", response_model=OnboardingState)
-def get_onboarding_state(user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
+async def get_onboarding_state(user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
     """Return current wizard progress + accumulated form data."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.db_storage import db_load
 
     step_blob = db_load(_ONBOARDING_STEP_KEY) or {}
@@ -3811,33 +3743,33 @@ def get_onboarding_state(user: CurrentUser = Depends(current_user)) -> dict[str,
         "data": data_blob if isinstance(data_blob, dict) else {},
     }
 
-
 @router.put("/onboarding/state", response_model=OnboardingState)
-def put_onboarding_state(
+async def put_onboarding_state(
     body: OnboardingState,
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Replace wizard progress + data. Called on each step transition / save."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.db_storage import db_save
     step = max(1, min(_TOTAL_STEPS, int(body.step or 1)))
     db_save(_ONBOARDING_STEP_KEY, {"step": step, "completed": bool(body.completed)})
     db_save(_ONBOARDING_DATA_KEY, body.data or {})
     return {"step": step, "completed": bool(body.completed), "data": body.data or {}}
 
-
 @router.post("/projects", response_model=ProjectCreateOut)
-def create_project(
+async def create_project(
     body: ProjectCreateIn,
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Create a new project — thin wrapper over legacy.config.add_project.
 
     Used by onboarding step 2 and the /finance/projects page. Full edit flow
     (baseline, aluguel, rental, etc.) lives on the projects page — here we
     only collect the minimum needed to unblock the wizard.
     """
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.config import add_project, load_projects, _invalidate_projects_cache, update_project
 
     pid = (body.project_id or "").strip().upper()
@@ -3893,20 +3825,20 @@ def create_project(
     total = len(load_projects() or {})
     return {"project_id": pid, "created": is_new, "total_projects": total}
 
-
 @router.put("/projects/{project_id}", response_model=ProjectMutOut)
-def update_project_endpoint(
+async def update_project_endpoint(
     project_id: str,
     body: ProjectUpdateIn,
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Edit an existing project. Only whitelisted fields (see `_PROJECT_EDITABLE_KEYS`
     in legacy.config) are applied. `rental_fields` merges into the `rental` subdict.
 
     Also invalidates per-user vendas DF cache because project → SKU resolution
     depends on `sku_prefixes` / `mlb_fallback`.
     """
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.config import update_project, load_projects, _invalidate_projects_cache
     from v2.legacy.reports import invalidate_vendas_cache
 
@@ -3946,18 +3878,18 @@ def update_project_endpoint(
     invalidate_vendas_cache(user.id)
     return {"project_id": pid, "updated": True, "exists": True}
 
-
 @router.get("/projects/{project_id}/fixed-costs")
-def get_project_fixed_costs(
+async def get_project_fixed_costs(
     project_id: str,
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Per-project monthly fixed costs (6 категорий + total). Используется для
     конфигурации break-even tracker в TG sales notifications.
 
     Если поле ещё не задано — возвращает все нули.
     """
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.config import load_projects, FIXED_COST_CATEGORIES
 
     pid = project_id.strip().upper()
@@ -3983,15 +3915,15 @@ def get_project_fixed_costs(
         "total_monthly": round(sum(breakdown.values()), 2),
     }
 
-
 @router.put("/projects/{project_id}/fixed-costs")
-def save_project_fixed_costs(
+async def save_project_fixed_costs(
     project_id: str,
     body: FixedCostsSaveIn,
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Save per-project monthly fixed costs. Replaces full breakdown (не merge)."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.config import update_project, FIXED_COST_CATEGORIES, _invalidate_projects_cache
 
     pid = project_id.strip().upper()
@@ -4016,14 +3948,14 @@ def save_project_fixed_costs(
         "total_monthly": round(sum(canonical.values()), 2),
     }
 
-
 @router.delete("/projects/{project_id}", response_model=ProjectMutOut)
-def delete_project_endpoint(
+async def delete_project_endpoint(
     project_id: str,
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Remove a project from user_data.projects. Raw vendas / uploads are kept."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.config import delete_project, load_projects, _invalidate_projects_cache
     from v2.legacy.reports import invalidate_vendas_cache
 
@@ -4036,7 +3968,6 @@ def delete_project_endpoint(
     _invalidate_projects_cache()
     invalidate_vendas_cache(user.id)
     return {"project_id": pid, "deleted": True, "exists": True}
-
 
 # ── Manual cashflow entries (partner / expense / supplier) ─────────────────
 # Streamlit DDS tab had a form "Добавить запись вручную" — port here.
@@ -4054,27 +3985,27 @@ _MANUAL_CF_KINDS = (
     "approved_transfer", "approved_invoice",
 )
 
-
 @router.get("/cashflow-entries", response_model=ManualCashflowEntriesOut)
-def list_cashflow_entries(
+async def list_cashflow_entries(
     project: str = Query(...),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Return 3 lists of manual entries for a project."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.reports import list_manual_cashflow_entries
     buckets = list_manual_cashflow_entries(project)
     return {"project": project.upper(), **buckets}
 
-
 @router.post("/cashflow-entries", response_model=ManualCashflowEntriesOut)
-def add_cashflow_entry(
+async def add_cashflow_entry(
     entry: ManualCashflowEntryIn,
     project: str = Query(...),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Append a manual cashflow entry (inflow/outflow/supplier) to a project."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.reports import add_manual_cashflow_entry, list_manual_cashflow_entries
     from v2.legacy.config import _invalidate_projects_cache
 
@@ -4125,16 +4056,16 @@ def add_cashflow_entry(
     buckets = list_manual_cashflow_entries(project)
     return {"project": project.upper(), **buckets}
 
-
 @router.delete("/cashflow-entries", response_model=ManualCashflowEntriesOut)
-def remove_cashflow_entry(
+async def remove_cashflow_entry(
     project: str = Query(...),
     kind: str = Query(...),
     index: int = Query(..., ge=0),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Delete one manual entry by (kind, array index)."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.reports import delete_manual_cashflow_entry, list_manual_cashflow_entries
     from v2.legacy.config import _invalidate_projects_cache
 
@@ -4148,21 +4079,21 @@ def remove_cashflow_entry(
     buckets = list_manual_cashflow_entries(project)
     return {"project": project.upper(), **buckets}
 
-
 @router.patch("/cashflow-entries", response_model=ManualCashflowEntriesOut)
-def update_cashflow_entry(
+async def update_cashflow_entry(
     entry: ManualCashflowEntryIn,
     project: str = Query(...),
     index: int = Query(..., ge=0, description="Array index within the kind's bucket"),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Replace one manual entry at (project, kind, index).
 
     For loan_given/loan_received rewrites the mirror in the counterparty project
     (loan_id preserved — stable across edits, even when counterparty changes).
     Client must send the full entry body — no partial merges.
     """
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.reports import update_manual_cashflow_entry, list_manual_cashflow_entries
     from v2.legacy.config import _invalidate_projects_cache
 
@@ -4205,13 +4136,11 @@ def update_cashflow_entry(
     buckets = list_manual_cashflow_entries(project)
     return {"project": project.upper(), **buckets}
 
-
 # ── Publicidade invoices (ML billing cycle: anchor date + 30-day window) ─────
 
 def _invoice_anchor(entry: dict) -> str:
     """Extract anchor date from entry. New schema uses `date`; legacy had `ate`."""
     return str(entry.get("date") or entry.get("ate") or "")
-
 
 def _publicidade_list_response(project: str) -> dict[str, Any]:
     from v2.legacy.reports import list_publicidade_invoices
@@ -4245,27 +4174,26 @@ def _publicidade_list_response(project: str) -> dict[str, Any]:
         ],
     }
 
-
 @router.get("/publicidade/invoices", response_model=PublicidadeInvoicesListOut)
-def list_publicidade(
+async def list_publicidade(
     project: str = Query(..., description="Project ID"),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """List manual Mercado Ads invoices (faturas) for a project.
 
     Each fatura has its own [desde, ate] period — usually a 12-12 billing cycle,
     but arbitrary periods are allowed (backend splits per-day across requested period).
     """
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     return _publicidade_list_response(project)
 
-
 @router.post("/publicidade/invoices", response_model=PublicidadeInvoicesListOut)
-def add_publicidade(
+async def add_publicidade(
     entry: PublicidadeInvoiceIn,
     project: str = Query(...),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Append one fatura entry to a project's manual_publicidade list.
 
     Схема:
@@ -4273,7 +4201,8 @@ def add_publicidade(
       - `month` (YYYY-MM) — месяц фатуры, день берётся из project.billing_cycle_day
     Окно [date-29, date] и daily rate = valor/30 считаются в `get_publicidade_by_period`.
     """
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.reports import add_publicidade_invoice as _add
     from v2.legacy.config import load_projects
 
@@ -4323,15 +4252,15 @@ def add_publicidade(
         raise HTTPException(status_code=404, detail="project_not_found")
     return _publicidade_list_response(project)
 
-
 @router.delete("/publicidade/invoices", response_model=PublicidadeInvoicesListOut)
-def remove_publicidade(
+async def remove_publicidade(
     project: str = Query(...),
     index: int = Query(..., ge=0, description="Array index to remove"),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Delete one fatura entry by its array index."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.reports import delete_publicidade_invoice as _del
 
     ok = _del(project, index)
@@ -4339,17 +4268,17 @@ def remove_publicidade(
         raise HTTPException(status_code=404, detail="entry_not_found")
     return _publicidade_list_response(project)
 
-
 @router.patch("/publicidade/invoices", response_model=PublicidadeInvoicesListOut)
-def patch_publicidade(
+async def patch_publicidade(
     entry: PublicidadeInvoiceIn,
     project: str = Query(...),
     index: int = Query(..., ge=0, description="Array index to update"),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Обновить поля существующей фатуры (valor / note / date / month).
     Поля опциональны — что передано, то обновится."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.reports import update_publicidade_invoice as _upd
     from v2.legacy.config import load_projects
 
@@ -4388,7 +4317,6 @@ def patch_publicidade(
     if not ok:
         raise HTTPException(status_code=404, detail="entry_not_found")
     return _publicidade_list_response(project)
-
 
 # ── Rental payments (cash-basis aluguel schedule per project) ────────────────
 
@@ -4452,17 +4380,16 @@ def _rental_payments_response(project: str, auto_generate: bool = True) -> dict[
         "launch_date": proj_meta.get("launch_date") or None,
     }
 
-
 @router.get("/rental-payments", response_model=RentalPaymentsListOut)
-def list_rental(
+async def list_rental(
     project: str = Query(..., description="Project ID"),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Список платежей аренды по проекту. При первом вызове с пустым массивом
     автосгенерирует 6 будущих pending-платежей из rental.next_payment_date."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     return _rental_payments_response(project, auto_generate=True)
-
 
 def _rental_payment_payload(entry: RentalPaymentIn) -> dict[str, Any]:
     """Validate + normalize payload for persistence."""
@@ -4486,15 +4413,15 @@ def _rental_payment_payload(entry: RentalPaymentIn) -> dict[str, Any]:
         payload["rate_brl"] = float(entry.rate_brl)
     return payload
 
-
 @router.post("/rental-payments", response_model=RentalPaymentsListOut)
-def add_rental(
+async def add_rental(
     entry: RentalPaymentIn,
     project: str = Query(...),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Добавить платёж аренды (paid или pending)."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.reports import add_rental_payment as _add
     payload = _rental_payment_payload(entry)
     ok = _add(project, payload)
@@ -4502,16 +4429,16 @@ def add_rental(
         raise HTTPException(status_code=404, detail="project_not_found")
     return _rental_payments_response(project, auto_generate=False)
 
-
 @router.patch("/rental-payments", response_model=RentalPaymentsListOut)
-def update_rental(
+async def update_rental(
     entry: RentalPaymentIn,
     project: str = Query(...),
     index: int = Query(..., ge=0),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Заменить платёж аренды по индексу."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.reports import update_rental_payment as _upd
     payload = _rental_payment_payload(entry)
     ok = _upd(project, index, payload)
@@ -4519,38 +4446,38 @@ def update_rental(
         raise HTTPException(status_code=404, detail="payment_not_found")
     return _rental_payments_response(project, auto_generate=False)
 
-
 @router.delete("/rental-payments", response_model=RentalPaymentsListOut)
-def remove_rental(
+async def remove_rental(
     project: str = Query(...),
     index: int = Query(..., ge=0),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Удалить платёж аренды."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.reports import delete_rental_payment as _del
     ok = _del(project, index)
     if not ok:
         raise HTTPException(status_code=404, detail="payment_not_found")
     return _rental_payments_response(project, auto_generate=False)
 
-
 # ── Publicidade reconciliation ──────────────────────────────────────────────
 
 @router.get("/publicidade/reconciliation", response_model=PublicidadeReconciliationOut)
-def get_publicidade_reconciliation(
+async def get_publicidade_reconciliation(
     project: str = Query(...),
     period_from: str = Query(..., alias="from"),
     period_to: str = Query(..., alias="to"),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Сверка расхода publicidade за период: CSV vs fatura.
 
     Вызывает `get_publicidade_by_period` дважды — отфильтрованно по типу источника,
     чтобы показать юзеру два числа и Δ. CSV = реальный дневной расход ML Ads.
     Fatura = то, что ML выставил/юзер закрыл как итог месяца.
     """
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.reports import get_publicidade_by_period
 
     try:
@@ -4585,21 +4512,21 @@ def get_publicidade_reconciliation(
         "total_days": int(csv_data.get("total_days") or 0),
     }
 
-
 @router.get("/coverage", response_model=CoverageOut)
-def get_coverage_endpoint(
+async def get_coverage_endpoint(
     project: str = Query(...),
     period_from: str = Query(..., alias="from"),
     period_to: str = Query(..., alias="to"),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Покрытие источниками данных (publicidade + armazenagem) за период.
 
     Возвращает сегменты дней, покрытых CSV / fatura / uncovered — для таймлайна.
     `csv_raw_range` — весь реальный охват CSV (до сужения слайдером),
     `csv_window` — пользовательское сужение из project.publicidade_csv_window.
     """
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.reports import get_coverage
 
     try:
@@ -4612,37 +4539,37 @@ def get_coverage_endpoint(
 
     return get_coverage(project.upper(), pf, pt)
 
-
 # ── Planned Payments / DDS Planning ─────────────────────────────────────────
 # Port of Streamlit _admin/dds_planning.py. Per-user list lives in
 # user_data.f2_planned_payments; monthly grid + recurring detection derived.
 
 @router.get("/planned-payments", response_model=PlannedPaymentsOut)
-def get_planned_payments(user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
-    _bind_user(user)
+async def get_planned_payments(user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.planning import load_payments
     payments = load_payments()
     return {"payments": payments, "count": len(payments)}
 
-
 @router.post("/planned-payments", response_model=PlannedPaymentMutOut)
-def create_planned_payment(
+async def create_planned_payment(
     body: PlannedPaymentIn,
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
-    _bind_user(user)
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.planning import add_payment
     row = add_payment(body.model_dump())
     return {"updated": True, "payment": row}
 
-
 @router.put("/planned-payments/{payment_id}", response_model=PlannedPaymentMutOut)
-def put_planned_payment(
+async def put_planned_payment(
     payment_id: int,
     body: PlannedPaymentIn,
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
-    _bind_user(user)
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.planning import update_payment, load_payments
     ok = update_payment(payment_id, body.model_dump())
     if not ok:
@@ -4650,55 +4577,55 @@ def put_planned_payment(
     row = next((p for p in load_payments() if int(p.get("id") or -1) == payment_id), None)
     return {"updated": True, "payment": row}
 
-
 @router.delete("/planned-payments/{payment_id}", response_model=PlannedPaymentMutOut)
-def remove_planned_payment(
+async def remove_planned_payment(
     payment_id: int,
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
-    _bind_user(user)
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.planning import delete_payment
     ok = delete_payment(payment_id)
     if not ok:
         raise HTTPException(status_code=404, detail="payment_not_found")
     return {"deleted": True}
 
-
 @router.get("/planned-payments/monthly", response_model=MonthlyPlanOut)
-def get_monthly_plan(
+async def get_monthly_plan(
     months: int = Query(12, ge=1, le=36),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Aggregate all planned payments into next N months. Used by Planning → Monthly grid."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.planning import build_monthly_plan
     plan = build_monthly_plan(months)
     months_sorted = sorted(plan.keys())
     buckets = {k: {"month": k, **v} for k, v in plan.items()}
     return {"months": months_sorted, "buckets": buckets}
 
-
 @router.get("/planned-payments/suggest-recurring", response_model=RecurringSuggestionsOut)
-def get_recurring_suggestions(
+async def get_recurring_suggestions(
     min_occurrences: int = Query(3, ge=2, le=12),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Scan all bank uploads of the user and suggest recurring payment patterns
     (same label appearing in >= min_occurrences distinct months)."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.planning import detect_recurring_from_bank_sync
     items = detect_recurring_from_bank_sync(user.id, min_occurrences)
     return {"suggestions": items, "min_occurrences": min_occurrences}
 
-
 # ── Loans (Balance sheet Liabilities) ───────────────────────────────────────
 
 @router.get("/loans", response_model=LoansListOut)
-def list_loans_endpoint(
+async def list_loans_endpoint(
     project: str = Query(...),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
-    _bind_user(user)
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.capital import load_loans, loans_balance
     items = load_loans(project)
     return {
@@ -4707,25 +4634,25 @@ def list_loans_endpoint(
         "total_outstanding_brl": loans_balance(project, None),
     }
 
-
 @router.post("/loans", response_model=LoanMutOut)
-def create_loan(
+async def create_loan(
     body: LoanIn,
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
-    _bind_user(user)
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.capital import add_loan
     row = add_loan(body.model_dump())
     return {"updated": True, "loan": row}
 
-
 @router.put("/loans/{loan_id}", response_model=LoanMutOut)
-def put_loan(
+async def put_loan(
     loan_id: int,
     body: LoanIn,
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
-    _bind_user(user)
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.capital import update_loan, load_loans
     ok = update_loan(loan_id, body.model_dump())
     if not ok:
@@ -4733,28 +4660,28 @@ def put_loan(
     row = next((it for it in load_loans() if int(it.get("id") or -1) == loan_id), None)
     return {"updated": True, "loan": row}
 
-
 @router.delete("/loans/{loan_id}", response_model=LoanMutOut)
-def remove_loan(
+async def remove_loan(
     loan_id: int,
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
-    _bind_user(user)
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.capital import delete_loan
     ok = delete_loan(loan_id)
     if not ok:
         raise HTTPException(status_code=404, detail="loan_not_found")
     return {"deleted": True}
 
-
 # ── Dividends (Equity reductions) ───────────────────────────────────────────
 
 @router.get("/dividends", response_model=DividendsListOut)
-def list_dividends_endpoint(
+async def list_dividends_endpoint(
     project: str = Query(...),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
-    _bind_user(user)
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.capital import load_dividends, dividends_total
     items = load_dividends(project)
     return {
@@ -4763,41 +4690,41 @@ def list_dividends_endpoint(
         "total_amount_brl": dividends_total(project, None),
     }
 
-
 @router.post("/dividends", response_model=DividendMutOut)
-def create_dividend(
+async def create_dividend(
     body: DividendIn,
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
-    _bind_user(user)
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.capital import add_dividend
     row = add_dividend(body.model_dump())
     return {"updated": True, "dividend": row}
 
-
 @router.delete("/dividends/{dividend_id}", response_model=DividendMutOut)
-def remove_dividend(
+async def remove_dividend(
     dividend_id: int,
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
-    _bind_user(user)
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.capital import delete_dividend
     ok = delete_dividend(dividend_id)
     if not ok:
         raise HTTPException(status_code=404, detail="dividend_not_found")
     return {"deleted": True}
 
-
 # ── Accounts Payable (feeds from planned_payments) ──────────────────────────
 
 @router.get("/accounts-payable", response_model=APListOut)
-def list_accounts_payable(
+async def list_accounts_payable(
     project: str = Query(...),
     as_of: Optional[str] = Query(None, description="ISO YYYY-MM-DD; default: today"),
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Unpaid expense planned_payments with date <= as_of. Feeds Balance sheet."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.planning import list_unpaid_ap, unpaid_ap_total
     as_of_date = _parse_iso(as_of) or date.today()
     items = list_unpaid_ap(project, as_of_date)
@@ -4808,15 +4735,15 @@ def list_accounts_payable(
         "total_brl": unpaid_ap_total(project, as_of_date),
     }
 
-
 @router.post("/planned-payments/{payment_id}/mark-paid", response_model=PlannedPaymentMutOut)
-def mark_planned_paid_endpoint(
+async def mark_planned_paid_endpoint(
     payment_id: int,
     body: MarkPaidIn,
-    user: CurrentUser = Depends(current_user),
-) -> dict[str, Any]:
+    user: CurrentUser = Depends(current_user), pool=Depends(get_pool))-> dict[str, Any]:
+
     """Toggle the paid status on a planned_payment row. UI: «Marcar como paga»."""
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.planning import mark_paid, load_payments
     if body.paid is False:
         stamp = False  # clear flag → marks unpaid
@@ -4827,7 +4754,6 @@ def mark_planned_paid_endpoint(
         raise HTTPException(status_code=404, detail="payment_not_found")
     row = next((p for p in load_payments() if int(p.get("id") or -1) == payment_id), None)
     return {"updated": True, "payment": row}
-
 
 @router.post("/backfill-fs-to-db")
 async def backfill_fs_to_db(
@@ -4892,7 +4818,6 @@ async def backfill_fs_to_db(
         "armazenagem_full": armazenagem,
         "stock_full": stock_full,
     }
-
 
 @router.get("/uploads/debug")
 async def uploads_debug(
