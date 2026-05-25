@@ -2787,6 +2787,152 @@ async def save_bank_transactions_grouped(
     db_save(_grouped_overrides_key(source_key), current)
     return {"saved": saved, "total_overrides": len(current)}
 
+
+# ── Transaction attachments (invoices / receipts) ───────────────────────────
+
+_TX_ATTACHMENTS_SQL = """
+CREATE TABLE IF NOT EXISTS tx_attachments (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  tx_hash TEXT NOT NULL,
+  source_key TEXT,
+  filename TEXT NOT NULL,
+  content_type TEXT,
+  file_data BYTEA NOT NULL,
+  invoice_number TEXT,
+  description TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_tx_attach_user_hash
+  ON tx_attachments(user_id, tx_hash);
+"""
+
+_tx_attach_schema_ready = False
+
+
+async def _ensure_tx_attach_schema(pool: asyncpg.Pool) -> None:
+    global _tx_attach_schema_ready
+    if _tx_attach_schema_ready:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(_TX_ATTACHMENTS_SQL)
+    _tx_attach_schema_ready = True
+
+
+@router.post("/tx-attachments/upload")
+async def upload_tx_attachment(
+    tx_hash: str = Form(...),
+    source_key: str = Form(""),
+    invoice_number: str = Form(""),
+    description: str = Form(""),
+    file: UploadFile = File(...),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Attach a file (invoice PDF, receipt photo) to a bank transaction."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await _ensure_tx_attach_schema(pool)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+
+    data = await file.read()
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="file_too_large_10mb")
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO tx_attachments
+              (user_id, tx_hash, source_key, filename, content_type, file_data,
+               invoice_number, description)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING id, filename, content_type, invoice_number, description,
+                      to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+            """,
+            effective_user_id, tx_hash.strip(), source_key.strip(),
+            file.filename or "attachment", file.content_type or "application/octet-stream",
+            data, invoice_number.strip(), description.strip(),
+        )
+    return dict(row) if row else {}
+
+
+@router.get("/tx-attachments")
+async def list_tx_attachments(
+    tx_hash: str = Query(...),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """List attachments for a transaction (without file data)."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await _ensure_tx_attach_schema(pool)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, filename, content_type, invoice_number, description,
+                   length(file_data) AS size_bytes,
+                   to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+              FROM tx_attachments
+             WHERE user_id = $1 AND tx_hash = $2
+             ORDER BY created_at
+            """,
+            effective_user_id, tx_hash.strip(),
+        )
+    return {"items": [dict(r) for r in rows]}
+
+
+@router.get("/tx-attachments/{attachment_id}/download")
+async def download_tx_attachment(
+    attachment_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> Response:
+    """Download a specific attachment file."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await _ensure_tx_attach_schema(pool)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT filename, content_type, file_data
+              FROM tx_attachments
+             WHERE id = $1 AND user_id = $2
+            """,
+            attachment_id, effective_user_id,
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="attachment_not_found")
+    return Response(
+        content=bytes(row["file_data"]),
+        media_type=row["content_type"] or "application/octet-stream",
+        headers={"Content-Disposition": f'inline; filename="{row["filename"]}"'},
+    )
+
+
+@router.delete("/tx-attachments/{attachment_id}")
+async def delete_tx_attachment(
+    attachment_id: int,
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Delete an attachment."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    await _ensure_tx_attach_schema(pool)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM tx_attachments WHERE id = $1 AND user_id = $2",
+            attachment_id, effective_user_id,
+        )
+    return {"deleted": "DELETE 1" in result}
+
+
 # ── Upload source-key diagnostic + re-detect ────────────────────────────────
 # Filename auto-detect rules evolved over time (e.g. fix(uploads): handle
 # spaces in ML export names); old uploads stayed in the DB with their
