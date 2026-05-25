@@ -28,6 +28,7 @@ router = APIRouter(
 class ProjectMembershipOut(BaseModel):
     project_name: str
     role: str
+    synced: bool = True
 
 
 class UserOut(BaseModel):

@@ -44,6 +44,7 @@ def _parse_projects(raw: Any) -> list[dict[str, str]]:
             out.append({
                 "project_name": str(item["project_name"]),
                 "role": str(item.get("role") or "viewer"),
+                "synced": bool(item.get("synced", True)),
             })
     return out
 
@@ -69,7 +70,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict[str, Any]:
 _PROJECTS_SUBQUERY = """
     COALESCE((
         SELECT jsonb_agg(
-                 jsonb_build_object('project_name', pm.project_name, 'role', pm.role)
+                 jsonb_build_object('project_name', pm.project_name, 'role', pm.role, 'synced', COALESCE(pm.synced, true))
                  ORDER BY pm.project_name
                )
           FROM project_members pm
