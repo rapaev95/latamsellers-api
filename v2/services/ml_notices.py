@@ -90,6 +90,10 @@ CREATE TABLE IF NOT EXISTS notification_settings (
 async def ensure_schema(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
         await conn.execute(CREATE_NOTICES_SQL)
+        await conn.execute("""
+            ALTER TABLE notification_settings
+              ADD COLUMN IF NOT EXISTS notify_promo_all BOOLEAN DEFAULT FALSE
+        """)
 
 
 # ── ML API ────────────────────────────────────────────────────────────────────
@@ -380,7 +384,8 @@ async def _dispatch_to_telegram(
     async with pool.acquire() as conn:
         settings = await conn.fetchrow(
             """
-            SELECT telegram_chat_id, notify_ml_news, COALESCE(language, 'pt') AS language
+            SELECT telegram_chat_id, notify_ml_news, COALESCE(language, 'pt') AS language,
+                   COALESCE(notify_promo_all, FALSE) AS notify_promo_all
               FROM notification_settings
              WHERE user_id = $1
             """,
@@ -466,6 +471,21 @@ async def _dispatch_to_telegram(
             """,
             user_id,
         )
+
+        # Suppress non-SMART promotions when user hasn't opted into all promos.
+        # SMART promos always pass — ML can auto-activate them so seller MUST see.
+        if not settings["notify_promo_all"]:
+            await conn.execute(
+                """
+                UPDATE ml_notices
+                   SET telegram_sent_at = NOW()
+                 WHERE user_id = $1
+                   AND telegram_sent_at IS NULL
+                   AND topic = 'promotions'
+                   AND COALESCE(upper(raw->>'type'), '') NOT IN ('SMART', '')
+                """,
+                user_id,
+            )
 
         # Atomic claim: SELECT + UPDATE telegram_sent_at в одной транзакции
         # с FOR UPDATE SKIP LOCKED. Это предотвращает race condition при
