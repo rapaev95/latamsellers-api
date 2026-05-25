@@ -1751,12 +1751,13 @@ async def get_pnl_matrix(
 
 
 @router.post("/sku-mapping/save", response_model=SkuBulkSaveOut)
-def save_sku_mapping(body: SkuBulkSaveIn, user: CurrentUser = Depends(current_user)):
+async def save_sku_mapping(body: SkuBulkSaveIn, user: CurrentUser = Depends(current_user), pool=Depends(get_pool)):
     """Bulk-update catalog rows. Each update merges into the existing catalog
     item (or creates a new one). After save, both project-resolver and projects
     cache are invalidated.
     """
-    _bind_user(user)
+    effective_user_id = await _resolve_primary_owner(pool, user)
+    _bind_user_id(effective_user_id)
     from v2.legacy.sku_catalog import load_catalog, save_catalog, normalize_sku
     from v2.legacy.config import invalidate_catalog_project_index, _invalidate_projects_cache
 
