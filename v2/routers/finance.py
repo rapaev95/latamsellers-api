@@ -2810,7 +2810,8 @@ async def save_bank_transactions_grouped(
         cat = ov.get("category")
         proj = ov.get("project")
         lbl = ov.get("label")
-        has_content = any(v for v in (cat, proj, lbl))
+        splits = ov.get("splits")
+        has_content = any(v for v in (cat, proj, lbl)) or splits
         if not has_content:
             if h in current:
                 current.pop(h, None)
@@ -2823,6 +2824,15 @@ async def save_bank_transactions_grouped(
             entry["project"] = proj
         if lbl is not None:
             entry["label"] = lbl
+        if splits is not None:
+            if isinstance(splits, list) and len(splits) > 0:
+                entry["splits"] = [
+                    {"project": s.get("project", ""), "amount": float(s.get("amount", 0))}
+                    for s in splits if isinstance(s, dict)
+                ]
+                entry["project"] = None
+            else:
+                entry.pop("splits", None)
         current[h] = entry
         saved += 1
 
