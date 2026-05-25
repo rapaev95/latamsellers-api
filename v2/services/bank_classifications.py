@@ -122,6 +122,8 @@ async def prefetch_for_user(pool: asyncpg.Pool, user_id: int) -> list[dict[str, 
                         r["project"] = gov["project"]
                     if gov.get("label"):
                         r["label"] = gov["label"]
+                    if gov.get("splits"):
+                        r["splits"] = gov["splits"]
 
                 r["_source_key"] = src
                 r["_upload_id"] = f.id
@@ -169,12 +171,24 @@ def aggregate_for_project(
     }
 
     for r in txs:
-        if (r.get("project") or "") != project:
-            continue
-        try:
-            val = float(r.get("value_brl") or 0)
-        except (TypeError, ValueError):
-            val = 0.0
+        splits = r.get("splits")
+        if splits and isinstance(splits, list):
+            split_amount = sum(
+                float(s.get("amount", 0))
+                for s in splits
+                if isinstance(s, dict) and s.get("project") == project
+            )
+            if split_amount == 0:
+                continue
+            original_val = float(r.get("value_brl") or 0)
+            val = -abs(split_amount) if original_val < 0 else abs(split_amount)
+        else:
+            if (r.get("project") or "") != project:
+                continue
+            try:
+                val = float(r.get("value_brl") or 0)
+            except (TypeError, ValueError):
+                val = 0.0
 
         if cutoff is not None:
             d_str = str(r.get("date") or "")[:10]
@@ -196,12 +210,7 @@ def aggregate_for_project(
         src_key = r.get("_source_key") or "unknown"
         result["by_source"][src_key] = result["by_source"].get(src_key, 0.0) + val
 
-        # Convert to legacy-shape tx so downstream code that iterates over
-        # `transactions` (looking for "Категория", "Valor", "Data") keeps
-        # working without changes.
         d_iso = str(r.get("date") or "")[:10]
-        # legacy format expected `DD/MM/YYYY` for compute_cashflow's
-        # `pd.to_datetime(ds, dayfirst=True)` — but that accepts ISO too.
         result["transactions"].append({
             "Data": d_iso,
             "Категория": r.get("category", ""),
