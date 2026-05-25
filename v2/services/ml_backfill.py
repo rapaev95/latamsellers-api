@@ -266,6 +266,21 @@ async def _enrich_order_with_margin(
     except (TypeError, ValueError):
         sale_price = 0.0
     if not item_id or sale_price <= 0:
+        # Even if sale_price=0 (e.g., cancelled order), inject cancellation
+        # stats when status is cancelled/invalid. Webhook handler at
+        # escalar.py:3501 also tries, but its debug-level exception handler
+        # swallowed the error silently and backfill path never ran this.
+        status_raw = str(enriched.get("status") or "").lower()
+        if item_id and status_raw in ("cancelled", "invalid"):
+            try:
+                from . import ml_orders as _ml_orders_cancel
+                cancel_stats = await _ml_orders_cancel.get_cancellation_stats(
+                    pool, user_id, item_id,
+                )
+                if cancel_stats:
+                    enriched["_cancellation_stats"] = cancel_stats
+            except Exception as err:  # noqa: BLE001
+                log.warning("cancel stats in _enrich failed %s: %s", item_id, err)
         return
 
     async with pool.acquire() as conn:
@@ -328,6 +343,24 @@ async def _enrich_order_with_margin(
                 enriched["_negative_margin_snoozed"] = True
     except Exception as err:  # noqa: BLE001
         log.debug("negative margin snooze check failed: %s", err)
+
+    # ── Cancellation stats per-SKU ────────────────────────────────────────
+    # Если заказ cancelled/invalid — подтянуть % отмен по этому MLB из
+    # ml_user_orders. Делаем тут (а не только в escalar.py:3501) потому что:
+    # 1) webhook handler ловит exception молча (был debug-level)
+    # 2) backfill path (_upsert_batch) вообще не инжектит stats
+    # 3) _enrich_order_with_margin вызывается из ОБОИХ путей (webhook + backfill)
+    status_for_cancel = str(enriched.get("status") or "").lower()
+    if item_id and status_for_cancel in ("cancelled", "invalid"):
+        try:
+            from . import ml_orders as _ml_orders_cancel
+            cancel_stats = await _ml_orders_cancel.get_cancellation_stats(
+                pool, user_id, item_id,
+            )
+            if cancel_stats:
+                enriched["_cancellation_stats"] = cancel_stats
+        except Exception as err:  # noqa: BLE001
+            log.warning("cancel stats inject %s: %s", item_id, err)
 
     # ── Velocity adjustment ───────────────────────────────────────────────
     # Cached margin uses vendas CSV для units_sold count, который юзер

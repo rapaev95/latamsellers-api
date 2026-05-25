@@ -3516,7 +3516,7 @@ async def orders_notice_from_webhook(
                 if stats:
                     enriched["_cancellation_stats"] = stats
         except Exception as err:  # noqa: BLE001
-            _log_n.debug("cancellation stats failed: %s", err)
+            _log_n.warning("cancellation stats failed mlb=%s: %s", mlb, err)
 
     try:
         notice = ml_normalize_svc.normalize_event(topic, resource, enriched)
