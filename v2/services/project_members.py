@@ -109,6 +109,7 @@ _CREATE_STATEMENTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_project_members_user ON project_members(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_project_members_project ON project_members(project_name)",
+    "ALTER TABLE project_members ADD COLUMN IF NOT EXISTS synced BOOLEAN DEFAULT TRUE",
     """
     CREATE TABLE IF NOT EXISTS project_invitations (
       id SERIAL PRIMARY KEY,
@@ -304,7 +305,8 @@ async def list_inherited_projects(
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT project_name, invited_by AS owner_id, role
+            SELECT project_name, invited_by AS owner_id, role,
+                   COALESCE(synced, TRUE) AS synced
               FROM project_members
              WHERE user_id = $1
                AND accepted_at IS NOT NULL
@@ -314,7 +316,7 @@ async def list_inherited_projects(
             user_id,
         )
     return [
-        {"project_name": r["project_name"], "owner_id": r["owner_id"], "role": r["role"]}
+        {"project_name": r["project_name"], "owner_id": r["owner_id"], "role": r["role"], "synced": r["synced"]}
         for r in rows
     ]
 
@@ -339,6 +341,25 @@ async def get_owner_for_project_via_membership(
             user_id, project_name,
         )
     return row["owner_id"] if row else None
+
+
+async def set_member_synced(
+    pool: asyncpg.Pool, *, member_user_id: int, project_name: str, synced: bool,
+) -> bool:
+    """Toggle data synchronization for a member. When synced=True (default),
+    the member reads/writes the owner's namespace. When False, they get their
+    own independent workspace."""
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE project_members
+               SET synced = $3, updated_at = NOW()
+             WHERE user_id = $1 AND project_name = $2
+               AND accepted_at IS NOT NULL
+            """,
+            member_user_id, project_name, synced,
+        )
+    return "UPDATE 1" in result
 
 
 async def admin_grant_membership(

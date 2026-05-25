@@ -120,7 +120,8 @@ async def _resolve_primary_owner(pool, caller: CurrentUser) -> int:
         memberships = await pm_svc.list_inherited_projects(pool, caller.id)
     except Exception:
         return caller.id
-    owner_ids = sorted({m["owner_id"] for m in memberships if m.get("owner_id")})
+    synced = [m for m in memberships if m.get("owner_id") and m.get("synced", True)]
+    owner_ids = sorted({m["owner_id"] for m in synced})
     return owner_ids[0] if owner_ids else caller.id
 
 async def _resolve_effective_user_for_upload(

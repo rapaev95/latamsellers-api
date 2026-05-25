@@ -206,3 +206,28 @@ async def revoke_project_endpoint(
     return row
 
 
+class SyncToggleIn(BaseModel):
+    project_name: str
+    synced: bool
+
+
+@router.post("/{user_id}/projects/sync", response_model=UserOut)
+async def toggle_member_sync(
+    user_id: int,
+    body: SyncToggleIn,
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Toggle data synchronization for a member. synced=True means the member
+    reads/writes the owner's namespace; False gives them their own workspace."""
+    await project_members_svc.ensure_schema(pool)
+    ok = await project_members_svc.set_member_synced(
+        pool, member_user_id=user_id, project_name=body.project_name, synced=body.synced,
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="membership_not_found")
+    row = await store.get_user(pool, user_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="user_not_found")
+    return row
+
+
