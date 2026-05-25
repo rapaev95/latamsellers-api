@@ -2801,6 +2801,7 @@ CREATE TABLE IF NOT EXISTS tx_attachments (
   file_data BYTEA NOT NULL,
   invoice_number TEXT,
   description TEXT,
+  parsed_data JSONB,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_tx_attach_user_hash
@@ -2816,7 +2817,66 @@ async def _ensure_tx_attach_schema(pool: asyncpg.Pool) -> None:
         return
     async with pool.acquire() as conn:
         await conn.execute(_TX_ATTACHMENTS_SQL)
+        await conn.execute("ALTER TABLE tx_attachments ADD COLUMN IF NOT EXISTS parsed_data JSONB")
     _tx_attach_schema_ready = True
+
+
+def _try_parse_invoice(file_data: bytes, filename: str, content_type: str) -> dict | None:
+    """Best-effort invoice parsing. Tries NFS-e → DANFE → NF-e XML."""
+    import json as _json
+
+    if content_type and 'pdf' in content_type.lower() or (filename or '').lower().endswith('.pdf'):
+        try:
+            from v2.legacy.reports import parse_nfse_pdf_bytes
+            result = parse_nfse_pdf_bytes(file_data, filename)
+            if result:
+                result["_parser"] = "nfse"
+                return result
+        except Exception:
+            pass
+        try:
+            from v2.services.nf_parser import parse_danfe_pdf
+            parsed_nf = parse_danfe_pdf(file_data)
+            result = {
+                "_parser": "danfe",
+                "nf_number": parsed_nf.nf_number,
+                "nf_series": parsed_nf.nf_series,
+                "nf_date": parsed_nf.nf_date,
+                "total_brl": parsed_nf.total_brl,
+                "chave_acesso": parsed_nf.chave_acesso,
+                "operation": parsed_nf.operation,
+                "emitter_name": parsed_nf.emitter_name,
+                "emitter_cnpj": parsed_nf.emitter_cnpj,
+                "lines_count": len(parsed_nf.lines) if parsed_nf.lines else 0,
+            }
+            return result
+        except Exception:
+            pass
+    elif content_type and 'xml' in content_type.lower() or (filename or '').lower().endswith('.xml'):
+        try:
+            from v2.services.nf_parser import parse_nfe_xml
+            parsed_nf = parse_nfe_xml(file_data)
+            result = {
+                "_parser": "nfe_xml",
+                "nf_number": parsed_nf.nf_number,
+                "nf_series": parsed_nf.nf_series,
+                "nf_date": parsed_nf.nf_date,
+                "total_brl": parsed_nf.total_brl,
+                "chave_acesso": parsed_nf.chave_acesso,
+                "emitter_name": parsed_nf.emitter_name,
+                "emitter_cnpj": parsed_nf.emitter_cnpj,
+                "dest_name": parsed_nf.dest_name,
+                "lines_count": len(parsed_nf.lines) if parsed_nf.lines else 0,
+                "lines": [
+                    {"sku": l.sku, "description": l.description, "quantity": l.quantity,
+                     "unit_cost": l.unit_cost, "total_cost": l.total_cost}
+                    for l in (parsed_nf.lines or [])
+                ],
+            }
+            return result
+        except Exception:
+            pass
+    return None
 
 
 @router.post("/tx-attachments/upload")
@@ -2839,19 +2899,33 @@ async def upload_tx_attachment(
     if len(data) > 10 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="file_too_large_10mb")
 
+    fname = file.filename or "attachment"
+    ctype = file.content_type or "application/octet-stream"
+
+    parsed = _try_parse_invoice(data, fname, ctype)
+    inv_num = invoice_number.strip()
+    desc = description.strip()
+    if parsed and not inv_num:
+        inv_num = str(parsed.get("numero") or parsed.get("nf_number") or "")
+    if parsed and not desc:
+        desc = str(parsed.get("descricao") or parsed.get("operation") or "")
+
+    import json as _json
+    parsed_json = _json.dumps(parsed, ensure_ascii=False, default=str) if parsed else None
+
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO tx_attachments
               (user_id, tx_hash, source_key, filename, content_type, file_data,
-               invoice_number, description)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               invoice_number, description, parsed_data)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
             RETURNING id, filename, content_type, invoice_number, description,
+                      parsed_data,
                       to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
             """,
             effective_user_id, tx_hash.strip(), source_key.strip(),
-            file.filename or "attachment", file.content_type or "application/octet-stream",
-            data, invoice_number.strip(), description.strip(),
+            fname, ctype, data, inv_num, desc, parsed_json,
         )
     return dict(row) if row else {}
 
@@ -2872,6 +2946,7 @@ async def list_tx_attachments(
         rows = await conn.fetch(
             """
             SELECT id, filename, content_type, invoice_number, description,
+                   parsed_data,
                    length(file_data) AS size_bytes,
                    to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
               FROM tx_attachments
