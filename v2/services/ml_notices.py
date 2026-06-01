@@ -472,8 +472,11 @@ async def _dispatch_to_telegram(
             user_id,
         )
 
-        # Suppress non-SMART promotions when user hasn't opted into all promos.
-        # SMART promos always pass — ML can auto-activate them so seller MUST see.
+        # Suppress ALL promotions when user hasn't opted into the promo feed.
+        # Раньше SMART был исключением (пропускался всегда, потому что ML
+        # может авто-активировать его без согласия). User requested: SMART
+        # тоже под фильтр — он сам разберётся когда нужны все промо
+        # (включит notify_promo_all=true в /settings/notifications).
         if not settings["notify_promo_all"]:
             await conn.execute(
                 """
@@ -482,7 +485,6 @@ async def _dispatch_to_telegram(
                  WHERE user_id = $1
                    AND telegram_sent_at IS NULL
                    AND topic = 'promotions'
-                   AND COALESCE(upper(raw->>'type'), '') NOT IN ('SMART', '')
                 """,
                 user_id,
             )
