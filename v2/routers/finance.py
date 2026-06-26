@@ -189,9 +189,13 @@ async def list_projects(
     Inherited projects are loaded from each inviter's user_data so the project
     metadata (sku_prefixes, launch_date, etc.) matches what the owner sees.
     """
-    # Own projects
-    effective_user_id = await _resolve_primary_owner(pool, user)
-    _bind_user_id(effective_user_id)
+    # Own projects — from the CALLER's own namespace only. Must NOT use
+    # _resolve_primary_owner here: that rebinds a collaborator to the project
+    # owner and would dump EVERY project the owner has, leaking other clients'
+    # projects into this user's dropdown. Cross-client isolation depends on
+    # this staying user.id; the inherited-memberships loop below adds back
+    # exactly (and only) the projects the caller was invited to.
+    _bind_user_id(user.id)
     projects: dict = dict(legacy_config.load_projects() or {})
 
     # Projects inherited via memberships — load from each inviter's namespace
