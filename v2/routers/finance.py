@@ -276,7 +276,7 @@ async def get_reports(
     def _compute_bundle() -> dict[str, Any]:
         # Lazy imports — only pay the cost when we actually need to recompute.
         from v2.legacy.finance import compute_pnl, compute_cashflow, compute_balance
-        from v2.legacy.reports import load_vendas_ml_report, has_1yr_bank_statements
+        from v2.legacy.reports import load_vendas_ml_report, has_1yr_bank_statements, get_vendas_ml_by_project
 
         # Pre-warm the vendas DataFrame cache in the request context so all three
         # parallel compute tasks below find it hot. Without this the threads race
@@ -326,6 +326,22 @@ async def get_reports(
         bal_res, bal_err = results["balance"]
         if bal_res is not None: bundle["balance"] = _dataclass_to_dict(bal_res)
         if bal_err: bundle["balance_error"] = bal_err
+
+        # Sales still shipping (bucket=in_progress) — excluded from the
+        # delivered-only P&L above, but surfaced so the UI can show how much
+        # revenue is in transit. Snapshot of the whole dataset (not period-
+        # filtered): "currently in transit" is inherently a point-in-time view.
+        try:
+            in_prog = (get_vendas_ml_by_project(project) or {}).get("in_progress")
+            if in_prog:
+                bundle["in_transit"] = {
+                    "count": int(in_prog.get("count", 0) or 0),
+                    "units": int(in_prog.get("units", 0) or 0),
+                    "bruto": float(in_prog.get("bruto", 0) or 0),
+                    "net": float(in_prog.get("net", 0) or 0),
+                }
+        except Exception:  # noqa: BLE001 — in-transit is non-critical, never break the bundle
+            pass
         return bundle
 
     # Pre-fetch every bank statement, parse it, apply user overrides

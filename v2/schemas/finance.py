@@ -172,6 +172,18 @@ class BalanceReportOut(BaseModel):
 
 # ── Bundle (single endpoint returns three reports) ──────────────────────────
 
+class InTransitOut(BaseModel):
+    """Sales not yet delivered (bucket=in_progress) — excluded from revenue.
+
+    Surfaced separately so the UI can show "R$ X em trânsito" without it
+    inflating the delivered-only P&L.
+    """
+    count: int = 0
+    units: int = 0
+    bruto: float = 0.0
+    net: float = 0.0
+
+
 class ReportsBundleOut(BaseModel):
     project: str
     period: dict[str, str]  # {"from": "...", "to": "..."}
@@ -182,6 +194,7 @@ class ReportsBundleOut(BaseModel):
     cashflow_error: Optional[str] = None
     balance: Optional[BalanceReportOut] = None
     balance_error: Optional[str] = None
+    in_transit: Optional[InTransitOut] = None
 
 
 class ProjectsListOut(BaseModel):
