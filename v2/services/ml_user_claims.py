@@ -31,6 +31,39 @@ log = logging.getLogger(__name__)
 ML_API_BASE = "https://api.mercadolibre.com"
 RATE_SLEEP = 0.2
 ENRICH_CONCURRENCY = 10
+ML_MAX_CONCURRENCY = 5      # global ceiling on simultaneous ML requests
+ML_MAX_RETRIES = 3          # retries on 429 before giving up
+
+# Global (process-wide) on purpose: ML rate-limits per token/app, so we cap
+# concurrent requests across ALL claims and all users, not per refresh.
+_ml_sem = asyncio.Semaphore(ML_MAX_CONCURRENCY)
+
+
+async def _ml_get(
+    http: httpx.AsyncClient, token: str, url: str, *, timeout: float = 15.0
+) -> httpx.Response:
+    """GET against ML with a global concurrency ceiling and 429 backoff.
+
+    Returns the httpx.Response so callers keep their existing status checks.
+    Respects the Retry-After header; falls back to exponential backoff.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    backoff = 0.5
+    last: httpx.Response | None = None
+    for attempt in range(ML_MAX_RETRIES + 1):
+        async with _ml_sem:
+            last = await http.get(url, headers=headers, timeout=timeout)
+        if last.status_code != 429:
+            return last
+        retry_after = last.headers.get("Retry-After")
+        try:
+            delay = float(retry_after) if retry_after else backoff
+        except ValueError:
+            delay = backoff
+        log.warning("ML 429 %s attempt=%s sleep=%.1fs", url, attempt + 1, delay)
+        await asyncio.sleep(delay)
+        backoff *= 2
+    return last  # last 429 — existing status checks downstream handle it
 
 
 CREATE_SQL = """
@@ -85,14 +118,13 @@ async def _search_claims(
     """
     out: list[dict] = []
     offset = 0
-    headers = {"Authorization": f"Bearer {token}"}
     for _ in range(max_pages):
         url = (
             f"{ML_API_BASE}/post-purchase/v1/claims/search"
             f"?status={status}&sort=date_created&limit=50&offset={offset}"
         )
         try:
-            r = await http.get(url, headers=headers, timeout=20.0)
+            r = await _ml_get(http, token, url, timeout=20.0)
         except Exception as err:  # noqa: BLE001
             log.warning("claims/search status=%s offset=%s failed: %s", status, offset, err)
             break
@@ -114,9 +146,9 @@ async def _search_claims(
 async def _fetch_one_claim(http: httpx.AsyncClient, token: str, claim_id: int) -> dict | None:
     """Fetch a single claim by id (used by reconciliation)."""
     try:
-        r = await http.get(
+        r = await _ml_get(
+            http, token,
             f"{ML_API_BASE}/post-purchase/v1/claims/{claim_id}",
-            headers={"Authorization": f"Bearer {token}"},
             timeout=15.0,
         )
         if r.status_code == 200:
@@ -135,9 +167,9 @@ async def _enrich_one(http: httpx.AsyncClient, token: str, claim: dict) -> dict:
         return claim
     # 1. Full claim payload
     try:
-        r = await http.get(
+        r = await _ml_get(
+            http, token,
             f"{ML_API_BASE}/post-purchase/v1/claims/{cid}",
-            headers={"Authorization": f"Bearer {token}"},
             timeout=15.0,
         )
         if r.status_code == 200:
@@ -157,9 +189,9 @@ async def _enrich_one(http: httpx.AsyncClient, token: str, claim: dict) -> dict:
     )
     if has_returns:
         try:
-            r = await http.get(
+            r = await _ml_get(
+                http, token,
                 f"{ML_API_BASE}/post-purchase/v2/claims/{cid}/returns",
-                headers={"Authorization": f"Bearer {token}"},
                 timeout=15.0,
             )
             if r.status_code == 200:
@@ -175,9 +207,9 @@ async def _enrich_one(http: httpx.AsyncClient, token: str, claim: dict) -> dict:
                     )
                     if has_reviews and ret.get("id"):
                         try:
-                            rr = await http.get(
+                            rr = await _ml_get(
+                                http, token,
                                 f"{ML_API_BASE}/post-purchase/v1/returns/{ret['id']}/reviews",
-                                headers={"Authorization": f"Bearer {token}"},
                                 timeout=10.0,
                             )
                             if rr.status_code == 200:
@@ -226,9 +258,9 @@ async def _enrich_one(http: httpx.AsyncClient, token: str, claim: dict) -> dict:
     aggregated: list[dict] = []
     # (a) claims/{id}/messages
     try:
-        r = await http.get(
+        r = await _ml_get(
+            http, token,
             f"{ML_API_BASE}/post-purchase/v1/claims/{cid}/messages",
-            headers={"Authorization": f"Bearer {token}"},
             timeout=15.0,
         )
         if r.status_code == 200:
@@ -278,9 +310,9 @@ async def _enrich_one(http: httpx.AsyncClient, token: str, claim: dict) -> dict:
     order_id = claim.get("resource_id")
     if order_id:
         try:
-            r = await http.get(
+            r = await _ml_get(
+                http, token,
                 f"{ML_API_BASE}/orders/{order_id}",
-                headers={"Authorization": f"Bearer {token}"},
                 timeout=15.0,
             )
             if r.status_code == 200:
