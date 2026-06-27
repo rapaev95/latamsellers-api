@@ -29,4 +29,10 @@ EXPOSE 8000
 # *.railway.internal resolves to AAAA only and Railway's healthcheck arrives as
 # IPv4 → both are served by the same [::] socket. uvicorn --host :: was
 # unreliable because uvicorn forces IPV6_V6ONLY=1; gunicorn does not.
-CMD ["sh", "-c", "gunicorn main:app -k uvicorn.workers.UvicornWorker -w 1 --bind [::]:${PORT:-8000}"]
+# --timeout 120 (> the 90s internal _COMPUTE_TIMEOUT_SECONDS): a cold report
+# compute for a large project (ARTHUR) can run tens of seconds; gunicorn's
+# default 30s timeout was killing the worker mid-compute, so the proxy saw
+# UND_ERR_SOCKET and the bundle never reached the durable cache — making every
+# load a fresh, doomed recompute. The raised timeout lets the compute finish,
+# cache, and serve ~50ms thereafter.
+CMD ["sh", "-c", "gunicorn main:app -k uvicorn.workers.UvicornWorker -w 1 --timeout 120 --graceful-timeout 120 --bind [::]:${PORT:-8000}"]

@@ -1911,7 +1911,9 @@ def _load_vendas_from_db_sync(user_id: int) -> "pd.DataFrame | None":
 
 
 _VENDAS_DF_CACHE: dict = {}  # {(user_id, fingerprint): (timestamp, df)}
-_VENDAS_DF_TTL = 120  # seconds
+_VENDAS_DF_TTL = 1800  # seconds. Safe to keep long: invalidate_vendas_cache()
+# is called explicitly on every vendas upload, so staleness can't outlive a
+# real data change. 120s was forcing a full 15-file re-parse every 2 minutes.
 
 # Кеш помесячной P&L-матрицы: ключ (user_id, project, fingerprint) — тот же
 # fingerprint что и у vendas, т.к. матрица строится из vendas + publicidade +
@@ -2720,6 +2722,30 @@ def list_orphan_pacotes() -> list[dict]:
             "bucket": str(r.get("__bucket", "") or ""),
         })
     return rows
+
+
+def get_in_transit_summary(project: str) -> dict:
+    """Cheap, vectorized in_progress (in-transit) aggregate for one project.
+
+    Used by the /reports bundle's `in_transit` field. Deliberately avoids
+    get_vendas_ml_by_project() — that builds a full per-SKU breakdown via a
+    row-by-row iterrows() loop (~1.7s on a 4k-row project), all of it thrown
+    away here. This stays vectorized so the (already heavy) cold report
+    compute isn't slowed further.
+    """
+    empty = {"count": 0, "units": 0, "bruto": 0.0, "net": 0.0}
+    df = load_vendas_ml_report()
+    if df is None or df.empty or "__project" not in df.columns or "__bucket" not in df.columns:
+        return empty
+    sub = df[(df["__project"] == project) & (df["__bucket"] == "in_progress")]
+    if sub.empty:
+        return empty
+    return {
+        "count": int(len(sub)),
+        "units": int(pd.to_numeric(sub["Unidades"], errors="coerce").fillna(0).sum()),
+        "bruto": float(pd.to_numeric(sub["Receita por produtos (BRL)"], errors="coerce").fillna(0).sum()),
+        "net": float(pd.to_numeric(sub["Total (BRL)"], errors="coerce").fillna(0).sum()),
+    }
 
 
 def get_vendas_ml_by_project(project: str) -> dict:
