@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextvars
+import os
 from datetime import date, datetime
 from typing import Any, Callable, Optional, TypeVar
 
@@ -56,6 +57,20 @@ router = APIRouter(prefix="/finance", tags=["finance"])
 
 _COMPUTE_TIMEOUT_SECONDS = 90  # legacy compute can scan many files; cap response time
 
+# Single process-wide compute pool. A per-request ThreadPoolExecutor +
+# shutdown(wait=False) LEAKED threads: any compute that exceeded the timeout
+# kept running (threads can't be killed) and was orphaned, so under load the
+# process hit the OS thread ceiling and the NEXT pool.submit() raised
+# `RuntimeError: can't start new thread` — 500-ing EVERY finance endpoint (all
+# projects, even fresh=1) until a worker restart. A bounded shared pool caps
+# live threads: excess work QUEUES instead of spawning unbounded threads, and a
+# slow/timed-out task at worst holds a worker until it finishes (then reused),
+# never crashing the process. Tune via FINANCE_COMPUTE_POOL_MAX.
+_COMPUTE_POOL_MAX = max(1, int(os.environ.get("FINANCE_COMPUTE_POOL_MAX", "12")))
+_COMPUTE_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_COMPUTE_POOL_MAX, thread_name_prefix="fin-compute",
+)
+
 T = TypeVar("T")
 
 def _run_parallel_with_timeout(
@@ -64,32 +79,45 @@ def _run_parallel_with_timeout(
 ) -> dict[str, tuple[Any | None, str | None]]:
     """Run several sync legacy computes in parallel with a single shared timeout.
 
-    Total wall time is capped at `timeout` (not N × timeout). Orphaned threads
-    keep running but we stop waiting on them — Python can't kill threads safely.
+    Total wall time is capped at `timeout` (not N × timeout). Runs on the
+    process-wide `_COMPUTE_POOL`: a task that outlives the timeout keeps its
+    worker until it finishes (Python can't kill threads), but the pool is
+    bounded so those slow tasks can't accumulate into thread exhaustion.
     """
     out: dict[str, tuple[Any | None, str | None]] = {label: (None, None) for label in tasks}
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(tasks)))
-    # Each task gets its OWN copy of the parent context (otherwise ctx.run on
-    # the same ctx in parallel raises "cannot enter context: already entered").
-    future_to_label = {
-        pool.submit(contextvars.copy_context().run, fn): label for label, fn in tasks.items()
-    }
+    # Submit onto the shared pool. Each task gets its OWN copy of the parent
+    # context (otherwise ctx.run on the same ctx in parallel raises "cannot
+    # enter context: already entered"). Guard submit(): if the interpreter still
+    # can't spawn a worker, degrade THIS task to an error tuple rather than let
+    # the exception bubble into a 500 for the whole request.
+    future_to_label: dict[concurrent.futures.Future, str] = {}
+    for label, fn in tasks.items():
+        try:
+            fut = _COMPUTE_POOL.submit(contextvars.copy_context().run, fn)
+        except RuntimeError as e:  # e.g. "can't start new thread"
+            out[label] = (None, f"compute_unavailable: {e}")
+            continue
+        future_to_label[fut] = label
 
-    try:
-        for future in concurrent.futures.as_completed(future_to_label, timeout=timeout):
-            label = future_to_label[future]
-            try:
-                out[label] = (future.result(), None)
-            except Exception as e:
-                out[label] = (None, f"{type(e).__name__}: {e}")
-    except concurrent.futures.TimeoutError:
-        pass
+    if future_to_label:
+        try:
+            for future in concurrent.futures.as_completed(future_to_label, timeout=timeout):
+                label = future_to_label[future]
+                try:
+                    out[label] = (future.result(), None)
+                except Exception as e:
+                    out[label] = (None, f"{type(e).__name__}: {e}")
+        except concurrent.futures.TimeoutError:
+            pass
 
-    # Mark unfinished tasks with a timeout error
-    for future, label in future_to_label.items():
-        if not future.done() and out[label][1] is None:
-            out[label] = (None, f"{label}_timeout_{timeout}s")
-    pool.shutdown(wait=False, cancel_futures=True)
+        # Mark unfinished tasks with a timeout error. cancel() reclaims the
+        # future only if it's still QUEUED (never started); a running task
+        # keeps its shared-pool worker until it finishes, then the worker is
+        # reused — no thread leak either way.
+        for future, label in future_to_label.items():
+            if not future.done() and out[label][1] is None:
+                future.cancel()
+                out[label] = (None, f"{label}_timeout_{timeout}s")
     return out
 
 def _bind_user(user: CurrentUser) -> None:
