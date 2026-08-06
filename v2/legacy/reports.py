@@ -1870,9 +1870,9 @@ def _load_vendas_from_db_sync(user_id: int) -> "pd.DataFrame | None":
         conn = psycopg2.connect(dsn)
         cur = conn.cursor()
         cur.execute(
-            """SELECT filename, file_bytes FROM uploads
-               WHERE user_id=%s AND source_key='vendas_ml' AND file_bytes IS NOT NULL
-               ORDER BY created_at DESC""",
+            """SELECT filename, file_bytes, EXTRACT(EPOCH FROM created_at)::bigint
+               FROM uploads
+               WHERE user_id=%s AND source_key='vendas_ml' AND file_bytes IS NOT NULL""",
             (user_id,),
         )
         rows = cur.fetchall()
@@ -1883,16 +1883,33 @@ def _load_vendas_from_db_sync(user_id: int) -> "pd.DataFrame | None":
     if not rows:
         return None
 
-    parts: list[pd.DataFrame] = []
-    filenames: list[str] = []
-    for filename, blob in rows:
+    # Order files by EXPORT freshness, NOT upload time. An ML vendas export is a
+    # point-in-time snapshot: the same order shows partial revenue while "in
+    # transit" and its final revenue once delivered. We keep the value from the
+    # freshest EXPORT per (order, SKU) so re-uploading an OLD export can never
+    # overwrite newer final values. Freshness = date embedded in the filename
+    # (YYYYMMDD / YYYY-MM-DD), falling back to upload time when unparseable.
+    import re as _re_vendas
+    def _export_key(fname: str, ts: int) -> tuple:
+        m = _re_vendas.search(r"(20\d{2})[-_ ]?(0[1-9]|1[0-2])[-_ ]?(0[1-9]|[12]\d|3[01])", fname or "")
+        if m:
+            return (1, int(m.group(1) + m.group(2) + m.group(3)), ts)
+        return (0, 0, ts)
+
+    parsed: list = []  # (freshness_key, filename, df_part)
+    for filename, blob, ts in rows:
         df_part = _parse_one_vendas_file(filename, bytes(blob))
         if df_part is None or df_part.empty:
             continue
-        parts.append(df_part)
-        filenames.append(filename)
-    if not parts:
+        parsed.append((_export_key(filename, int(ts or 0)), filename, df_part))
+    if not parsed:
         return None
+    # Freshest first → drop_duplicates(keep="first") below keeps the freshest
+    # per-order value; the union across all files means orders that only exist
+    # in older exports (periods a new export doesn't cover) are never dropped.
+    parsed.sort(key=lambda x: x[0], reverse=True)
+    parts: list[pd.DataFrame] = [p[2] for p in parsed]
+    filenames: list[str] = [p[1] for p in parsed]
 
     # Align columns via pd.concat (handles differing column sets gracefully)
     df = pd.concat(parts, ignore_index=True)

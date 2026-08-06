@@ -39,7 +39,7 @@ log = logging.getLogger(__name__)
 # Bump when compute_pnl / compute_cashflow / compute_balance / abc.aggregate
 # change shape (added / removed / renamed fields). Bumping invalidates every
 # cached payload at once — no manual `invalidate_*` calls needed.
-COMPUTE_VERSION = "v5"  # v5: dedup verbatim-duplicate publicidade rows (was double-counting ad spend)
+COMPUTE_VERSION = "v6"  # v6: vendas merge keeps freshest EXPORT per order (stable revenue across re-uploads)
 
 # Upload source_keys that influence any finance/abc compute. MAX(created_at)
 # per source feeds the fingerprint.
