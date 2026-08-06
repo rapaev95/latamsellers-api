@@ -3032,6 +3032,7 @@ def _parse_publicidade_rows(
         return []
 
     out: list[dict] = []
+    seen_rows: set = set()  # drop rows that repeat verbatim within one file
     for r in rows[2:]:
         max_idx = max(x for x in (i_desde, i_ate, i_mlb, i_inv) if x is not None)
         if len(r) <= max_idx:
@@ -3054,14 +3055,25 @@ def _parse_publicidade_rows(
                 inv = 0.0
         sku_from_mlb = (mlb_to_sku or {}).get(mlb, "")
         project = get_project_by_sku(sku_from_mlb, mlb)
+        campanha = str(r[i_camp]) if i_camp is not None and len(r) > i_camp and r[i_camp] is not None else ""
+        titulo = str(r[i_titulo]) if i_titulo is not None and len(r) > i_titulo and r[i_titulo] is not None else ""
+        # Some ML "report-pads" exports repeat a line verbatim (same anúncio /
+        # campanha / período / investimento) — summing them double-counts ad
+        # spend (ARTHUR Jun–Jul 2026: +3 717,48 from 25 duplicate rows). Drop
+        # rows identical in EVERY field; genuinely distinct charges differ in at
+        # least one field (usually investimento) and are kept.
+        dedup_key = (desde, ate, mlb, campanha, titulo, round(inv, 2))
+        if dedup_key in seen_rows:
+            continue
+        seen_rows.add(dedup_key)
         out.append({
             "file_name": file_name,
             "desde": desde,
             "ate": ate,
             "project": project,
             "mlb": mlb,
-            "campanha": str(r[i_camp]) if i_camp is not None and len(r) > i_camp and r[i_camp] is not None else "",
-            "titulo": str(r[i_titulo]) if i_titulo is not None and len(r) > i_titulo and r[i_titulo] is not None else "",
+            "campanha": campanha,
+            "titulo": titulo,
             "investimento": inv,
         })
     return out
