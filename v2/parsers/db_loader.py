@@ -8,7 +8,8 @@ alternative selected by `LS_STORAGE_MODE=db` (see `v2.settings`).
 """
 from __future__ import annotations
 
-from typing import Iterable
+import time
+from typing import Any, Iterable
 
 import asyncpg
 
@@ -24,12 +25,66 @@ STOCK_FULL_SOURCE_KEY = "stock_full"
 PUBLICIDADE_SOURCE_KEY = "ads_publicidade"
 
 
+# ── Parsed-dataset cache ──────────────────────────────────────────────────────
+# Re-parsing every uploaded file (15 vendas + armazenagem + stock + ads) on
+# every /escalar/products load was the page's dominant latency. Cache the
+# parsed result per (user, source), keyed by a cheap fingerprint of the source's
+# upload rows (id + created_at, no bytes fetched). A new/removed/replaced upload
+# changes the fingerprint → automatic rebuild, so there's nothing to invalidate
+# from the upload path. TTL is only a safety cap on staleness of the fingerprint
+# itself. Callers treat the result as read-only (they build new structures from
+# it), so returning the shared reference is safe.
+_PARSE_CACHE: dict[tuple[int, str], tuple[str, float, Any]] = {}
+_PARSE_CACHE_TTL = 1800  # seconds
+_MISS = object()
+
+
+async def _source_fingerprint(pool: asyncpg.Pool, user_id: int, source_key: str) -> str:
+    """Cheap freshness probe for a source's uploads — ids + created_at, no bytes."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, EXTRACT(EPOCH FROM created_at)::bigint AS ts
+                 FROM uploads
+                WHERE user_id = $1 AND source_key = $2 AND file_bytes IS NOT NULL
+                ORDER BY id""",
+            user_id, source_key,
+        )
+    return ";".join(f"{r['id']}:{r['ts']}" for r in rows) or "empty"
+
+
+def _cache_get(user_id: int, source_key: str, fp: str) -> Any:
+    hit = _PARSE_CACHE.get((user_id, source_key))
+    if hit and hit[0] == fp and (time.monotonic() - hit[1]) < _PARSE_CACHE_TTL:
+        return hit[2]
+    return _MISS
+
+
+def _cache_put(user_id: int, source_key: str, fp: str, result: Any) -> Any:
+    _PARSE_CACHE[(user_id, source_key)] = (fp, time.monotonic(), result)
+    return result
+
+
+def invalidate_parse_cache(user_id: int | None = None) -> None:
+    """Drop cached parses for one user (or all). The fingerprint already
+    self-invalidates on upload; this is a belt-and-suspenders hook for callers
+    that want an immediate, explicit clear."""
+    if user_id is None:
+        _PARSE_CACHE.clear()
+        return
+    for k in [k for k in _PARSE_CACHE if k[0] == user_id]:
+        _PARSE_CACHE.pop(k, None)
+
+
 async def load_user_vendas(pool: asyncpg.Pool, user_id: int) -> list[VendasRow]:
     """All Vendas ML rows across the user's uploaded files, deduped by sale_id.
 
     Sale_id dedupe matches the FS loader — snapshot files (90d rolling) overlap
     with monthly exports and must not double-count.
     """
+    fp = await _source_fingerprint(pool, user_id, VENDAS_SOURCE_KEY)
+    cached = _cache_get(user_id, VENDAS_SOURCE_KEY, fp)
+    if cached is not _MISS:
+        return cached
     files = await uploads_storage.fetch_files_by_source(pool, user_id, VENDAS_SOURCE_KEY)
     seen: set[str] = set()
     out: list[VendasRow] = []
@@ -42,11 +97,15 @@ async def load_user_vendas(pool: asyncpg.Pool, user_id: int) -> list[VendasRow]:
             if row.sale_id:
                 seen.add(row.sale_id)
             out.append(row)
-    return out
+    return _cache_put(user_id, VENDAS_SOURCE_KEY, fp, out)
 
 
 async def load_user_armazenagem(pool: asyncpg.Pool, user_id: int) -> dict[str, StorageData]:
     """Merge every armazenagem file the user uploaded; freshest end_date wins per SKU."""
+    fp = await _source_fingerprint(pool, user_id, ARMAZENAGEM_SOURCE_KEY)
+    cached = _cache_get(user_id, ARMAZENAGEM_SOURCE_KEY, fp)
+    if cached is not _MISS:
+        return cached
     files = await uploads_storage.fetch_files_by_source(pool, user_id, ARMAZENAGEM_SOURCE_KEY)
     parsed: list[tuple[int, list[StorageData]]] = [
         parse_armazenagem_bytes(sf.file_bytes) for sf in files
@@ -58,7 +117,7 @@ async def load_user_armazenagem(pool: asyncpg.Pool, user_id: int) -> dict[str, S
         for row in rows:
             if row.sku not in merged:
                 merged[row.sku] = row
-    return merged
+    return _cache_put(user_id, ARMAZENAGEM_SOURCE_KEY, fp, merged)
 
 
 async def list_user_vendas_filenames(pool: asyncpg.Pool, user_id: int) -> list[str]:
@@ -72,6 +131,10 @@ async def load_user_stock_full(pool: asyncpg.Pool, user_id: int) -> dict[str, St
     `fetch_files_by_source` orders by `created_at DESC`, so the first parsed
     dict overrides older ones — mirroring the FS loader's newest-wins policy.
     """
+    fp = await _source_fingerprint(pool, user_id, STOCK_FULL_SOURCE_KEY)
+    cached = _cache_get(user_id, STOCK_FULL_SOURCE_KEY, fp)
+    if cached is not _MISS:
+        return cached
     files = await uploads_storage.fetch_files_by_source(pool, user_id, STOCK_FULL_SOURCE_KEY)
     merged: dict[str, StockFullSku] = {}
     for sf in files:
@@ -79,7 +142,7 @@ async def load_user_stock_full(pool: asyncpg.Pool, user_id: int) -> dict[str, St
         for sku, entry in parsed.items():
             if sku not in merged:
                 merged[sku] = entry
-    return merged
+    return _cache_put(user_id, STOCK_FULL_SOURCE_KEY, fp, merged)
 
 
 async def load_user_publicidade(pool: asyncpg.Pool, user_id: int) -> list[PublicidadeRow]:
@@ -87,6 +150,10 @@ async def load_user_publicidade(pool: asyncpg.Pool, user_id: int) -> list[Public
     (mlb, desde, ate, investimento). ML can emit overlapping monthly exports
     the same way vendas does — same period values would double-count otherwise.
     """
+    fp = await _source_fingerprint(pool, user_id, PUBLICIDADE_SOURCE_KEY)
+    cached = _cache_get(user_id, PUBLICIDADE_SOURCE_KEY, fp)
+    if cached is not _MISS:
+        return cached
     files = await uploads_storage.fetch_files_by_source(pool, user_id, PUBLICIDADE_SOURCE_KEY)
     seen: set[tuple] = set()
     out: list[PublicidadeRow] = []
@@ -97,7 +164,7 @@ async def load_user_publicidade(pool: asyncpg.Pool, user_id: int) -> list[Public
                 continue
             seen.add(key)
             out.append(row)
-    return out
+    return _cache_put(user_id, PUBLICIDADE_SOURCE_KEY, fp, out)
 
 
 def dedupe_vendas_rows(rows: Iterable[VendasRow]) -> list[VendasRow]:
