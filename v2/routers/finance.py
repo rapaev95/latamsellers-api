@@ -9,6 +9,7 @@ Per-request workflow:
 from __future__ import annotations
 
 import concurrent.futures
+import asyncio
 import contextvars
 import os
 from datetime import date, datetime
@@ -393,7 +394,13 @@ async def get_reports(
     # be served indefinitely until next user input change.
     # Cache is keyed by the effective owner so members and owners share the
     # same precomputed bundle.
-    bundle, status = finance_cache.cached_compute(
+    # Run the (synchronous, CPU-heavy: parse 15 files + pandas compute) bundle
+    # OFF the event loop. On -w 1 a blocking compute here froze the single
+    # worker's loop for the whole cold compute → concurrent requests (Escalar,
+    # /health) 502'd. to_thread copies the current context, so _bind_user_id
+    # and the prefetched bank classifications set above stay visible.
+    bundle, status = await asyncio.to_thread(
+        finance_cache.cached_compute,
         effective_user_id, cache_key, _compute_bundle,
         force=fresh,
         should_cache=lambda b: not any(k.endswith("_error") for k in b),
@@ -1753,7 +1760,9 @@ async def get_pnl_matrix(
         }
 
     cache_key = f"matrix:{project}"
-    payload, status = finance_cache.cached_compute(
+    # Off the event loop — same rationale as /reports (see get_reports).
+    payload, status = await asyncio.to_thread(
+        finance_cache.cached_compute,
         effective_user_id, cache_key, _compute_matrix,
         force=fresh,
         should_cache=lambda p: not p.get("_error") and bool(p.get("months")),
