@@ -502,12 +502,14 @@ def generate_opiu_estonia(
     except Exception:  # noqa: BLE001 — prefetch may be unset in legacy callers
         bank_agg = {}
     bank_txs = bank_agg.get("transactions") or []
-    # Build (month, gross) set of ALL income bank-txs BEFORE the dedup step
+    # Build the gross-amount set of ALL income bank-txs BEFORE the dedup step
     # strips matched ones — invoices_out builder uses this to mark
     # payment_status='paid' on baseline/NFS-e rows that have a real bank
     # arrival behind them. Without this, the dedup would consume the bank
     # tx and we'd lose the "this invoice was actually paid" signal.
-    bank_keys_for_match: set[tuple[str, float]] = set()
+    # Matched by AMOUNT only (not month): a payment lands weeks/months after
+    # the invoice's emission month, so month-strict matching missed the link.
+    bank_keys_for_match: set[float] = set()
     for tx in bank_txs:
         cat = str(tx.get("Категория") or "").lower()
         if cat != "income":
@@ -524,10 +526,15 @@ def generate_opiu_estonia(
         if m_d:
             d_, mo_, yr_ = m_d.groups()
             iso = f"{('20' + yr_) if len(yr_) == 2 else yr_}-{mo_}-{d_}"
-        bank_keys_for_match.add((iso[:7], round(v, 2)))
-    # Normalise existing invoices into (month, gross) tuples for fast dedup.
-    existing_keys = {
-        (str(inv.get("date") or "")[:7], round(float(inv.get("gross") or 0), 2))
+        bank_keys_for_match.add(round(v, 2))
+    # Normalise existing invoices into a gross-amount set for fast dedup.
+    # Dedup a bank «ВЫПИСКА» income row against a real NFS-e/baseline invoice
+    # by GROSS AMOUNT regardless of month: for ESTONIA a same-amount pair is
+    # the same payment (invoice emitted one month, bank arrival another). The
+    # earlier (month, gross) key double-counted when emission and payment fell
+    # in different months (e.g. NFS-e May, MP/Shopee credit June).
+    existing_grosses = {
+        round(float(inv.get("gross") or 0), 2)
         for inv in invoice_lines
     }
     bank_candidates: list[dict] = []
@@ -550,9 +557,8 @@ def generate_opiu_estonia(
             yr_full = f"20{yr}" if len(yr) == 2 else yr
             iso_date = f"{yr_full}-{mo}-{d}"
         gross_r = round(val, 2)
-        month = iso_date[:7]
-        if (month, gross_r) in existing_keys:
-            continue  # already covered by NFS-e / baseline invoice
+        if gross_r in existing_grosses:
+            continue  # already covered by an NFS-e / baseline invoice (any month)
         # Pre-compute tax via split_invoice_tax — same pattern as NFS-e merge.
         # Required so the legacy aggregation loop (`inv["tax"]`) doesn't
         # KeyError on shadow rows, and so the invoices_out builder uses these
@@ -573,7 +579,7 @@ def generate_opiu_estonia(
             "bank_source": str(tx.get("Класс.") or tx.get("Descrição") or tx.get("Описание") or ""),
         })
         cum_gross = cum_after_b
-        existing_keys.add((month, gross_r))  # avoid dup if same amount twice in same month
+        existing_grosses.add(gross_r)  # avoid re-adding the same amount twice
     invoice_lines.extend(bank_candidates)
 
     # DAS Simples Nacional payments (already paid, from approved report)
@@ -871,10 +877,11 @@ def generate_opiu_estonia(
         #   4. Otherwise → pending
         # User override (payment_overrides[inv_key]) wins over auto.
         inv_date_str = str(inv.get("date") or "")[:10]
-        inv_month_gross = (inv_date_str[:7], gross)
         is_shadow = bool(inv.get("from_bank"))
         is_auto_loaded = bool(inv.get("auto_loaded"))
-        has_bank_match = inv_month_gross in bank_keys_for_match
+        # Amount-only match (see bank_keys_for_match): an invoice counts as paid
+        # once a bank income of the same gross has arrived, regardless of month.
+        has_bank_match = gross in bank_keys_for_match
         is_baseline = not is_shadow and not is_auto_loaded
         is_pre_cutoff_baseline = is_baseline and inv_date_str < "2026-03-19"
 
