@@ -39,7 +39,7 @@ log = logging.getLogger(__name__)
 # Bump when compute_pnl / compute_cashflow / compute_balance / abc.aggregate
 # change shape (added / removed / renamed fields). Bumping invalidates every
 # cached payload at once — no manual `invalidate_*` calls needed.
-COMPUTE_VERSION = "v7"  # v7: freeze FIFO câmbio rate per TrafficStars débito (stable USD→BRL across re-parses)
+COMPUTE_VERSION = "v8"  # v8: parse new DANFSe 2026 (IBS/CBS) NFS-e layout — inline valor + date fallback
 
 # Upload source_keys that influence any finance/abc compute. MAX(created_at)
 # per source feeds the fingerprint.

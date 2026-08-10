@@ -1559,6 +1559,16 @@ def _parse_nfse_pdf_text(text: str) -> dict | None:
         if emissao:
             result["data_emissao"] = emissao
 
+        # Fallback for columnar / space-less layouts (new DANFSe 2026) where the
+        # labelled cell isn't isolable: take the first DD/MM/YYYY in the doc.
+        if not result["competencia"]:
+            m_date = re.search(r"(\d{2})/(\d{2})/(\d{4})", text)
+            if m_date:
+                result["competencia_raw"] = f"{m_date.group(2)}/{m_date.group(3)}"
+                result["competencia"] = f"{m_date.group(3)}-{m_date.group(2)}"
+                if not result["data_emissao"]:
+                    result["data_emissao"] = m_date.group(0)
+
         # Tomador — находим строки с SHPS/LTDA, исключая GANZA
         all_names = re.findall(r'(GANZA[^\n]*|SHPS[^\n]*|[A-Z][A-Z ]*LTDA\.?)', text)
         for name in all_names:
@@ -1582,6 +1592,18 @@ def _parse_nfse_pdf_text(text: str) -> dict | None:
                 result["valor_liquido"] = float(liq_str.replace(".", "").replace(",", "."))
             except ValueError:
                 pass
+
+        # New DANFSe (2026 IBS/CBS reform) layout has no "Valor do Serviço"
+        # label — the service value sits inline in the description block, e.g.
+        # "...Comissão Elegível em Julho.Valor:R$98.449,71TRIBUTAÇÃO...".
+        # Fall back to it so the newer invoices still parse.
+        if not result["valor"]:
+            m_inline = re.search(r"Valor:\s*R\$\s*([\d.,]+)", re.sub(r"[ \t]+", "", text))
+            if m_inline:
+                try:
+                    result["valor"] = float(m_inline.group(1).replace(".", "").replace(",", "."))
+                except ValueError:
+                    pass
 
         # Descrição do Serviço (e mês de referência)
         m = re.search(r'Descri[çc][ãa]odoServi[çc]o\s*\n\s*([^\n]+)', re.sub(r"[ \t]+", "", text))
