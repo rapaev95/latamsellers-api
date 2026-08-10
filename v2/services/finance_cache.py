@@ -39,7 +39,7 @@ log = logging.getLogger(__name__)
 # Bump when compute_pnl / compute_cashflow / compute_balance / abc.aggregate
 # change shape (added / removed / renamed fields). Bumping invalidates every
 # cached payload at once — no manual `invalidate_*` calls needed.
-COMPUTE_VERSION = "v9"  # v9: services invoices land in EARNED month (ref_month), not emission — fixes RBT12/DAS rate
+COMPUTE_VERSION = "v10"  # v10: ESTONIA DAS rate from declared RBT12 (whole-entity) config
 
 # Upload source_keys that influence any finance/abc compute. MAX(created_at)
 # per source feeds the fingerprint.

@@ -408,6 +408,32 @@ def generate_opiu_estonia(
     BASELINE_CUTOFF = "2026-04"
 
     cum_gross = sum(inv["gross"] for inv in invoice_lines)
+
+    # RBT12 base for the DAS effective rate. Legal RBT12 = the whole GANZA
+    # entity's gross over the 12 months BEFORE the competência (goods Anexo I +
+    # services Anexo III of the same CNPJ) — NOT just our service invoices,
+    # which is why a service-only cumulative understated the rate (12,9% vs the
+    # accountant's 13,98%). Sourced from the accountant's monthly declaration
+    # figures stored in `rbt12_monthly` (project config); when absent we fall
+    # back to the running service cumulative (old behaviour).
+    from .config import load_projects as _lp_rbt
+    rbt12_monthly = ((_lp_rbt() or {}).get(project_id, {}) or {}).get("rbt12_monthly") or {}
+
+    def _rbt12_trailing(month_iso: str) -> float:
+        """Sum the 12 months strictly BEFORE `month_iso` (YYYY-MM) — the Simples
+        'receita bruta dos doze meses anteriores ao PA'."""
+        try:
+            y, m = int(month_iso[:4]), int(month_iso[5:7])
+        except (ValueError, TypeError):
+            return 0.0
+        tot = 0.0
+        for _ in range(12):
+            m -= 1
+            if m == 0:
+                m, y = 12, y - 1
+            tot += float(rbt12_monthly.get(f"{y:04d}-{m:02d}", 0) or 0)
+        return tot
+
     # `loaded_nfs` arg is passed by services_reports.compute_for_user — it
     # already merged DB uploads (Railway) with disk sidecars (local dev).
     # Fallback `load_all_nfse()` keeps Streamlit/legacy call sites working.
@@ -445,7 +471,11 @@ def generate_opiu_estonia(
         # of precision (~0.5% при больших инвойсах), но это совпадает с тем
         # как Receita Federal начисляет DAS (на сумму за месяц, не split).
         cum_after = cum_gross + gross
-        split = split_invoice_tax(gross, cum_after, anexo="III")
+        # Prefer the accountant's declared RBT12 (whole-entity, from config) for
+        # the DAS rate; fall back to the service-only cumulative when the month
+        # isn't in `rbt12_monthly` yet.
+        rbt12_das = _rbt12_trailing(ref) if (rbt12_monthly and ref and len(ref) == 7 and _rbt12_trailing(ref) > 0) else cum_after
+        split = split_invoice_tax(gross, rbt12_das, anexo="III")
         invoice_lines.append({
             "date": date_str,
             "gross": gross,
