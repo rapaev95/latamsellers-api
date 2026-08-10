@@ -413,16 +413,22 @@ def generate_opiu_estonia(
     # Fallback `load_all_nfse()` keeps Streamlit/legacy call sites working.
     if loaded_nfs is None:
         loaded_nfs = load_all_nfse()
+    # Order by the EARNED month (ref_month from the description), not the
+    # emission month — so RBT12 accumulates chronologically by service month.
     loaded_nfs.sort(key=lambda r: (
-        r.get("competencia") or "",
-        r.get("ref_month_iso") or "",
+        r.get("ref_month_iso") or r.get("competencia") or "",
         int(r.get("numero") or 0) if str(r.get("numero") or "").isdigit() else 0,
     ))
     # Lazy import — services_reports lives outside v2.legacy and would cause
     # a circular import if pulled at module top.
     from v2.services.services_reports import split_invoice_tax
     for nf in loaded_nfs:
-        comp = nf.get("competencia") or ""
+        # Effective month = the month the commission was EARNED (ref_month from
+        # the description), NOT the NFS-e emission/competência month. A July
+        # commission emitted in August must land in July for the RBT12 window
+        # and the effective Simples rate (DAS is on competência of the service).
+        # Falls back to competência when the description carries no month.
+        comp = nf.get("ref_month_iso") or nf.get("competencia") or ""
         if comp < BASELINE_CUTOFF:
             continue
         tomador = (nf.get("tomador") or "").upper()
@@ -431,7 +437,7 @@ def generate_opiu_estonia(
         gross = float(nf.get("valor") or 0)
         if gross <= 0:
             continue
-        ref = nf.get("competencia") or nf.get("ref_month_iso")
+        ref = comp
         date_str = f"{ref}-15" if ref and len(ref) == 7 else nf.get("data_emissao", "2026-04-01")
         # Single split per invoice — commission table follows the same shape
         # as Simples faixa, so rate at cum_gross+gross applies to the whole
