@@ -1071,6 +1071,30 @@ def _load_transfer_edits(project_id: str) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _load_fifo_locked_ts(user_id: int) -> dict[str, dict[str, Any]]:
+    """Frozen FIFO rates for auto-imported TrafficStars débitos, keyed by
+    "{date_iso}|{usd}". Once a débito's câmbio (USD→BRL) is computed from real
+    FIFO lots we lock its rate here, so re-parsing C6 extratos / adding newer
+    USD purchases never re-values a past payment. Stored per-user as JSONB
+    `f2_services_fifo_locked_ts`.
+    """
+    try:
+        from v2.legacy.db_storage import db_load
+        raw = db_load("f2_services_fifo_locked_ts", user_id=user_id)
+    except Exception as err:  # noqa: BLE001
+        log.warning("fifo_locked_ts load failed for user %s: %s", user_id, err)
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _save_fifo_locked_ts(user_id: int, locked: dict[str, dict[str, Any]]) -> None:
+    try:
+        from v2.legacy.db_storage import db_save
+        db_save("f2_services_fifo_locked_ts", locked, user_id=user_id)
+    except Exception as err:  # noqa: BLE001
+        log.warning("fifo_locked_ts save failed for user %s: %s", user_id, err)
+
+
 def _transfer_sort_key(tr: dict[str, Any]) -> date:
     """Order transfers chronologically regardless of source.
 
@@ -1176,6 +1200,14 @@ async def _build_trafficstars_auto_transfers(
     summary = result.summary if hasattr(result, "summary") else {}
     avg_rate = float(summary.get("avg_rate") or 0)
 
+    # Frozen câmbio rates: once a débito is priced from real FIFO lots we lock
+    # its rate so re-parsing extratos / adding newer USD purchases never
+    # re-values a past TrafficStars payment (user requirement — rate must be
+    # stable once set). Only REAL (non-estimated) rates are frozen; estimates
+    # stay live until real lots cover them, then freeze.
+    locked = _load_fifo_locked_ts(user_id)
+    new_locks: dict[str, dict[str, Any]] = {}
+
     out_transfers: list[dict[str, Any]] = []
     for r in rows:
         val = float(r.get("value_brl") or 0)
@@ -1198,13 +1230,27 @@ async def _build_trafficstars_auto_transfers(
             # transfers table.
             continue
         date_iso = str(r.get("date") or "")[:10]
+        rate = round(brl_cost / usd_abs, 4) if usd_abs > 0 else None
+
+        # ── Freeze / apply frozen rate ──
+        lock_key = f"{date_iso}|{round(usd_abs, 2)}"
+        row_locked = False
+        if lock_key in locked and isinstance(locked[lock_key], dict):
+            lv = locked[lock_key]
+            rate = float(lv.get("vet") or rate or 0) or rate
+            brl_cost = float(lv.get("brl") or brl_cost)
+            estimated = bool(lv.get("est", estimated))
+            row_locked = True
+        elif not estimated and rate:
+            # First real pricing of this débito — lock it forever.
+            new_locks[lock_key] = {"vet": rate, "brl": round(brl_cost, 2), "est": False}
+
         try:
             from datetime import datetime as _dt
             d = _dt.strptime(date_iso, "%Y-%m-%d").date()
             date_str = d.strftime("%d/%m/%y")
         except (ValueError, TypeError):
             date_str = date_iso
-        rate = round(brl_cost / usd_abs, 4) if usd_abs > 0 else None
         out_transfers.append({
             "date": date_str,
             "canal": "C6 TrafficStars (auto)" + (" ~est" if estimated else ""),
@@ -1214,6 +1260,14 @@ async def _build_trafficstars_auto_transfers(
             "_auto_imported": True,
             "_auto_source": "trafficstars",
             "_brl_estimated": estimated,
+            "_fifo_locked": row_locked,
         })
+
+    # Persist any newly-locked rates (best-effort; a save failure just means we
+    # re-price next time — no corruption, only the loss of a freeze).
+    if new_locks:
+        locked.update(new_locks)
+        _save_fifo_locked_ts(user_id, locked)
+
     out_transfers.sort(key=lambda r: r["date"])
     return out_transfers
