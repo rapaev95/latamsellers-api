@@ -310,20 +310,50 @@ _COMPANY_BUDGET_SECONDS = int(os.environ.get("FINANCE_COMPANY_BUDGET_S", "45"))
 _COMPANY_MIN_SLICE_SECONDS = 10
 
 
+# Rows the finance UI aggregates across projects. `pnl_rev_gross` feeds the
+# company receipts dashboard; the rest feed /finance (revenue, profit, margin,
+# delivered orders). Callers may ask for a subset via the `rows` query param.
+_COMPANY_DEFAULT_ROWS: tuple[str, ...] = (
+    "pnl_rev_gross", "pnl_net_revenue", "pnl_op_profit", "pnl_orders_delivered",
+)
+
+
+def _num(v: Any) -> float:
+    try:
+        return float(round(float(v or 0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _rows_from_matrix(
+    payload: dict[str, Any], labels: tuple[str, ...],
+) -> dict[str, dict[str, Any]]:
+    """Pull the requested rows out of a PnL matrix payload.
+
+    Returns {label: {"total": float, "by_month": {"YYYY-MM": float}}}. Months
+    come from the payload's own axis, so a month with no value reads as 0 for
+    that row — same as the per-project UI did when it held the whole matrix.
+    """
+    by_label = {
+        row.get("label"): row
+        for row in (payload.get("rows") or [])
+        if row.get("label") in labels
+    }
+    months = [str(m) for m in (payload.get("months") or [])]
+    out: dict[str, dict[str, Any]] = {}
+    for label in labels:
+        row = by_label.get(label) or {}
+        values = row.get("values") or {}
+        out[label] = {
+            "total": _num(row.get("total")),
+            "by_month": {m: _num(values.get(m)) for m in months},
+        }
+    return out
+
+
 def _gross_by_month_from_matrix(payload: dict[str, Any]) -> dict[str, float]:
     """`pnl_rev_gross` row of a PnL matrix → {"YYYY-MM": amount}."""
-    values: dict[str, Any] = {}
-    for row in payload.get("rows") or []:
-        if row.get("label") == "pnl_rev_gross":
-            values = row.get("values") or {}
-            break
-    out: dict[str, float] = {}
-    for month in payload.get("months") or []:
-        try:
-            out[str(month)] = float(round(float(values.get(month) or 0)))
-        except (TypeError, ValueError):
-            out[str(month)] = 0.0
-    return out
+    return _rows_from_matrix(payload, ("pnl_rev_gross",))["pnl_rev_gross"]["by_month"]
 
 
 def _gross_by_month_from_services(payload: dict[str, Any]) -> dict[str, float]:
@@ -387,6 +417,42 @@ async def _services_bundle_computed(
     return payload
 
 
+def _services_rows(by_month: dict[str, float], labels: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+    """Invoice volume dressed as P&L rows.
+
+    A services project has invoices, not an ecom P&L, so only the revenue row
+    exists. The others are OMITTED rather than zero-filled: a caller summing
+    `rows` must see "this project has no op_profit", not "its op_profit is 0",
+    which would quietly drag a company-wide margin down.
+    """
+    if "pnl_rev_gross" not in labels:
+        return {}
+    return {"pnl_rev_gross": {
+        "total": _num(sum(by_month.values())),
+        "by_month": dict(by_month),
+    }}
+
+
+def _apply_services_series(
+    item: dict[str, Any], by_month: dict[str, float], labels: tuple[str, ...],
+) -> None:
+    item["rows"] = _services_rows(by_month, labels)
+    item["by_month"] = dict(by_month)
+
+
+def _apply_payload(
+    item: dict[str, Any], payload: dict[str, Any], labels: tuple[str, ...],
+) -> None:
+    """Fill an item's rows from whichever payload shape its `kind` implies."""
+    if item["kind"] == "services":
+        by_month = _gross_by_month_from_services(payload)
+        _apply_services_series(item, by_month, labels)
+        return
+    item["rows"] = _rows_from_matrix(payload, labels)
+    # Back-compat mirror for a UI build that predates `rows`; see the schema.
+    item["by_month"] = dict(item["rows"].get("pnl_rev_gross", {}).get("by_month", {}))
+
+
 async def _services_revenue_computed(
     pool, owner_id: int, project: str, fingerprint: str, deps: dict[str, Any],
 ) -> tuple[dict[str, float], str, Optional[str]]:
@@ -405,10 +471,20 @@ async def _services_revenue_computed(
 async def get_company_revenue_by_month(
     response: Response,
     fresh: bool = Query(False, description="Recompute instead of reading the durable cache"),
+    rows: str = Query(
+        "", description="Comma-separated P&L row labels to return. Default: "
+                        + ",".join(_COMPANY_DEFAULT_ROWS),
+    ),
+    services: str = Query(
+        "invoice", pattern="^(invoice|matrix)$",
+        description="How to read services-type projects. 'invoice' = invoice "
+                    "volume from /services-reports (receipts view). 'matrix' = "
+                    "the ecom PnL matrix, same as every other project.",
+    ),
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
 ) -> dict[str, Any]:
-    """Gross receipts per month across every project the caller can see.
+    """P&L rows per month and in total, across every project the caller can see.
 
     Replaces the client-side fan-out that /finance/company used to do — one
     pnl-matrix (ecom) or services-reports (services) request per project. That
@@ -431,6 +507,10 @@ async def get_company_revenue_by_month(
     ABSENT, not zero. A follow-up call finishes the job, because the misses
     computed on this pass are now cached.
     """
+    labels = tuple(dict.fromkeys(
+        [r.strip() for r in rows.split(",") if r.strip()]
+    )) or _COMPANY_DEFAULT_ROWS
+
     projects, owners = await _visible_projects_with_owners(pool, user)
     is_superadmin = _is_superadmin(user)
 
@@ -442,12 +522,20 @@ async def get_company_revenue_by_month(
             "project": name,
             "type": ptype,
             "owner_id": owners.get(name, user.id),
+            "rows": {},
             "by_month": {},
             "error": None,
             "status": None,
             "cache_key": None,
         }
-        if ptype == "services":
+        if ptype == "services" and services == "matrix":
+            # Caller wants every project on the same footing (the /finance
+            # dashboard sums P&L rows and has always read services projects
+            # through the ecom matrix). Segment still says these are «прямые».
+            item["segment"] = "own"
+            item["kind"] = "ecom"
+            item["cache_key"] = pnl_matrix_cache_key(name)
+        elif ptype == "services":
             # «Прямые» — invoice volume.
             item["segment"] = "own"
             item["kind"] = "services"
@@ -493,10 +581,7 @@ async def get_company_revenue_by_month(
         if payload is None:
             misses.append(item)
             continue
-        item["by_month"] = (
-            _gross_by_month_from_services(payload) if item["kind"] == "services"
-            else _gross_by_month_from_matrix(payload)
-        )
+        _apply_payload(item, payload, labels)
         item["status"] = "cached"
 
     # Misses are filled SEQUENTIALLY on purpose. These computes are CPU-bound
@@ -518,10 +603,12 @@ async def get_company_revenue_by_month(
         slice_s = max(_COMPANY_MIN_SLICE_SECONDS, int(deadline - loop.time()))
         try:
             if item["kind"] == "services":
-                item["by_month"], item["status"], item["error"] = await asyncio.wait_for(
+                by_month, item["status"], item["error"] = await asyncio.wait_for(
                     _services_revenue_computed(pool, owner_id, item["project"], fp, deps),
                     timeout=slice_s,
                 )
+                if item["status"] == "computed":
+                    _apply_services_series(item, by_month, labels)
             else:
                 payload, _status = await asyncio.to_thread(
                     _pnl_matrix_cached, owner_id, item["project"], fresh, slice_s,
@@ -530,7 +617,7 @@ async def get_company_revenue_by_month(
                     item["status"] = "error"
                     item["error"] = str(payload["_error"])
                 else:
-                    item["by_month"] = _gross_by_month_from_matrix(payload)
+                    _apply_payload(item, payload, labels)
                     item["status"] = "computed"
         except asyncio.TimeoutError:
             item["status"] = "error"
@@ -539,7 +626,12 @@ async def get_company_revenue_by_month(
             item["status"] = "error"
             item["error"] = str(err)
 
-    months = sorted({m for item in plan for m in (item["by_month"] or {})})
+    months = sorted({
+        m
+        for item in plan
+        for row in (item["rows"] or {}).values()
+        for m in (row.get("by_month") or {})
+    })
     pending_count = sum(1 for i in plan if i["status"] == "pending")
     error_count = sum(1 for i in plan if i["status"] in ("error", "forbidden"))
 
@@ -556,6 +648,7 @@ async def get_company_revenue_by_month(
                 "segment": i["segment"],
                 "type": i["type"],
                 "status": i["status"],
+                "rows": i["rows"],
                 "by_month": i["by_month"],
                 "error": i["error"],
             }

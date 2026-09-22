@@ -307,6 +307,12 @@ class RecomputeOut(BaseModel):
 # cache, and anything that could NOT be produced is reported explicitly in
 # `status` rather than dropped.
 
+class CompanyRowOut(BaseModel):
+    """One P&L row of one project: the period total plus the monthly series."""
+    total: float = 0
+    by_month: dict[str, float] = Field(default_factory=dict)
+
+
 class CompanyProjectRevenue(BaseModel):
     project: str
     # "own" — прямые (services / invoice volume); "partner" — партнёрские (ecom gross).
@@ -316,6 +322,12 @@ class CompanyProjectRevenue(BaseModel):
     # "pending" = not in cache and the request's compute budget ran out; the
     # numbers are absent, NOT zero. The UI must not silently sum it as zero.
     status: str
+    # Requested P&L rows, keyed by label (see the `rows` query param).
+    rows: dict[str, CompanyRowOut] = Field(default_factory=dict)
+    # Gross revenue per month. Redundant with rows["pnl_rev_gross"].by_month —
+    # kept so a browser still running the previous build doesn't render zeros
+    # during the minutes between the API and UI deploys. Drop it once both
+    # sides have shipped `rows`.
     by_month: dict[str, float] = Field(default_factory=dict)
     error: Optional[str] = None
 
