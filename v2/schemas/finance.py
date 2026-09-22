@@ -335,6 +335,11 @@ class CompanyProjectRevenue(BaseModel):
 class CompanyRevenueOut(BaseModel):
     months: list[str]                 # sorted YYYY-MM union across projects
     projects: list[CompanyProjectRevenue]
+    # True while a background job is still filling one of the misses. The UI
+    # polls on this rather than guessing: the request never waits for a
+    # compute, so a first load legitimately answers with most projects
+    # `pending` and fills in over the next few seconds.
+    running: bool = False
     # Counts so the UI can warn without re-deriving them from `projects`.
     complete: bool
     pending_count: int = 0

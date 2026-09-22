@@ -3,6 +3,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 """Company roll-up: cache hits, computed misses, pending, forbidden, and the
 rule that a project without numbers is never summed as zero."""
+import time
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -28,12 +30,19 @@ MATRIX = {"months": ["2026-08", "2026-09"], "rows": [
 ]}
 
 finance_cache.compute_fingerprint = lambda uid, extra_deps=None: ("fp1", {})
-# ARTHUR cached; JOOM absent → must be computed.
-finance_cache.read_many_cached = lambda uid, keys, fp: {"matrix:ARTHUR": MATRIX}
+
+# Stateful fake cache: ARTHUR starts warm, and whatever a background job
+# computes lands here — which is how the real flow fills in between polls.
+CACHE = {"matrix:ARTHUR": MATRIX}
+finance_cache.read_many_cached = lambda uid, keys, fp: {
+    k: CACHE[k] for k in keys if k in CACHE
+}
 
 computed = []
 def fake_matrix(uid, project, force=False, timeout=90):
     computed.append(project)
+    time.sleep(0.2)                      # stand-in for a real cold compute
+    CACHE[f"matrix:{project}"] = MATRIX
     return MATRIX, "miss"
 finance._pnl_matrix_cached = fake_matrix
 
@@ -41,38 +50,62 @@ app = FastAPI()
 app.include_router(finance.router, prefix="/api/v2")
 app.dependency_overrides[get_pool] = lambda: None
 
+app.dependency_overrides[current_user] = lambda: CurrentUser(
+    id=7, email="a@b.c", name="T", role="admin")
+CLIENT = TestClient(app)
+CLIENT.__enter__()          # one portal loop, so background jobs outlive a request
+
 def run(user, **params):
     app.dependency_overrides[current_user] = lambda: user
-    with TestClient(app) as c:
-        r = c.get("/api/v2/finance/company/revenue-by-month", params=params)
-        assert r.status_code == 200, r.text
-        return r.json()
+    r = CLIENT.get("/api/v2/finance/company/revenue-by-month", params=params)
+    assert r.status_code == 200, r.text
+    return r.json()
 
 # ── regular admin: services project is not readable, and must be REPORTED ──
 body = run(CurrentUser(id=7, email="a@b.c", name="T", role="admin"))
 by = {p["project"]: p for p in body["projects"]}
 print("statuses:", {k: v["status"] for k, v in by.items()})
 assert by["ARTHUR"]["status"] == "cached"
-assert by["JOOM"]["status"] == "computed" and computed == ["JOOM"], computed
+# JOOM isn't cached, so it comes back as a started job rather than making the
+# caller wait for it.
+assert by["JOOM"]["status"] == "pending", by["JOOM"]
 assert by["ESTONIA"]["status"] == "forbidden"
 assert by["ESTONIA"]["by_month"] == {}, by["ESTONIA"]
 assert body["complete"] is False and body["error_count"] == 1, body
+# The month axis still spans the projects that DID produce numbers.
 assert body["months"] == ["2026-08", "2026-09"], body
 assert by["ARTHUR"]["by_month"] == {"2026-08": 100.0, "2026-09": 250.0}, by["ARTHUR"]
 assert by["ARTHUR"]["segment"] == "partner" and by["ESTONIA"]["segment"] == "own"
-print("forbidden project reported, not dropped ✓")
+print("forbidden project reported, not dropped \u2713")
 
-# ── budget exhausted → pending, never a silent zero ──
-finance._COMPANY_BUDGET_SECONDS = -100
-computed.clear()
-body = run(CurrentUser(id=7, email="a@b.c", name="T", role="admin"))
-by = {p["project"]: p for p in body["projects"]}
-print("zero-budget statuses:", {k: v["status"] for k, v in by.items()})
-assert by["JOOM"]["status"] == "pending" and computed == [], computed
-assert by["JOOM"]["by_month"] == {}, by["JOOM"]
+# ── a miss never blocks the request: it becomes a background job ──────────
+print("first-call statuses:", {k: v["status"] for k, v in by.items()})
+assert by["JOOM"]["status"] == "pending", by["JOOM"]
+assert by["JOOM"]["rows"] == {} and by["JOOM"]["by_month"] == {}, by["JOOM"]
 assert body["pending_count"] == 1 and body["complete"] is False, body
-assert by["ARTHUR"]["status"] == "cached"    # cached ones are unaffected
-print("pending carries no numbers ✓")
+assert body["running"] is True, body
+assert by["ARTHUR"]["status"] == "cached"    # cached ones answer immediately
+print("miss returns pending with no numbers, job started \u2713")
+
+# Polling again while the job runs must not start a second one.
+run(CurrentUser(id=7, email="a@b.c", name="T", role="admin"))
+run(CurrentUser(id=7, email="a@b.c", name="T", role="admin"))
+assert computed.count("JOOM") == 1, computed
+print("polling doesn't restart the job \u2713")
+
+# Once it lands, the next poll reads it from cache and stops asking.
+deadline = time.time() + 10
+while time.time() < deadline:
+    body = run(CurrentUser(id=7, email="a@b.c", name="T", role="admin"))
+    if not body["running"]:
+        break
+    time.sleep(0.1)
+by = {p["project"]: p for p in body["projects"]}
+print("after job:", {k: v["status"] for k, v in by.items()})
+assert by["JOOM"]["status"] == "cached", by["JOOM"]
+assert by["JOOM"]["rows"]["pnl_rev_gross"]["total"] == 350.0, by["JOOM"]
+assert body["running"] is False and body["pending_count"] == 0, body
+print("background job fills the cache, polling ends \u2713")
 
 # ── the /finance dashboard needs totals, not just a revenue series ─────────
 finance._COMPANY_BUDGET_SECONDS = 45
@@ -101,7 +134,15 @@ print("rows= selects a subset \u2713")
 computed.clear()
 body = run(CurrentUser(id=7, email="a@b.c", name="T", role="admin"), services="matrix")
 est = {p["project"]: p for p in body["projects"]}["ESTONIA"]
-assert est["status"] == "computed", est          # no longer "forbidden"
+assert est["status"] == "pending", est           # a job, not a 403
+deadline = time.time() + 10
+while time.time() < deadline:
+    body = run(CurrentUser(id=7, email="a@b.c", name="T", role="admin"), services="matrix")
+    if not body["running"]:
+        break
+    time.sleep(0.1)
+est = {p["project"]: p for p in body["projects"]}["ESTONIA"]
+assert est["status"] == "cached", est            # no longer "forbidden"
 assert est["segment"] == "own", est              # still «прямые»
 assert est["rows"]["pnl_rev_gross"]["total"] == 350.0, est["rows"]
 assert "ESTONIA" in computed, computed

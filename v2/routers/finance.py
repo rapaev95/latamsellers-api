@@ -299,17 +299,6 @@ async def list_projects(
 
 # ── Company revenue roll-up ────────────────────────────────────────────────
 #
-# Wall-clock budget for filling cache misses inside the roll-up. Deliberately
-# under the UI proxy's heavy-path cap so the dashboard ALWAYS gets an answer:
-# whatever doesn't fit comes back as `pending`, instead of the request hanging
-# to the cap and 502-ing with nothing to show.
-_COMPANY_BUDGET_SECONDS = int(os.environ.get("FINANCE_COMPANY_BUDGET_S", "45"))
-# Don't start another compute with less than this left — anything shorter is
-# not a realistic slice for a cold project, so it would burn the remaining
-# budget only to time out.
-_COMPANY_MIN_SLICE_SECONDS = 10
-
-
 # Rows the finance UI aggregates across projects. `pnl_rev_gross` feeds the
 # company receipts dashboard; the rest feed /finance (revenue, profit, margin,
 # delivered orders). Callers may ask for a subset via the `rows` query param.
@@ -584,47 +573,48 @@ async def get_company_revenue_by_month(
         _apply_payload(item, payload, labels)
         item["status"] = "cached"
 
-    # Misses are filled SEQUENTIALLY on purpose. These computes are CPU-bound
-    # Python: running them concurrently doesn't finish them any sooner (GIL),
-    # it just multiplies peak memory and starves every other request on this
-    # single-worker process for the whole duration.
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + _COMPANY_BUDGET_SECONDS
+    # Misses are handed to background jobs and the request returns NOW.
+    #
+    # This used to fill them inline under a wall-clock budget, which meant the
+    # very first load after a cache invalidation sat there for the whole budget
+    # before painting anything. Since /finance/recompute exists, there's no
+    # reason to hold the request: start the same jobs, answer with whatever is
+    # already cached, and let the page poll. Each poll finds more of them done.
+    #
+    # `finance_jobs` dedupes by cache key and caps concurrency, so a page open
+    # in three tabs still triggers one computation per project, and a cold
+    # cache can't stampede the single worker.
     for item in misses:
-        if loop.time() + _COMPANY_MIN_SLICE_SECONDS > deadline:
-            item["status"] = "pending"
-            continue
         owner_id = item["owner_id"]
         fp, deps = fingerprints.get(owner_id, ("", {}))
-        # Cap this compute by what's LEFT, not by the global compute timeout —
-        # otherwise a single cold project started near the deadline could run
-        # another 90s and push the whole request past the proxy's cap, which is
-        # the 502 this endpoint exists to prevent.
-        slice_s = max(_COMPANY_MIN_SLICE_SECONDS, int(deadline - loop.time()))
+        item["status"] = "pending"
         try:
             if item["kind"] == "services":
-                by_month, item["status"], item["error"] = await asyncio.wait_for(
-                    _services_revenue_computed(pool, owner_id, item["project"], fp, deps),
-                    timeout=slice_s,
-                )
-                if item["status"] == "computed":
-                    _apply_services_series(item, by_month, labels)
+                if pool is None:
+                    item["status"], item["error"] = "error", "db_unavailable"
+                    continue
+
+                def _services_work(o=owner_id, proj=item["project"], f=fp, d=deps) -> Any:
+                    return _services_revenue_computed(pool, o, proj, f, d)
+
+                finance_jobs.start(item["cache_key"], _services_work)
             else:
-                payload, _status = await asyncio.to_thread(
-                    _pnl_matrix_cached, owner_id, item["project"], fresh, slice_s,
-                )
-                if payload.get("_error"):
-                    item["status"] = "error"
-                    item["error"] = str(payload["_error"])
-                else:
-                    _apply_payload(item, payload, labels)
-                    item["status"] = "computed"
-        except asyncio.TimeoutError:
-            item["status"] = "error"
-            item["error"] = f"compute_timeout after {slice_s}s"
+                async def _matrix_work(o=owner_id, proj=item["project"]) -> None:
+                    await asyncio.to_thread(_pnl_matrix_cached, o, proj, fresh)
+
+                finance_jobs.start(item["cache_key"], _matrix_work)
         except Exception as err:  # noqa: BLE001
             item["status"] = "error"
             item["error"] = str(err)
+
+    job_states = finance_jobs.snapshot(
+        i["cache_key"] for i in plan if i.get("cache_key")
+    )
+    for item in plan:
+        st = job_states.get(item.get("cache_key") or "")
+        if st and st["status"] == "failed" and item["status"] == "pending":
+            # A job that already failed must not read as "still working".
+            item["status"], item["error"] = "error", st["error"]
 
     months = sorted({
         m
@@ -641,6 +631,9 @@ async def get_company_revenue_by_month(
     response.headers["X-Cache"] = ",".join(f"{k}={v}" for k, v in sorted(tally.items()))
 
     return {
+        "running": any(
+            st["status"] in ("queued", "running") for st in job_states.values()
+        ),
         "months": months,
         "projects": [
             {
