@@ -273,6 +273,62 @@ class PnlMatrixOut(BaseModel):
     rows: list[PnlMatrixRow]
 
 
+# ── Background recompute jobs ──────────────────────────────────────────────
+#
+# `?fresh=1` on a big project runs for tens of seconds. Held open as an HTTP
+# request it outlives the UI proxy's cap and dies as a 502 with the work
+# thrown away, so «Обновить» starts a job instead and the UI polls it.
+
+class RecomputeJobOut(BaseModel):
+    kind: str                 # reports | matrix | services_reports
+    key: str                  # the durable cache key this job fills
+    # queued | running | done | failed | idle ("idle" = no job on record, i.e.
+    # nothing is being recomputed for this key right now).
+    status: str
+    elapsed_s: float = 0
+    error: Optional[str] = None
+
+
+class RecomputeOut(BaseModel):
+    project: str
+    jobs: list[RecomputeJobOut]
+    # True while anything is still queued or running — the one flag the UI
+    # needs to decide whether to keep polling.
+    running: bool
+
+
+# ── Company revenue roll-up (aggregate across every visible project) ───────
+#
+# Feeds /finance/company. Replaces the old client-side fan-out of one
+# pnl-matrix / services-reports request per project: that issued N heavy
+# computes in parallel, which serialise behind the GIL, so the tail of the
+# fan-out hit the proxy's 90s cap and those projects silently vanished from
+# the totals. Here the roll-up is computed server-side off the same durable
+# cache, and anything that could NOT be produced is reported explicitly in
+# `status` rather than dropped.
+
+class CompanyProjectRevenue(BaseModel):
+    project: str
+    # "own" — прямые (services / invoice volume); "partner" — партнёрские (ecom gross).
+    segment: str
+    type: Optional[str] = None
+    # cached | computed | pending | error | forbidden.
+    # "pending" = not in cache and the request's compute budget ran out; the
+    # numbers are absent, NOT zero. The UI must not silently sum it as zero.
+    status: str
+    by_month: dict[str, float] = Field(default_factory=dict)
+    error: Optional[str] = None
+
+
+class CompanyRevenueOut(BaseModel):
+    months: list[str]                 # sorted YYYY-MM union across projects
+    projects: list[CompanyProjectRevenue]
+    # Counts so the UI can warn without re-deriving them from `projects`.
+    complete: bool
+    pending_count: int = 0
+    error_count: int = 0
+
+
 # ── Retirada Overrides (per-row политика «списание / в обороте») ────────────
 #
 # Хранится в user_data JSONB (per-user, per-project, per-custo_id).

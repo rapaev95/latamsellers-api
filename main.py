@@ -327,6 +327,25 @@ async def _dispatch_messages_to_tg_job() -> None:
         _ml_log.exception("Messages dispatch job failed: %s", err)
 
 
+async def _warm_finance_cache_job() -> None:
+    """Pre-compute finance reports so users don't pay for cold caches.
+
+    Cheap when nothing changed: the warm pass goes through the normal
+    read-through cache without forcing, so an unchanged project costs one
+    SELECT. Cost tracks actual data churn, not project count.
+    """
+    try:
+        pool = await get_pool()
+        if pool is None:
+            _ml_log.warning("finance warm tick skipped: no DB pool")
+            return
+        from v2.services import finance_warm
+        stats = await finance_warm.warm_all(pool)
+        _ml_log.info("finance warm tick: %s", stats)
+    except Exception as err:  # noqa: BLE001
+        _ml_log.warning("finance warm tick failed: %s", err)
+
+
 async def _sync_ml_notices_job() -> None:
     """Pull /communications/notices for every user with a live ML token,
     upsert into Railway Postgres ml_notices, dispatch new ones to Telegram."""
@@ -1023,6 +1042,21 @@ async def _v2_startup() -> None:
         id="ml_token_refresh",
         replace_existing=True,
     )
+    # Finance cache warm-up. Default 03:20 UTC = ~00:20 in São Paulo: after the
+    # day's uploads, before anyone opens the dashboard. `max_instances=1` +
+    # `coalesce` matter here more than elsewhere — a pass can run for minutes,
+    # and overlapping passes would compete for the single worker.
+    _warm_hour = int(os.environ.get("FINANCE_WARM_HOUR", "3"))
+    _warm_minute = int(os.environ.get("FINANCE_WARM_MINUTE", "20"))
+    if os.environ.get("FINANCE_WARM_ENABLED", "1") not in ("0", "false", "False"):
+        _ml_scheduler.add_job(
+            _warm_finance_cache_job,
+            CronTrigger(hour=_warm_hour, minute=_warm_minute, timezone="UTC"),
+            id="finance_cache_warm",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+        )
     # /communications/notices sync (Phase 1 — ML anouncements: billing, policies).
     # Usually empty for most sellers. Runs slowly as it's a secondary source.
     # ML «communications/notices» + Telegram. Default 5m matches product expectation;

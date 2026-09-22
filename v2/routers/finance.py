@@ -22,9 +22,12 @@ from v2.deps import CurrentUser, current_user, _is_superadmin
 from v2.legacy import db_storage as legacy_db
 from v2.legacy import config as legacy_config
 from v2.services import finance_cache
+from v2.services import finance_jobs
 from v2.services import bank_balances as bank_balances_svc
 from v2.schemas.finance import (
     ProjectsListOut, ReportsBundleOut,
+    CompanyRevenueOut,
+    RecomputeOut,
     SkuMappingOut, SkuBulkSaveIn, SkuBulkSaveOut,
     PnlMatrixOut,
     OrphanPacotesResponse, OrphanSaveIn, OrphanSaveOut,
@@ -125,6 +128,32 @@ def _bind_user(user: CurrentUser) -> None:
     """Make legacy code see the current user_id (used by db_storage internals)."""
     legacy_db.set_current_user_id(user.id)
 
+# ── Cache keys ──────────────────────────────────────────────────────────────
+# Defined once so the single-project endpoints and the /company roll-up cannot
+# drift apart: a key typo there would not fail, it would just silently always
+# miss and recompute — the expensive kind of bug.
+
+def pnl_matrix_cache_key(project: str) -> str:
+    return f"matrix:{project}"
+
+def services_reports_cache_key(
+    project: str, period_from: date, period_to: date, bank_only: bool = False,
+) -> str:
+    bo_suffix = "bankonly" if bank_only else "full"
+    return f"services_reports:{project}:{period_from.isoformat()}:{period_to.isoformat()}:{bo_suffix}"
+
+def _services_default_period(
+    period_from: Optional[str] = None, period_to: Optional[str] = None,
+) -> tuple[date, date]:
+    """Resolve the services-reports window. Defaults to the trailing 12 months.
+
+    Note the cache-key consequence: `to` defaults to *today*, so the key rolls
+    over at midnight and the first caller each day pays a recompute.
+    """
+    pt = _parse_iso(period_to) or date.today()
+    pf = _parse_iso(period_from) or date.fromordinal(pt.toordinal() - 365)
+    return pf, pt
+
 def _bind_user_id(user_id: int) -> None:
     """Bind any user_id — used to swap to the project owner when the caller
     is reading data through a project membership."""
@@ -207,6 +236,56 @@ async def _resolve_effective_user_for_project(
     except Exception:
         return caller.id
 
+async def _visible_projects_with_owners(
+    pool, user: CurrentUser,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Projects this caller may read → (meta_by_project, owner_id_by_project).
+
+    Own projects come from the CALLER's own namespace only. Must NOT use
+    _resolve_primary_owner here: that rebinds a collaborator to the project
+    owner and would dump EVERY project the owner has, leaking other clients'
+    projects into this user's dropdown. Cross-client isolation depends on this
+    staying user.id; the inherited-memberships loop adds back exactly (and
+    only) the projects the caller was invited to, loaded from each inviter's
+    namespace so metadata (sku_prefixes, launch_date, …) matches what the
+    owner sees.
+
+    The owner map is what lets aggregate endpoints resolve every project's
+    cache namespace from ONE membership query, instead of paying a
+    `_resolve_effective_user_for_project` round trip per project.
+    """
+    _bind_user_id(user.id)
+    projects: dict = dict(legacy_config.load_projects() or {})
+    owners: dict[str, int] = {name: user.id for name in projects}
+    if pool is None:
+        return projects, owners
+
+    try:
+        from v2.services import project_members as pm_svc
+        memberships = await pm_svc.list_inherited_projects(pool, user.id)
+    except Exception:
+        memberships = []
+    for m in memberships:
+        project_name = m["project_name"]
+        owner_id = m["owner_id"]
+        if not project_name or not owner_id or project_name in projects:
+            continue
+        # Swap the contextvar to owner_id, load THEIR projects dict,
+        # pick out just the one project the caller is a member of, and
+        # rebind back to the caller before exiting.
+        try:
+            _bind_user_id(owner_id)
+            owner_projects = legacy_config.load_projects() or {}
+            if project_name in owner_projects:
+                projects[project_name] = owner_projects[project_name]
+                owners[project_name] = owner_id
+        except Exception:
+            pass
+        finally:
+            _bind_user(user)
+
+    return projects, owners
+
 @router.get("/projects", response_model=ProjectsListOut)
 async def list_projects(
     user: CurrentUser = Depends(current_user),
@@ -214,45 +293,278 @@ async def list_projects(
 ) -> dict[str, Any]:
     """Return the projects visible to this user — own projects (from their
     user_data) PLUS projects they were invited to as a collaborator.
-
-    Inherited projects are loaded from each inviter's user_data so the project
-    metadata (sku_prefixes, launch_date, etc.) matches what the owner sees.
     """
-    # Own projects — from the CALLER's own namespace only. Must NOT use
-    # _resolve_primary_owner here: that rebinds a collaborator to the project
-    # owner and would dump EVERY project the owner has, leaking other clients'
-    # projects into this user's dropdown. Cross-client isolation depends on
-    # this staying user.id; the inherited-memberships loop below adds back
-    # exactly (and only) the projects the caller was invited to.
-    _bind_user_id(user.id)
-    projects: dict = dict(legacy_config.load_projects() or {})
-
-    # Projects inherited via memberships — load from each inviter's namespace
-    if pool is not None:
-        try:
-            from v2.services import project_members as pm_svc
-            memberships = await pm_svc.list_inherited_projects(pool, user.id)
-        except Exception:
-            memberships = []
-        for m in memberships:
-            project_name = m["project_name"]
-            owner_id = m["owner_id"]
-            if not project_name or not owner_id or project_name in projects:
-                continue
-            # Swap the contextvar to owner_id, load THEIR projects dict,
-            # pick out just the one project the caller is a member of, and
-            # rebind back to the caller before exiting.
-            try:
-                _bind_user_id(owner_id)
-                owner_projects = legacy_config.load_projects() or {}
-                if project_name in owner_projects:
-                    projects[project_name] = owner_projects[project_name]
-            except Exception:
-                pass
-            finally:
-                _bind_user(user)
-
+    projects, _owners = await _visible_projects_with_owners(pool, user)
     return {"projects": projects, "count": len(projects)}
+
+# ── Company revenue roll-up ────────────────────────────────────────────────
+#
+# Wall-clock budget for filling cache misses inside the roll-up. Deliberately
+# under the UI proxy's heavy-path cap so the dashboard ALWAYS gets an answer:
+# whatever doesn't fit comes back as `pending`, instead of the request hanging
+# to the cap and 502-ing with nothing to show.
+_COMPANY_BUDGET_SECONDS = int(os.environ.get("FINANCE_COMPANY_BUDGET_S", "45"))
+# Don't start another compute with less than this left — anything shorter is
+# not a realistic slice for a cold project, so it would burn the remaining
+# budget only to time out.
+_COMPANY_MIN_SLICE_SECONDS = 10
+
+
+def _gross_by_month_from_matrix(payload: dict[str, Any]) -> dict[str, float]:
+    """`pnl_rev_gross` row of a PnL matrix → {"YYYY-MM": amount}."""
+    values: dict[str, Any] = {}
+    for row in payload.get("rows") or []:
+        if row.get("label") == "pnl_rev_gross":
+            values = row.get("values") or {}
+            break
+    out: dict[str, float] = {}
+    for month in payload.get("months") or []:
+        try:
+            out[str(month)] = float(round(float(values.get(month) or 0)))
+        except (TypeError, ValueError):
+            out[str(month)] = 0.0
+    return out
+
+
+def _gross_by_month_from_services(payload: dict[str, Any]) -> dict[str, float]:
+    """Invoice volume per month out of a services-reports bundle."""
+    rows = ((payload.get("pnl") or {}).get("pnl_by_month")) or []
+    out: dict[str, float] = {}
+    for row in rows:
+        month = (row or {}).get("month")
+        if not month:
+            continue
+        try:
+            out[str(month)] = float(round(float(row.get("invoice_gross") or 0)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+async def _services_bundle_computed(
+    pool, owner_id: int, project: str, pf: date, pt: date,
+    fingerprint: Optional[str] = None, deps: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Compute a services bundle and write it under the SAME cache key that
+    GET /services-reports reads, so either path warms the other.
+
+    Returns the bundle with any `*_error` keys intact — their presence is also
+    the signal not to cache it, since a half-computed bundle would otherwise be
+    served until the user's next data change.
+
+    The bank-classification prefetch is load-bearing, not boilerplate: without
+    it generate_dds_estonia can't see income-tagged statement rows and the ОПиУ
+    comes out short. Keep in step with the endpoint if either changes.
+    """
+    from v2.services import services_reports as services_svc
+
+    _bind_user_id(owner_id)
+    try:
+        from v2.services import bank_classifications as _bank_cls
+        prefetched = await _bank_cls.prefetch_for_user(pool, owner_id)
+        _bank_cls.set_prefetched(prefetched)
+    except Exception:  # noqa: BLE001
+        pass
+
+    bundle = await services_svc.compute_for_user(
+        pool, owner_id, project, period_from=pf, period_to=pt,
+        include_hardcoded_outflows=True,
+    )
+    payload = {k: v for k, v in bundle.items() if k not in ("project", "period")}
+    if any(k.endswith("_error") for k in payload):
+        return payload
+
+    if fingerprint is None:
+        fingerprint, deps = await asyncio.to_thread(
+            finance_cache.compute_fingerprint, owner_id,
+        )
+    if fingerprint:
+        await asyncio.to_thread(
+            finance_cache._write_cached,  # noqa: SLF001
+            owner_id, services_reports_cache_key(project, pf, pt),
+            payload, fingerprint, deps or {},
+        )
+    return payload
+
+
+async def _services_revenue_computed(
+    pool, owner_id: int, project: str, fingerprint: str, deps: dict[str, Any],
+) -> tuple[dict[str, float], str, Optional[str]]:
+    """Invoice volume per month for a services project, computing the full
+    bundle (and caching it) on the way — see `_services_bundle_computed`."""
+    pf, pt = _services_default_period()
+    payload = await _services_bundle_computed(pool, owner_id, project, pf, pt, fingerprint, deps)
+
+    error_keys = [k for k in payload if k.endswith("_error")]
+    if error_keys:
+        return {}, "error", f"{error_keys[0]}: {payload[error_keys[0]]}"
+    return _gross_by_month_from_services(payload), "computed", None
+
+
+@router.get("/company/revenue-by-month", response_model=CompanyRevenueOut)
+async def get_company_revenue_by_month(
+    response: Response,
+    fresh: bool = Query(False, description="Recompute instead of reading the durable cache"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Gross receipts per month across every project the caller can see.
+
+    Replaces the client-side fan-out that /finance/company used to do — one
+    pnl-matrix (ecom) or services-reports (services) request per project. That
+    pattern had three compounding problems this endpoint removes:
+
+      1. N heavy computes fired at once. They don't actually run in parallel:
+         the legacy compute is CPU-bound Python, so the GIL serialises it and
+         latency accumulated until the tail hit the proxy's 90s cap and 502'd.
+         Here misses are computed one at a time, under a wall-clock budget.
+      2. ~3 fresh psycopg2 connections per project just to check the cache
+         (schema probe + fingerprint + read). Now: one fingerprint and one
+         batched SELECT per distinct owner, whatever the project count.
+      3. Failures were invisible. The UI caught every error and dropped that
+         project, so company totals silently under-reported. Every project is
+         returned here with an explicit `status`; the caller can render the
+         gap instead of quietly summing it as zero.
+
+    `status` per project: cached | computed | pending | error | forbidden.
+    `pending` means "not cached and the budget ran out" — the numbers are
+    ABSENT, not zero. A follow-up call finishes the job, because the misses
+    computed on this pass are now cached.
+    """
+    projects, owners = await _visible_projects_with_owners(pool, user)
+    is_superadmin = _is_superadmin(user)
+
+    plan: list[dict[str, Any]] = []
+    for name in sorted(projects):
+        meta = projects.get(name)
+        ptype = meta.get("type") if isinstance(meta, dict) else None
+        item: dict[str, Any] = {
+            "project": name,
+            "type": ptype,
+            "owner_id": owners.get(name, user.id),
+            "by_month": {},
+            "error": None,
+            "status": None,
+            "cache_key": None,
+        }
+        if ptype == "services":
+            # «Прямые» — invoice volume.
+            item["segment"] = "own"
+            item["kind"] = "services"
+            if not is_superadmin:
+                # Mirrors the ACL on /services-reports. Reported rather than
+                # dropped: the old UI swallowed the 403 and the project simply
+                # vanished from the totals with no hint they were incomplete.
+                item["status"] = "forbidden"
+            elif pool is None:
+                item["status"] = "error"
+                item["error"] = "db_unavailable"
+            else:
+                pf, pt = _services_default_period()
+                item["cache_key"] = services_reports_cache_key(name, pf, pt)
+        else:
+            # «Партнёрские» — gross sales off the ecom PnL matrix.
+            item["segment"] = "partner"
+            item["kind"] = "ecom"
+            item["cache_key"] = pnl_matrix_cache_key(name)
+        plan.append(item)
+
+    # One fingerprint + one batched SELECT per distinct owner.
+    fingerprints: dict[int, tuple[str, dict[str, Any]]] = {}
+    keys_by_owner: dict[int, list[str]] = {}
+    for item in plan:
+        if item["cache_key"]:
+            keys_by_owner.setdefault(item["owner_id"], []).append(item["cache_key"])
+
+    cached_by_owner: dict[int, dict[str, Any]] = {}
+    for owner_id, keys in keys_by_owner.items():
+        fp, deps = await asyncio.to_thread(finance_cache.compute_fingerprint, owner_id)
+        fingerprints[owner_id] = (fp, deps)
+        if fp and not fresh:
+            cached_by_owner[owner_id] = await asyncio.to_thread(
+                finance_cache.read_many_cached, owner_id, keys, fp,
+            )
+
+    misses: list[dict[str, Any]] = []
+    for item in plan:
+        if item["status"] or not item["cache_key"]:
+            continue
+        payload = cached_by_owner.get(item["owner_id"], {}).get(item["cache_key"])
+        if payload is None:
+            misses.append(item)
+            continue
+        item["by_month"] = (
+            _gross_by_month_from_services(payload) if item["kind"] == "services"
+            else _gross_by_month_from_matrix(payload)
+        )
+        item["status"] = "cached"
+
+    # Misses are filled SEQUENTIALLY on purpose. These computes are CPU-bound
+    # Python: running them concurrently doesn't finish them any sooner (GIL),
+    # it just multiplies peak memory and starves every other request on this
+    # single-worker process for the whole duration.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _COMPANY_BUDGET_SECONDS
+    for item in misses:
+        if loop.time() + _COMPANY_MIN_SLICE_SECONDS > deadline:
+            item["status"] = "pending"
+            continue
+        owner_id = item["owner_id"]
+        fp, deps = fingerprints.get(owner_id, ("", {}))
+        # Cap this compute by what's LEFT, not by the global compute timeout —
+        # otherwise a single cold project started near the deadline could run
+        # another 90s and push the whole request past the proxy's cap, which is
+        # the 502 this endpoint exists to prevent.
+        slice_s = max(_COMPANY_MIN_SLICE_SECONDS, int(deadline - loop.time()))
+        try:
+            if item["kind"] == "services":
+                item["by_month"], item["status"], item["error"] = await asyncio.wait_for(
+                    _services_revenue_computed(pool, owner_id, item["project"], fp, deps),
+                    timeout=slice_s,
+                )
+            else:
+                payload, _status = await asyncio.to_thread(
+                    _pnl_matrix_cached, owner_id, item["project"], fresh, slice_s,
+                )
+                if payload.get("_error"):
+                    item["status"] = "error"
+                    item["error"] = str(payload["_error"])
+                else:
+                    item["by_month"] = _gross_by_month_from_matrix(payload)
+                    item["status"] = "computed"
+        except asyncio.TimeoutError:
+            item["status"] = "error"
+            item["error"] = f"compute_timeout after {slice_s}s"
+        except Exception as err:  # noqa: BLE001
+            item["status"] = "error"
+            item["error"] = str(err)
+
+    months = sorted({m for item in plan for m in (item["by_month"] or {})})
+    pending_count = sum(1 for i in plan if i["status"] == "pending")
+    error_count = sum(1 for i in plan if i["status"] in ("error", "forbidden"))
+
+    tally: dict[str, int] = {}
+    for i in plan:
+        tally[i["status"]] = tally.get(i["status"], 0) + 1
+    response.headers["X-Cache"] = ",".join(f"{k}={v}" for k, v in sorted(tally.items()))
+
+    return {
+        "months": months,
+        "projects": [
+            {
+                "project": i["project"],
+                "segment": i["segment"],
+                "type": i["type"],
+                "status": i["status"],
+                "by_month": i["by_month"],
+                "error": i["error"],
+            }
+            for i in plan
+        ],
+        "complete": pending_count == 0 and error_count == 0,
+        "pending_count": pending_count,
+        "error_count": error_count,
+    }
 
 def _parse_iso(s: Optional[str]) -> Optional[date]:
     if not s:
@@ -262,49 +574,30 @@ def _parse_iso(s: Optional[str]) -> Optional[date]:
     except ValueError:
         return None
 
-@router.get("/reports", response_model=ReportsBundleOut)
-async def get_reports(
-    response: Response,
-    project: str = Query(..., description="Project ID, e.g. 'GANZA'"),
-    period_from: Optional[str] = Query(None, alias="from"),
-    period_to: Optional[str] = Query(None, alias="to"),
-    basis: str = Query("accrual", pattern="^(accrual|cash)$"),
-    fresh: bool = Query(False, description="Bypass cache and recompute from scratch"),
-    user: CurrentUser = Depends(current_user),
-    pool=Depends(get_pool),
-) -> dict[str, Any]:
-    """Compute ОПиУ + ДДС + Баланс for one project + period in a single call.
+def reports_cache_key(project: str, pf: date, pt: date, basis: str) -> str:
+    return f"reports:{project}:{pf.isoformat()}:{pt.isoformat()}:{basis}"
 
-    Returns three sub-objects matching the Streamlit "Отчёты" page tabs.
-    Errors from any single computation are reported per-tab, not as 500.
 
-    Wrapped in a durable read-through cache (`finance_compute_cache` table).
-    First call after upload / settings change recomputes from scratch and
-    stores the bundle; subsequent calls return cached JSONB in ~50ms.
-    Pass `?fresh=1` to force recomputation.
+def _reports_bundle_cached(
+    effective_user_id: int, project: str, projects: dict[str, Any],
+    pf: date, pt: date, basis: str, force: bool = False,
+) -> tuple[dict[str, Any], str]:
+    """ОПиУ + ДДС + Баланс bundle through the durable cache.
 
-    ACL: if the caller is an accepted member of `project` but not the owner,
-    we rebind to the owner's user_id so the legacy loaders read from the
-    owner's namespace (user_data + uploads). Cache key is namespaced by the
-    effective user, not the caller, so members and owners share the cache.
+    Sync (the legacy computes are sync) — call it via `asyncio.to_thread` so it
+    never runs on the event loop: on `-w 1` a blocking compute here froze the
+    single worker for the whole cold run and concurrent requests (Escalar,
+    /health) 502'd.
+
+    Shared by GET /reports and the background recompute job, so a job's result
+    lands under exactly the key the endpoint will read next.
+
+    NOTE: callers must have prefetched bank classifications into the contextvar
+    first — `aggregate_classified_by_project` reads them from there, and the
+    legacy disk path returns empty on Railway's ephemeral FS. Without it the
+    numbers come out wrong rather than failing loudly.
     """
-    effective_user_id = await _resolve_effective_user_for_project(pool, user, project)
     _bind_user_id(effective_user_id)
-    projects = legacy_config.load_projects()
-    if project not in projects:
-        raise HTTPException(status_code=404, detail={"error": "project_not_found", "available": list(projects.keys())})
-
-    pf = _parse_iso(period_from)
-    pt = _parse_iso(period_to) or date.today()
-    if pf is None:
-        # default: 30 days back
-        pf = date.fromordinal(pt.toordinal() - 30)
-
-    out: dict[str, Any] = {
-        "project": project,
-        "period": {"from": pf.isoformat(), "to": pt.isoformat()},
-        "basis": basis,
-    }
 
     def _compute_bundle() -> dict[str, Any]:
         # Lazy imports — only pay the cost when we actually need to recompute.
@@ -372,6 +665,60 @@ async def get_reports(
             pass
         return bundle
 
+    return finance_cache.cached_compute(
+        effective_user_id, reports_cache_key(project, pf, pt, basis), _compute_bundle,
+        force=force,
+        # Don't cache partial / errored bundles — half-computed results would
+        # be served indefinitely until the next user input change.
+        should_cache=lambda b: not any(k.endswith("_error") for k in b),
+    )
+
+
+@router.get("/reports", response_model=ReportsBundleOut)
+async def get_reports(
+    response: Response,
+    project: str = Query(..., description="Project ID, e.g. 'GANZA'"),
+    period_from: Optional[str] = Query(None, alias="from"),
+    period_to: Optional[str] = Query(None, alias="to"),
+    basis: str = Query("accrual", pattern="^(accrual|cash)$"),
+    fresh: bool = Query(False, description="Bypass cache and recompute from scratch"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Compute ОПиУ + ДДС + Баланс for one project + period in a single call.
+
+    Returns three sub-objects matching the Streamlit "Отчёты" page tabs.
+    Errors from any single computation are reported per-tab, not as 500.
+
+    Wrapped in a durable read-through cache (`finance_compute_cache` table).
+    First call after upload / settings change recomputes from scratch and
+    stores the bundle; subsequent calls return cached JSONB in ~50ms.
+    Pass `?fresh=1` to force recomputation.
+
+    ACL: if the caller is an accepted member of `project` but not the owner,
+    we rebind to the owner's user_id so the legacy loaders read from the
+    owner's namespace (user_data + uploads). Cache key is namespaced by the
+    effective user, not the caller, so members and owners share the cache.
+    """
+    effective_user_id = await _resolve_effective_user_for_project(pool, user, project)
+    _bind_user_id(effective_user_id)
+    projects = legacy_config.load_projects()
+    if project not in projects:
+        raise HTTPException(status_code=404, detail={"error": "project_not_found", "available": list(projects.keys())})
+
+    pf = _parse_iso(period_from)
+    pt = _parse_iso(period_to) or date.today()
+    if pf is None:
+        # default: 30 days back
+        pf = date.fromordinal(pt.toordinal() - 30)
+
+    out: dict[str, Any] = {
+        "project": project,
+        "period": {"from": pf.isoformat(), "to": pt.isoformat()},
+        "basis": basis,
+    }
+
+
     # Pre-fetch every bank statement, parse it, apply user overrides
     # (per-bank `f2_classifications_grouped_*` and per-upload
     # `f2_classifications_*`), and stuff the merged list into a contextvar
@@ -380,6 +727,32 @@ async def get_reports(
     # production app sees user classifications — the disk path stayed
     # broken on Railway because the FS is ephemeral.
     if pool is not None:
+        # ── Known inconsistency, instrumented before it is changed ──────────
+        # This prefetch uses `user.id`, while everything else in the bundle
+        # reads the OWNER's namespace (`_bind_user_id(effective_user_id)` above)
+        # and the result is cached under the owner. /services-reports prefetches
+        # for the owner instead, so the two endpoints disagree.
+        #
+        # It matters because prefetch_for_user reads that user's own bank
+        # STATEMENTS: a collaborator opening this page computes ДДС/Баланс from
+        # statements they don't have, and that payload lands in the owner's
+        # cache — the owner then gets a cache hit on numbers computed from
+        # nothing.
+        #
+        # Switching to effective_user_id changes reported financials, so it is
+        # not being done silently. This logs how often the divergence actually
+        # occurs in production; grep `finance_prefetch_owner_mismatch`. If the
+        # counter stays at zero, nobody uses memberships and the fix is free.
+        # Flipping it also needs a COMPUTE_VERSION bump: the fingerprint is
+        # computed from the owner's data and would NOT invalidate the payloads
+        # already poisoned under their key.
+        if user.id != effective_user_id:
+            import sys
+            print(
+                "[finance_prefetch_owner_mismatch] "
+                f"caller={user.id} owner={effective_user_id} project={project}",
+                file=sys.stderr, flush=True,
+            )
         try:
             from v2.services import bank_classifications as _bank_cls
             prefetched = await _bank_cls.prefetch_for_user(pool, user.id)
@@ -389,25 +762,145 @@ async def get_reports(
             # legacy disk path (which simply returns empty in production)
             pass
 
-    cache_key = f"reports:{project}:{pf.isoformat()}:{pt.isoformat()}:{basis}"
-    # Don't cache partial / errored bundles — half-computed results would
-    # be served indefinitely until next user input change.
     # Cache is keyed by the effective owner so members and owners share the
-    # same precomputed bundle.
-    # Run the (synchronous, CPU-heavy: parse 15 files + pandas compute) bundle
-    # OFF the event loop. On -w 1 a blocking compute here froze the single
-    # worker's loop for the whole cold compute → concurrent requests (Escalar,
-    # /health) 502'd. to_thread copies the current context, so _bind_user_id
-    # and the prefetched bank classifications set above stay visible.
+    # same precomputed bundle. to_thread copies the current context, so
+    # _bind_user_id and the bank classifications prefetched above stay visible.
     bundle, status = await asyncio.to_thread(
-        finance_cache.cached_compute,
-        effective_user_id, cache_key, _compute_bundle,
-        force=fresh,
-        should_cache=lambda b: not any(k.endswith("_error") for k in b),
+        _reports_bundle_cached,
+        effective_user_id, project, projects, pf, pt, basis, fresh,
     )
     out.update(bundle)
     response.headers["X-Cache"] = status
     return out
+
+async def _recompute_targets(
+    pool, user: CurrentUser, project: str,
+    pf: date, pt: date, basis: str,
+) -> list[tuple[str, str, Callable[[], Any]]]:
+    """What «Обновить» has to recompute for `project` → [(kind, cache_key, work)].
+
+    The keys are the durable cache keys, which is what makes the job dedupe
+    correct: two people refreshing the same project over the same period are
+    asking for one computation, and `finance_jobs` collapses them.
+    """
+    effective_user_id = await _resolve_effective_user_for_project(pool, user, project)
+    _bind_user_id(effective_user_id)
+    projects = legacy_config.load_projects()
+    if project not in projects:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "project_not_found", "available": list(projects.keys())},
+        )
+
+    meta = projects.get(project) or {}
+    if meta.get("type") == "services":
+        if not _is_superadmin(user):
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "superadmin_required", "feature": "services_reports"},
+            )
+        if pool is None:
+            raise HTTPException(status_code=503, detail="db_unavailable")
+
+        async def _services_work() -> None:
+            await _services_bundle_computed(pool, effective_user_id, project, pf, pt)
+
+        return [("services_reports", services_reports_cache_key(project, pf, pt), _services_work)]
+
+    async def _reports_work() -> None:
+        if pool is not None:
+            try:
+                from v2.services import bank_classifications as _bank_cls
+                # NOTE: `user.id`, not `effective_user_id` — mirrors GET /reports
+                # exactly so the job and the endpoint can't write two different
+                # payloads under one cache key. That endpoint looks inconsistent
+                # with /services-reports, which prefetches for the OWNER; if that
+                # is a bug it should be fixed in both places deliberately, not
+                # silently diverged here.
+                prefetched = await _bank_cls.prefetch_for_user(pool, user.id)
+                _bank_cls.set_prefetched(prefetched)
+            except Exception:  # noqa: BLE001
+                pass
+        await asyncio.to_thread(
+            _reports_bundle_cached,
+            effective_user_id, project, projects, pf, pt, basis, True,
+        )
+
+    async def _matrix_work() -> None:
+        await asyncio.to_thread(_pnl_matrix_cached, effective_user_id, project, True)
+
+    return [
+        ("reports", reports_cache_key(project, pf, pt, basis), _reports_work),
+        ("matrix", pnl_matrix_cache_key(project), _matrix_work),
+    ]
+
+
+def _jobs_response(project: str, targets, statuses: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    jobs = []
+    for kind, key, _work in targets:
+        st = statuses.get(key)
+        jobs.append({
+            "kind": kind,
+            "key": key,
+            "status": st["status"] if st else "idle",
+            "elapsed_s": st["elapsed_s"] if st else 0,
+            "error": st["error"] if st else None,
+        })
+    return {
+        "project": project,
+        "jobs": jobs,
+        "running": any(j["status"] in ("queued", "running") for j in jobs),
+    }
+
+
+@router.post("/recompute", response_model=RecomputeOut)
+async def start_recompute(
+    project: str = Query(..., description="Project ID"),
+    period_from: Optional[str] = Query(None, alias="from"),
+    period_to: Optional[str] = Query(None, alias="to"),
+    basis: str = Query("accrual", pattern="^(accrual|cash)$"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Start a background recompute and answer immediately.
+
+    This is what «Обновить» should call instead of `?fresh=1`. The work runs on
+    the server and lands in `finance_compute_cache`; the UI polls
+    GET /finance/recompute/status and, once done, re-reads the ordinary cached
+    endpoints — which now return the fresh numbers in ~50ms.
+
+    Why not just wait on the request: a cold recompute of a large project runs
+    for tens of seconds, and an HTTP request that long gets cut by the UI proxy
+    (90s) and Railway's edge. The user saw a spinner turn into a 502 and the
+    finished computation was discarded. Here nothing is lost if the tab closes.
+
+    Already running for the same key? You get that job back, not a second one.
+    """
+    pt = _parse_iso(period_to) or date.today()
+    pf = _parse_iso(period_from) or date.fromordinal(pt.toordinal() - 30)
+    targets = await _recompute_targets(pool, user, project, pf, pt, basis)
+    for _kind, key, work in targets:
+        finance_jobs.start(key, work)
+    return _jobs_response(project, targets, finance_jobs.snapshot(k for _, k, _ in targets))
+
+
+@router.get("/recompute/status", response_model=RecomputeOut)
+async def recompute_status(
+    project: str = Query(..., description="Project ID"),
+    period_from: Optional[str] = Query(None, alias="from"),
+    period_to: Optional[str] = Query(None, alias="to"),
+    basis: str = Query("accrual", pattern="^(accrual|cash)$"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """Progress of the jobs POST /finance/recompute started, for the same
+    project+period. `status: "idle"` means nothing is running for that key —
+    either it finished more than the retention window ago, or it never ran."""
+    pt = _parse_iso(period_to) or date.today()
+    pf = _parse_iso(period_from) or date.fromordinal(pt.toordinal() - 30)
+    targets = await _recompute_targets(pool, user, project, pf, pt, basis)
+    return _jobs_response(project, targets, finance_jobs.snapshot(k for _, k, _ in targets))
+
 
 @router.get("/services-reports", response_model=ServicesReportsBundleOut)
 async def get_services_reports(
@@ -471,10 +964,7 @@ async def get_services_reports(
             },
         )
 
-    pf = _parse_iso(period_from)
-    pt = _parse_iso(period_to) or date.today()
-    if pf is None:
-        pf = date.fromordinal(pt.toordinal() - 365)  # default: 12 months back
+    pf, pt = _services_default_period(period_from, period_to)
 
     out: dict[str, Any] = {
         "project": project,
@@ -514,8 +1004,7 @@ async def get_services_reports(
         return {k: v for k, v in bundle.items() if k not in ("project", "period")}
 
     # Cache key includes bank_only so the two views don't collide.
-    bo_suffix = "bankonly" if bank_only else "full"
-    cache_key = f"services_reports:{project}:{pf.isoformat()}:{pt.isoformat()}:{bo_suffix}"
+    cache_key = services_reports_cache_key(project, pf, pt, bank_only)
 
     bundle: dict[str, Any]
     cache_status: str
@@ -1721,6 +2210,45 @@ async def debug_sku_mapping(
 
     return report
 
+def _pnl_matrix_cached(
+    effective_user_id: int, project: str, force: bool = False,
+    timeout: int = _COMPUTE_TIMEOUT_SECONDS,
+) -> tuple[dict[str, Any], str]:
+    """Monthly PnL matrix payload through the durable cache.
+
+    Sync (the legacy compute is sync) — call it via `asyncio.to_thread`. Binds
+    the legacy user contextvar itself so it is safe to fan over several owners
+    from one request: `to_thread` copies the context, so each call gets its own.
+
+    Shared by GET /pnl-matrix and the /company roll-up so both go through the
+    same cache key and the same `should_cache` rule — a miss filled by one is
+    a hit for the other.
+    """
+    _bind_user_id(effective_user_id)
+
+    def _compute_matrix() -> dict[str, Any]:
+        from v2.legacy.reports import build_monthly_pnl_matrix
+        results = _run_parallel_with_timeout(
+            {"matrix": lambda: build_monthly_pnl_matrix(project)}, timeout=timeout,
+        )
+        data, err = results["matrix"]
+        if data is None or err:
+            import sys
+            print(f"[pnl-matrix] project={project} err={err}", file=sys.stderr, flush=True)
+            return {"project": project, "months": [], "years": [], "rows": [], "_error": err or "no_data"}
+        return {
+            "project": project,
+            "months": data.get("months", []),
+            "years": data.get("years", []),
+            "rows": data.get("rows", []),
+        }
+
+    return finance_cache.cached_compute(
+        effective_user_id, pnl_matrix_cache_key(project), _compute_matrix,
+        force=force,
+        should_cache=lambda p: not p.get("_error") and bool(p.get("months")),
+    )
+
 @router.get("/pnl-matrix", response_model=PnlMatrixOut)
 async def get_pnl_matrix(
     response: Response,
@@ -1741,31 +2269,9 @@ async def get_pnl_matrix(
     """
     effective_user_id = await _resolve_effective_user_for_project(pool, user, project)
     _bind_user_id(effective_user_id)
-
-    def _compute_matrix() -> dict[str, Any]:
-        from v2.legacy.reports import build_monthly_pnl_matrix
-        results = _run_parallel_with_timeout({
-            "matrix": lambda: build_monthly_pnl_matrix(project),
-        })
-        data, err = results["matrix"]
-        if data is None or err:
-            import sys
-            print(f"[pnl-matrix] project={project} err={err}", file=sys.stderr, flush=True)
-            return {"project": project, "months": [], "years": [], "rows": [], "_error": err or "no_data"}
-        return {
-            "project": project,
-            "months": data.get("months", []),
-            "years": data.get("years", []),
-            "rows": data.get("rows", []),
-        }
-
-    cache_key = f"matrix:{project}"
     # Off the event loop — same rationale as /reports (see get_reports).
     payload, status = await asyncio.to_thread(
-        finance_cache.cached_compute,
-        effective_user_id, cache_key, _compute_matrix,
-        force=fresh,
-        should_cache=lambda p: not p.get("_error") and bool(p.get("months")),
+        _pnl_matrix_cached, effective_user_id, project, fresh,
     )
     response.headers["X-Cache"] = status
     # Strip internal marker before returning to UI.

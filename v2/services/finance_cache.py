@@ -29,6 +29,7 @@ import hashlib
 import json
 import logging
 import os
+from collections.abc import Sequence
 from typing import Any, Callable
 
 import psycopg2
@@ -80,15 +81,32 @@ USER_DATA_KEYS_AFFECTING_FINANCE: tuple[str, ...] = (
     "f2_orphan_assignments",
     "f2_publicidade_invoices",
     "f2_rental_payments",
-    # Per-bank classification overrides — without these the cache returns a
-    # stale services-reports payload (no bank_inflows / wrong project
-    # totals) after the user re-classifies a row in /finance/classification.
-    # Surfaced as separate keys per source_key because that's how
-    # bank_classifications.prefetch_for_user reads them.
-    "f2_classifications_grouped_extrato_nubank",
-    "f2_classifications_grouped_extrato_c6_brl",
-    "f2_classifications_grouped_extrato_c6_usd",
-    "f2_classifications_grouped_extrato_mp",
+)
+
+# Whole FAMILIES of user_data keys that influence finance compute but can't be
+# listed literally, because the key name embeds a project id or an upload id.
+# Matched by prefix; MAX(updated_at) over the matches feeds the fingerprint.
+#
+# These were the invisible half of the cache. Every one of them is an input the
+# user edits from the UI, and none of them used to invalidate anything, so the
+# cache happily served pre-edit numbers:
+#
+#   f2_classifications_grouped_{source_key}   re-classifying a bank row
+#   f2_classifications_{upload_id}            same, legacy per-upload flow
+#   f2_services_invoice_payment_overrides_*   payment date/amount overrides
+#   f2_services_invoice_rate_overrides_*      FX rate overrides
+#   f2_services_hidden_transfers_*            hiding a transfer row
+#   f2_services_transfer_edits_*              editing a transfer row
+#
+# That is why the UI resorted to forcing `fresh=true` after any such edit. With
+# these covered, an ordinary read recomputes exactly when something changed.
+#
+# Prefixes rather than an ever-growing literal list on purpose: the next
+# `f2_<something>_{project}` key is covered the day it's added, instead of
+# silently serving stale numbers until someone notices.
+USER_DATA_PREFIXES_AFFECTING_FINANCE: tuple[str, ...] = (
+    "f2_classifications_",
+    "f2_services_",
 )
 
 CREATE_SQL = """
@@ -176,6 +194,7 @@ def compute_fingerprint(
         "version": COMPUTE_VERSION,
         "uploads": {},
         "user_data": {},
+        "user_data_dynamic": {},
         "extra": extra_deps or {},
     }
     try:
@@ -192,17 +211,29 @@ def compute_fingerprint(
         for src in UPLOAD_SOURCES_AFFECTING_FINANCE:
             ts = per_source.get(src)
             deps["uploads"][src] = ts.isoformat() if ts else None
-        # user_data: one query, all keys
+        # user_data: one query covering both the literal keys and the prefix
+        # families. Still a single round trip — the LIKE ANY is evaluated over
+        # rows already narrowed to this user.
+        patterns = [p + "%" for p in USER_DATA_PREFIXES_AFFECTING_FINANCE]
         cur.execute(
             """SELECT data_key, updated_at
                FROM user_data
-               WHERE user_id = %s AND data_key = ANY(%s)""",
-            (user_id, list(USER_DATA_KEYS_AFFECTING_FINANCE)),
+               WHERE user_id = %s
+                 AND (data_key = ANY(%s) OR data_key LIKE ANY(%s))""",
+            (user_id, list(USER_DATA_KEYS_AFFECTING_FINANCE), patterns),
         )
         per_key = {row[0]: row[1] for row in cur.fetchall()}
         for key in USER_DATA_KEYS_AFFECTING_FINANCE:
             ts = per_key.get(key)
             deps["user_data"][key] = ts.isoformat() if ts else None
+        # Prefix matches go in their own bucket. A key that gets DELETED simply
+        # disappears from here, which changes the hash — deletion has to
+        # invalidate just like an edit does.
+        for key, ts in per_key.items():
+            if key in deps["user_data"]:
+                continue
+            if any(key.startswith(p) for p in USER_DATA_PREFIXES_AFFECTING_FINANCE):
+                deps["user_data_dynamic"][key] = ts.isoformat() if ts else None
         cur.close()
     except Exception as err:  # noqa: BLE001
         log.warning("finance_cache: compute_fingerprint failed: %s", err)
@@ -247,6 +278,54 @@ def _read_cached(user_id: int, cache_key: str, fingerprint: str) -> Any | None:
         return None
     finally:
         conn.close()
+
+
+def read_many_cached(
+    user_id: int, cache_keys: Sequence[str], fingerprint: str,
+) -> dict[str, Any]:
+    """Batch variant of `_read_cached`: one connection, one query, N keys.
+
+    Returns {cache_key: payload} holding ONLY the rows whose stored fingerprint
+    matches. A stale row is indistinguishable from a missing one to the caller,
+    exactly as in the single-key path — absent from the dict means "recompute".
+
+    Why this exists: a dashboard that aggregates many projects used to issue one
+    HTTP request per project, and each of those opened its own psycopg2
+    connection for `ensure_schema_sync` + `compute_fingerprint` + `_read_cached`.
+    N projects cost ~3N connections and ~N fingerprint queries before a single
+    number was produced. Here it is one connection for all of them.
+    """
+    keys = [k for k in dict.fromkeys(cache_keys) if k]
+    if not keys or not fingerprint:
+        return {}
+    conn = _connect()
+    if conn is None:
+        return {}
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT cache_key, payload
+               FROM finance_compute_cache
+               WHERE user_id = %s AND cache_key = ANY(%s) AND fingerprint = %s""",
+            (user_id, keys, fingerprint),
+        )
+        rows = cur.fetchall()
+        cur.close()
+    except Exception as err:  # noqa: BLE001
+        log.warning("finance_cache: read_many_cached failed: %s", err)
+        return {}
+    finally:
+        conn.close()
+
+    out: dict[str, Any] = {}
+    for cache_key, payload in rows:
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError:
+                continue
+        out[cache_key] = payload
+    return out
 
 
 def _write_cached(
