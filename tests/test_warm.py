@@ -7,7 +7,7 @@ from v2.routers import finance
 from v2.legacy import config as legacy_config
 from v2.services import finance_warm
 
-calls = {"matrix": [], "reports": [], "services": []}
+calls = {"matrix": [], "reports": [], "services": [], "abc": []}
 
 def fake_matrix(uid, project, force=False, timeout=90):
     calls["matrix"].append((uid, project, force))
@@ -23,9 +23,15 @@ async def fake_services(pool, uid, project, pf, pt, fingerprint=None, deps=None)
     calls["services"].append((uid, project))
     return {}
 
+async def fake_abc(pool, uid, days_v, project="", *, fresh=False, step=None):
+    calls["abc"].append((uid, days_v, project, fresh))
+    return {"products": []}, "miss"
+
 finance._pnl_matrix_cached = fake_matrix
 finance._reports_bundle_cached = fake_reports
 finance._services_bundle_computed = fake_services
+import v2.routers.escalar as escalar_router
+escalar_router.abc_summary_cached = fake_abc
 finance._bind_user_id = lambda uid: None
 legacy_config.load_projects = lambda: {
     "ARTHUR": {"type": "ecom"}, "BROKEN": {"type": "ecom"}, "ESTONIA": {"type": "services"},
@@ -43,6 +49,11 @@ assert stats["users"] == 2, stats
 assert stats["matrix"] == 2, stats
 assert stats["reports"] == 2, stats
 assert stats["services"] == 2, stats
+# ABC is warmed per USER per window (key is abc:all:<days>), not per project.
+assert stats["abc"] == 4, stats                       # 2 users x {30, 90}
+assert sorted({d for _, d, _, _ in calls["abc"]}) == [30, 90], calls["abc"]
+assert all(project == "" for _, _, project, _ in calls["abc"]), calls["abc"]
+assert all(fresh is False for *_, fresh in calls["abc"]), calls["abc"]
 assert stats["errors"] == 2, stats            # BROKEN failed for each user, pass continued
 assert not stats["stopped_early"], stats
 

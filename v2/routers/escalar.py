@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, Response, UploadFile
 
@@ -73,31 +73,28 @@ def _parse_days(raw: Optional[str]) -> Union[int, str]:
         return 30
 
 
-@router.get("/products", response_model=EscalarProductsOut)
-async def get_products(
-    response: Response,
-    days: Optional[str] = Query(None),
-    project: Optional[str] = Query(None),
-    fresh: bool = Query(False, description="Bypass abc cache and recompute from scratch"),
-    user: CurrentUser = Depends(current_user),
-    pool=Depends(get_pool),
-):
-    import asyncio as _asyncio
-    import logging as _lg, time as _time
-    _log = _lg.getLogger("escalar.products")
-    _t0 = _time.perf_counter()
-    _step = lambda name: _log.info("  [%5.2fs] %s", _time.perf_counter() - _t0, name)
+async def abc_summary_cached(
+    pool, user_id: int, days_v: int, project: str = "",
+    *, fresh: bool = False, step: Callable[[str], None] = lambda _m: None,
+) -> tuple[dict[str, Any], str]:
+    """ABC summary for one (user, project, window), through the durable cache.
 
-    days_v = _parse_days(days)
-    _step("after parse_days")
+    Extracted from GET /products so the nightly warm pass runs the SAME code.
+    That matters more than the deduplication: the cache key is
+    `abc:{project}:{days}`, and a warm job that assembled its inputs even
+    slightly differently would fill that key with something the endpoint never
+    reads — a cache that looks warm and hits nothing.
+
+    Returns (summary, cache_status).
+    """
     # Bind user_id into legacy db_storage context-var — abc.aggregate calls
     # legacy.sku_catalog.load_catalog() for NCM/Origem/EAN/CSOSN, which is
     # per-user. Without this bind the fiscal fields come back empty.
-    legacy_db.set_current_user_id(user.id)
-    snoozed = set(await user_storage.get(pool, user.id, SNOOZE_KEY) or [])
-    _step(f"after snoozed load ({len(snoozed)} items)")
-    resolver = await projects.load_resolver(pool, user.id)
-    _step("after projects resolver")
+    legacy_db.set_current_user_id(user_id)
+    snoozed = set(await user_storage.get(pool, user_id, SNOOZE_KEY) or [])
+    step(f"after snoozed load ({len(snoozed)} items)")
+    resolver = await projects.load_resolver(pool, user_id)
+    step("after projects resolver")
 
     vendas_rows = None
     storage_map = None
@@ -105,16 +102,16 @@ async def get_products(
     vendas_filenames = None
     publicidade_rows = None
     if get_settings().storage_mode == "db" and pool is not None:
-        vendas_rows = await db_loader.load_user_vendas(pool, user.id)
-        _step(f"after load_user_vendas ({len(vendas_rows)} rows)")
-        storage_map = await db_loader.load_user_armazenagem(pool, user.id)
-        _step(f"after load_user_armazenagem ({len(storage_map)} skus)")
-        stock_full_map = await db_loader.load_user_stock_full(pool, user.id)
-        _step(f"after load_user_stock_full ({len(stock_full_map)} skus)")
-        vendas_filenames = await db_loader.list_user_vendas_filenames(pool, user.id)
-        _step(f"after list_vendas_filenames ({len(vendas_filenames)} files)")
-        publicidade_rows = await db_loader.load_user_publicidade(pool, user.id)
-        _step(f"after load_user_publicidade ({len(publicidade_rows)} rows)")
+        vendas_rows = await db_loader.load_user_vendas(pool, user_id)
+        step(f"after load_user_vendas ({len(vendas_rows)} rows)")
+        storage_map = await db_loader.load_user_armazenagem(pool, user_id)
+        step(f"after load_user_armazenagem ({len(storage_map)} skus)")
+        stock_full_map = await db_loader.load_user_stock_full(pool, user_id)
+        step(f"after load_user_stock_full ({len(stock_full_map)} skus)")
+        vendas_filenames = await db_loader.list_user_vendas_filenames(pool, user_id)
+        step(f"after list_vendas_filenames ({len(vendas_filenames)} files)")
+        publicidade_rows = await db_loader.load_user_publicidade(pool, user_id)
+        step(f"after load_user_publicidade ({len(publicidade_rows)} rows)")
 
     # Pull live listing prices from ml_user_items so abc can compute unit econ
     # at the current selling price (not the historical period average — avg
@@ -129,7 +126,7 @@ async def get_products(
             async with pool.acquire() as conn:
                 price_rows = await conn.fetch(
                     "SELECT item_id, price FROM ml_user_items WHERE user_id = $1",
-                    user.id,
+                    user_id,
                 )
                 # Snoozed-SKU list lives in user_data but we keep it OUT of
                 # the base finance fingerprint (reports/matrix don't care).
@@ -137,7 +134,7 @@ async def get_products(
                 # the user toggles snooze on a SKU.
                 snooze_row = await conn.fetchrow(
                     "SELECT updated_at FROM user_data WHERE user_id = $1 AND data_key = $2",
-                    user.id, SNOOZE_KEY,
+                    user_id, SNOOZE_KEY,
                 )
                 if snooze_row and snooze_row["updated_at"]:
                     snooze_updated_at_iso = snooze_row["updated_at"].isoformat()
@@ -150,7 +147,7 @@ async def get_products(
             current_prices_digest = hashlib.sha256(
                 json.dumps(sorted(current_prices_map.items())).encode("utf-8")
             ).hexdigest()
-            _step(f"after current_prices load ({len(current_prices_map)} items)")
+            step(f"after current_prices load ({len(current_prices_map)} items)")
         except Exception as err:  # noqa: BLE001
             _log.warning("current_prices load failed: %s", err)
 
@@ -192,9 +189,32 @@ async def get_products(
     }
     summary, abc_status = await _asyncio.to_thread(
         finance_cache.cached_compute,
-        user.id, abc_cache_key, _abc_compute,
+        user_id, abc_cache_key, _abc_compute,
         force=fresh,
         extra_deps=abc_extra_deps,
+    )
+    return summary, abc_status
+
+
+@router.get("/products", response_model=EscalarProductsOut)
+async def get_products(
+    response: Response,
+    days: Optional[str] = Query(None),
+    project: Optional[str] = Query(None),
+    fresh: bool = Query(False, description="Bypass abc cache and recompute from scratch"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    import asyncio as _asyncio
+    import logging as _lg, time as _time
+    _log = _lg.getLogger("escalar.products")
+    _t0 = _time.perf_counter()
+    _step = lambda name: _log.info("  [%5.2fs] %s", _time.perf_counter() - _t0, name)
+
+    days_v = _parse_days(days)
+    _step("after parse_days")
+    summary, abc_status = await abc_summary_cached(
+        pool, user.id, days_v, project or "", fresh=fresh, step=_step,
     )
     response.headers["X-Cache-Abc"] = abc_status
     _step(f"after abc.aggregate cache={abc_status} (products={len(summary['products'])})")

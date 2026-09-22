@@ -34,6 +34,13 @@ _BUDGET_S = int(os.environ.get("FINANCE_WARM_BUDGET_S", "900"))
 # Warming any other window would just fill the cache with keys nobody reads.
 _REPORTS_WINDOW_DAYS = int(os.environ.get("FINANCE_WARM_REPORTS_DAYS", "90"))
 _WARM_REPORTS = os.environ.get("FINANCE_WARM_REPORTS", "1") not in ("0", "false", "False")
+# Escalar ABC windows to pre-compute. 30 feeds /escalar/products, 90 feeds
+# /escalar/promotions — the two the UI opens with. Per-project drill-downs
+# (`abc:<project>:<days>`) stay on demand: warming every project × window
+# would multiply the nightly cost for keys most users never open.
+_WARM_ABC_DAYS = tuple(
+    int(d) for d in os.environ.get("FINANCE_WARM_ABC_DAYS", "30,90").split(",") if d.strip()
+)
 
 
 async def _users_with_projects(pool) -> list[int]:
@@ -59,11 +66,15 @@ async def warm_all(pool) -> dict[str, Any]:
         _bind_user_id, _pnl_matrix_cached, _reports_bundle_cached,
         _services_bundle_computed, _services_default_period,
     )
+    # Same function the endpoint calls — see its docstring for why warming
+    # through a copy of the logic would be worse than not warming at all.
+    from v2.routers.escalar import abc_summary_cached
     from v2.legacy import config as legacy_config
 
     started = time.monotonic()
     deadline = started + _BUDGET_S
-    stats = {"users": 0, "matrix": 0, "reports": 0, "services": 0, "errors": 0, "stopped_early": False}
+    stats = {"users": 0, "matrix": 0, "reports": 0, "services": 0, "abc": 0,
+             "errors": 0, "stopped_early": False}
 
     try:
         user_ids = await _users_with_projects(pool)
@@ -86,6 +97,18 @@ async def warm_all(pool) -> dict[str, Any]:
             log.warning("warm: user %s projects failed: %s", user_id, err)
             stats["errors"] += 1
             continue
+
+        # Escalar ABC — per user, not per project: the key is `abc:all:<days>`.
+        for days in _WARM_ABC_DAYS:
+            if time.monotonic() > deadline:
+                stats["stopped_early"] = True
+                break
+            try:
+                await abc_summary_cached(pool, user_id, days)
+                stats["abc"] += 1
+            except Exception as err:  # noqa: BLE001
+                stats["errors"] += 1
+                log.warning("warm: abc %s/%sd failed: %s", user_id, days, err)
 
         for name, meta in projects.items():
             if time.monotonic() > deadline:
