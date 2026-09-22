@@ -375,6 +375,15 @@ async def _upsert_notices(conn: asyncpg.Connection, user_id: int, notices: list[
     return saved
 
 
+# Notice topics that never reach Telegram. See the suppression block in
+# _dispatch_to_telegram for the reasoning.
+_TG_MUTED_TOPICS: tuple[str, ...] = tuple(
+    t.strip()
+    for t in _os.environ.get("TG_MUTED_TOPICS", "post_purchase").split(",")
+    if t.strip()
+)
+
+
 async def _dispatch_to_telegram(
     pool: asyncpg.Pool,
     http: httpx.AsyncClient,
@@ -449,6 +458,26 @@ async def _dispatch_to_telegram(
             """,
             user_id,
         )
+
+        # Topics muted from Telegram entirely. `post_purchase` is ML's
+        # post-sale bookkeeping stream — it fires on every order's after-sale
+        # lifecycle and carries nothing the seller acts on, so it was pure
+        # noise in the chat. Suppressed the same way as the other non-dispatch
+        # topics above: the rows stay in `ml_notices` and the UI still shows
+        # them, they're just marked as already sent so nothing is pushed.
+        #
+        # Tunable without a deploy: TG_MUTED_TOPICS="post_purchase,items".
+        if _TG_MUTED_TOPICS:
+            await conn.execute(
+                """
+                UPDATE ml_notices
+                   SET telegram_sent_at = NOW()
+                 WHERE user_id = $1
+                   AND telegram_sent_at IS NULL
+                   AND topic = ANY($2::text[])
+                """,
+                user_id, list(_TG_MUTED_TOPICS),
+            )
 
         # Bulk-suppress «empty» order notices — те у которых raw payload
         # пришёл от ML без total_amount/status/items (mid-fetch race,
