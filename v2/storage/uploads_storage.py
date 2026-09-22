@@ -34,6 +34,25 @@ class StoredFile:
     project_name: Optional[str] = None  # NULL = legacy upload, no project association
 
 
+@dataclass
+class StoredFileMeta:
+    """Everything a LIST view needs, and deliberately not the file itself.
+
+    `StoredFile` carries `file_bytes`, so building a listing out of it means
+    streaming every stored file from Postgres into this process just to call
+    `len()` on it. On an account with a few dozen vendas snapshots and bank
+    statements that is hundreds of megabytes per page view, and it grows with
+    every upload — which is exactly how /finance/uploads got to a 30s timeout.
+    """
+    id: int
+    filename: str
+    source_key: str
+    created_at: datetime
+    size_bytes: int
+    user_id: Optional[int] = None
+    project_name: Optional[str] = None
+
+
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -176,6 +195,79 @@ async def fetch_files_by_source(
             content_sha256=r["content_sha256"] or "",
             file_bytes=bytes(r["file_bytes"]),
             created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+
+
+async def list_files_meta(
+    pool: asyncpg.Pool,
+    user_id: int,
+    source_key: str,
+) -> list[StoredFileMeta]:
+    """Metadata for `(user_id, source_key)`, newest first — WITHOUT the bytes.
+
+    `octet_length` is computed by Postgres, so the file contents never cross
+    the wire. Use this for anything that only displays a file; use
+    `fetch_files_by_source` only when you are actually going to parse it.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, filename, source_key, created_at,
+                   octet_length(file_bytes) AS size_bytes
+            FROM uploads
+            WHERE user_id = $1 AND source_key = $2 AND file_bytes IS NOT NULL
+            ORDER BY created_at DESC
+            """,
+            user_id,
+            source_key,
+        )
+    return [
+        StoredFileMeta(
+            id=r["id"],
+            filename=r["filename"] or "",
+            source_key=r["source_key"] or "",
+            created_at=r["created_at"],
+            size_bytes=r["size_bytes"] or 0,
+        )
+        for r in rows
+    ]
+
+
+async def list_files_meta_for_project(
+    pool: asyncpg.Pool,
+    user_ids: list[int],
+    source_key: str,
+    project_name: str,
+) -> list[StoredFileMeta]:
+    """Project-scoped variant of `list_files_meta`. Same rule: no bytes."""
+    if not user_ids:
+        return []
+    await ensure_project_name_column(pool)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, filename, source_key, created_at, project_name,
+                   octet_length(file_bytes) AS size_bytes
+              FROM uploads
+             WHERE user_id = ANY($1::int[])
+               AND source_key = $2
+               AND project_name = $3
+               AND file_bytes IS NOT NULL
+             ORDER BY created_at DESC
+            """,
+            user_ids, source_key, project_name,
+        )
+    return [
+        StoredFileMeta(
+            id=r["id"],
+            user_id=r["user_id"],
+            filename=r["filename"] or "",
+            source_key=r["source_key"] or "",
+            created_at=r["created_at"],
+            size_bytes=r["size_bytes"] or 0,
+            project_name=r["project_name"],
         )
         for r in rows
     ]

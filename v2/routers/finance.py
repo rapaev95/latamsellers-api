@@ -2545,14 +2545,18 @@ async def list_uploads(
         groups: list[dict[str, Any]] = []
         total = 0
         for source_key, count in sorted(source_counts.items()):
-            files = await uploads_storage.fetch_files_for_project(
+            # Metadata only. This used to call fetch_files_for_project, which
+            # selects file_bytes — so rendering a LIST of uploads streamed every
+            # stored file out of Postgres just to take its length, and the page
+            # got slower with every upload until it hit the proxy's timeout.
+            files = await uploads_storage.list_files_meta_for_project(
                 pool, user_ids, source_key, project_filter,
             )
             items = [
                 {
                     "id": f.id,
                     "filename": f.filename,
-                    "size_bytes": len(f.file_bytes),
+                    "size_bytes": f.size_bytes,
                     "created_at": f.created_at.isoformat() if f.created_at else "",
                 }
                 for f in files
@@ -2570,12 +2574,12 @@ async def list_uploads(
     groups = []
     total = 0
     for source_key, count in sorted(source_counts.items()):
-        files = await uploads_storage.fetch_files_by_source(pool, user.id, source_key)
+        files = await uploads_storage.list_files_meta(pool, user.id, source_key)
         items = [
             {
                 "id": f.id,
                 "filename": f.filename,
-                "size_bytes": len(f.file_bytes),
+                "size_bytes": f.size_bytes,
                 "created_at": f.created_at.isoformat() if f.created_at else "",
             }
             for f in files

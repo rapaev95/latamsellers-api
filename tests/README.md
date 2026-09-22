@@ -7,6 +7,7 @@ Plain scripts, no pytest — run them with the project's interpreter:
 .venv/bin/python tests/test_company.py
 .venv/bin/python tests/test_warm.py
 .venv/bin/python tests/test_fingerprint.py
+.venv/bin/python tests/test_uploads_listing.py
 ```
 
 They monkeypatch the compute layer, so nothing here touches Postgres or runs a
@@ -22,6 +23,9 @@ real report. What they pin down is the wiring that is easy to break silently:
 - `test_fingerprint.py` — every dynamic `user_data` key family the UI edits
   invalidates the cache (add, edit AND delete), unrelated keys don't, and it
   still takes one query. This is what replaced the UI's forced `fresh=true`.
+- `test_uploads_listing.py` — the uploads list view reads metadata only. The
+  regression it guards is invisible in the response: fetching the bytes again
+  returns identical JSON and is simply slow, so the query shape is pinned.
 
 Run them after touching `finance_cache`, `finance_jobs`, the cache-key helpers,
 or anything in `routers/finance.py` that those share.
