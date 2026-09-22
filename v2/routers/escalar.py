@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from typing import Any, Optional, Union
 
@@ -119,7 +120,9 @@ async def get_products(
     # at the current selling price (not the historical period average — avg
     # mixes in past discounts and is misleading for "should I take this promo").
     current_prices_map: dict[str, float] = {}
-    items_max_fetched_iso: str | None = None
+    # Digest of the prices that actually feed the compute — see the note at
+    # `abc_extra_deps` for why this replaced MAX(fetched_at).
+    current_prices_digest: str = ""
     snooze_updated_at_iso: str | None = None
     if pool is not None:
         try:
@@ -128,15 +131,6 @@ async def get_products(
                     "SELECT item_id, price FROM ml_user_items WHERE user_id = $1",
                     user.id,
                 )
-                # MAX(fetched_at) feeds the cache fingerprint via extra_deps so
-                # that an items refresh (price change) invalidates ABC, not
-                # just an upload or settings change.
-                items_max_row = await conn.fetchrow(
-                    "SELECT MAX(fetched_at) AS m FROM ml_user_items WHERE user_id = $1",
-                    user.id,
-                )
-                if items_max_row and items_max_row["m"]:
-                    items_max_fetched_iso = items_max_row["m"].isoformat()
                 # Snoozed-SKU list lives in user_data but we keep it OUT of
                 # the base finance fingerprint (reports/matrix don't care).
                 # Pulling its updated_at here lets ABC alone invalidate when
@@ -153,6 +147,9 @@ async def get_products(
                         current_prices_map[r["item_id"]] = float(r["price"])
                     except (TypeError, ValueError):
                         pass
+            current_prices_digest = hashlib.sha256(
+                json.dumps(sorted(current_prices_map.items())).encode("utf-8")
+            ).hexdigest()
             _step(f"after current_prices load ({len(current_prices_map)} items)")
         except Exception as err:  # noqa: BLE001
             _log.warning("current_prices load failed: %s", err)
@@ -176,7 +173,21 @@ async def get_products(
 
     abc_cache_key = f"abc:{project or 'all'}:{days_v}"
     abc_extra_deps = {
-        "ml_user_items_max_fetched": items_max_fetched_iso,
+        # The prices themselves, not MAX(ml_user_items.fetched_at).
+        #
+        # `fetched_at` records when we last LOOKED at an item, not when it
+        # changed. The ML sync crons touch these rows continuously, so that
+        # value moved forward every few minutes and the ABC cache was stale on
+        # literally every request — the production logs showed `cache=stale`
+        # every single time, with a 9-21s recompute behind it. A cache that
+        # never hits is worse than no cache: it costs the compute AND the
+        # bookkeeping.
+        #
+        # A digest of current_prices_map invalidates exactly when a price that
+        # feeds the computation actually changes. It also costs nothing extra:
+        # these rows are already loaded above, and it removes the separate
+        # MAX() round trip.
+        "ml_user_items_prices": current_prices_digest,
         "snoozed_updated_at": snooze_updated_at_iso,
     }
     summary, abc_status = await _asyncio.to_thread(
