@@ -328,6 +328,58 @@ def read_many_cached(
     return out
 
 
+def _read_deps_snapshot(user_id: int, cache_key: str) -> dict | None:
+    """The deps recorded next to a cached payload, for answering the one
+    question a stale cache raises: what actually changed?"""
+    conn = _connect()
+    if conn is None:
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT deps_snapshot FROM finance_compute_cache
+               WHERE user_id = %s AND cache_key = %s""",
+            (user_id, cache_key),
+        )
+        row = cur.fetchone()
+        cur.close()
+        if not row or row[0] is None:
+            return None
+        snap = row[0]
+        return json.loads(snap) if isinstance(snap, str) else snap
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        conn.close()
+
+
+def _flatten(d: Any, prefix: str = "") -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if isinstance(d, dict):
+        for k, v in d.items():
+            out.update(_flatten(v, f"{prefix}.{k}" if prefix else str(k)))
+    else:
+        out[prefix] = d
+    return out
+
+
+def explain_stale(user_id: int, cache_key: str, fresh_deps: dict) -> str:
+    """Which dependency keys differ between the stored snapshot and now.
+
+    A cache that is stale on *every* request is a bug, not a cost — it pays the
+    compute and the bookkeeping and returns nothing. This names the culprit
+    instead of leaving it to guesswork.
+    """
+    old = _read_deps_snapshot(user_id, cache_key)
+    if old is None:
+        return "no_snapshot"
+    a, b = _flatten(old), _flatten(fresh_deps)
+    diff = [k for k in set(a) | set(b) if a.get(k) != b.get(k)]
+    if not diff:
+        return "identical_deps(hash_mismatch?)"
+    return ",".join(sorted(diff)[:6]) + (f"+{len(diff) - 6}" if len(diff) > 6 else "")
+
+
 def _write_cached(
     user_id: int,
     cache_key: str,
@@ -414,6 +466,11 @@ def cached_compute(
         # Determine miss vs stale for telemetry — quick second probe by key only.
         was_present = _has_any_row(user_id, cache_key)
         status_hint = "stale" if was_present else "miss"
+        if was_present:
+            log.warning(
+                "finance_cache STALE user=%s key=%s changed=%s",
+                user_id, cache_key, explain_stale(user_id, cache_key, deps_snapshot),
+            )
     else:
         status_hint = "force"
 
