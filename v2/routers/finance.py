@@ -28,6 +28,7 @@ from v2.schemas.finance import (
     ProjectsListOut, ReportsBundleOut,
     CompanyRevenueOut,
     RecomputeOut,
+    ReportsRollupOut,
     SkuMappingOut, SkuBulkSaveIn, SkuBulkSaveOut,
     PnlMatrixOut,
     OrphanPacotesResponse, OrphanSaveIn, OrphanSaveOut,
@@ -986,6 +987,121 @@ async def recompute_status(
     pf = _parse_iso(period_from) or date.fromordinal(pt.toordinal() - 30)
     targets = await _recompute_targets(pool, user, project, pf, pt, basis)
     return _jobs_response(project, targets, finance_jobs.snapshot(k for _, k, _ in targets))
+
+
+@router.get("/reports-rollup", response_model=ReportsRollupOut)
+async def get_reports_rollup(
+    response: Response,
+    period_from: Optional[str] = Query(None, alias="from"),
+    period_to: Optional[str] = Query(None, alias="to"),
+    basis: str = Query("accrual", pattern="^(accrual|cash)$"),
+    fresh: bool = Query(False, description="Recompute instead of reading the durable cache"),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+) -> dict[str, Any]:
+    """P&L for every visible project over one period, in a single request.
+
+    Replaces a client-side fan-out of /finance/reports — one per project, in
+    parallel, on the heaviest endpoint in this router. Same failure mode as the
+    other roll-ups had: the computes serialise behind the GIL, the tail hits the
+    proxy cap, and the caller's `catch → null` dropped those projects out of the
+    aggregate without saying so.
+
+    Reads the durable cache and hands misses to background jobs, so the request
+    returns immediately. Poll while `running`; each pass finds more done.
+
+    Every project goes through the ecom reports path, including services ones —
+    that is exactly what the per-project fan-out did, so the numbers can't shift
+    underneath the caller.
+    """
+    pt = _parse_iso(period_to) or date.today()
+    pf = _parse_iso(period_from) or date.fromordinal(pt.toordinal() - 30)
+
+    projects, owners = await _visible_projects_with_owners(pool, user)
+    plan: list[dict[str, Any]] = [
+        {
+            "project": name,
+            "owner_id": owners.get(name, user.id),
+            "cache_key": reports_cache_key(name, pf, pt, basis),
+            "status": None,
+            "pnl": None,
+            "error": None,
+        }
+        for name in sorted(projects)
+    ]
+
+    # One fingerprint + one batched SELECT per distinct owner.
+    fingerprints: dict[int, tuple[str, dict[str, Any]]] = {}
+    keys_by_owner: dict[int, list[str]] = {}
+    for item in plan:
+        keys_by_owner.setdefault(item["owner_id"], []).append(item["cache_key"])
+
+    cached_by_owner: dict[int, dict[str, Any]] = {}
+    for owner_id, keys in keys_by_owner.items():
+        fp, deps = await asyncio.to_thread(finance_cache.compute_fingerprint, owner_id)
+        fingerprints[owner_id] = (fp, deps)
+        if fp and not fresh:
+            cached_by_owner[owner_id] = await asyncio.to_thread(
+                finance_cache.read_many_cached, owner_id, keys, fp,
+            )
+
+    for item in plan:
+        bundle = cached_by_owner.get(item["owner_id"], {}).get(item["cache_key"])
+        if bundle is not None:
+            item["status"] = "cached"
+            item["pnl"] = bundle.get("pnl")
+            if bundle.get("pnl_error"):
+                item["status"], item["error"] = "error", str(bundle["pnl_error"])
+            continue
+
+        item["status"] = "pending"
+
+        async def _work(o=item["owner_id"], proj=item["project"]) -> None:
+            if pool is not None:
+                try:
+                    from v2.services import bank_classifications as _bank_cls
+                    # `user.id` mirrors GET /reports exactly — see the note there
+                    # about the owner/caller discrepancy. Two code paths writing
+                    # different payloads under one cache key would be worse than
+                    # the discrepancy itself.
+                    prefetched = await _bank_cls.prefetch_for_user(pool, user.id)
+                    _bank_cls.set_prefetched(prefetched)
+                except Exception:  # noqa: BLE001
+                    pass
+            await asyncio.to_thread(
+                _reports_bundle_cached, o, proj, projects, pf, pt, basis, fresh,
+            )
+
+        try:
+            finance_jobs.start(item["cache_key"], _work)
+        except Exception as err:  # noqa: BLE001
+            item["status"], item["error"] = "error", str(err)
+
+    job_states = finance_jobs.snapshot(i["cache_key"] for i in plan)
+    for item in plan:
+        st = job_states.get(item["cache_key"])
+        if st and st["status"] == "failed" and item["status"] == "pending":
+            item["status"], item["error"] = "error", st["error"]
+
+    pending_count = sum(1 for i in plan if i["status"] == "pending")
+    error_count = sum(1 for i in plan if i["status"] == "error")
+    tally: dict[str, int] = {}
+    for i in plan:
+        tally[i["status"]] = tally.get(i["status"], 0) + 1
+    response.headers["X-Cache"] = ",".join(f"{k}={v}" for k, v in sorted(tally.items()))
+
+    return {
+        "period": {"from": pf.isoformat(), "to": pt.isoformat()},
+        "basis": basis,
+        "projects": [
+            {"project": i["project"], "status": i["status"], "pnl": i["pnl"], "error": i["error"]}
+            for i in plan
+        ],
+        "running": any(st["status"] in ("queued", "running") for st in job_states.values()),
+        "complete": pending_count == 0 and error_count == 0,
+        "pending_count": pending_count,
+        "error_count": error_count,
+    }
 
 
 @router.get("/services-reports", response_model=ServicesReportsBundleOut)

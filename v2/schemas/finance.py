@@ -273,6 +273,33 @@ class PnlMatrixOut(BaseModel):
     rows: list[PnlMatrixRow]
 
 
+# ── Reports roll-up (P&L for every project in one call) ────────────────────
+#
+# Feeds the Escalar P&L waterfall, which used to fan out one /finance/reports
+# request per project — the heaviest endpoint there is, since each one computes
+# ОПиУ + ДДС + Баланс. Only `pnl` is returned here: the waterfall doesn't read
+# cashflow or balance, and shipping them would triple the payload.
+
+class ReportsRollupProject(BaseModel):
+    project: str
+    # cached | computed | pending | error. `pending` means a background job is
+    # filling it; `pnl` is absent, NOT an empty report — a caller summing these
+    # must skip it rather than add zeros.
+    status: str
+    pnl: Optional[PnLReportOut] = None
+    error: Optional[str] = None
+
+
+class ReportsRollupOut(BaseModel):
+    period: dict[str, str]
+    basis: str
+    projects: list[ReportsRollupProject]
+    running: bool = False
+    complete: bool
+    pending_count: int = 0
+    error_count: int = 0
+
+
 # ── Background recompute jobs ──────────────────────────────────────────────
 #
 # `?fresh=1` on a big project runs for tens of seconds. Held open as an HTTP
