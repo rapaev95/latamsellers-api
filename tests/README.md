@@ -9,6 +9,7 @@ Plain scripts, no pytest — run them with the project's interpreter:
 .venv/bin/python tests/test_fingerprint.py
 .venv/bin/python tests/test_uploads_listing.py
 .venv/bin/python tests/test_reports_rollup.py
+.venv/bin/python tests/test_abc_summary.py
 ```
 
 They monkeypatch the compute layer, so nothing here touches Postgres or runs a
@@ -27,6 +28,9 @@ real report. What they pin down is the wiring that is easy to break silently:
 - `test_reports_rollup.py` — the P&L roll-up serves cached reports, turns
   misses into background jobs without restarting them on every poll, and keeps
   a project that produced nothing out of the aggregate instead of adding zeros.
+- `test_abc_summary.py` — CALLS abc_summary_cached rather than importing it
+  (a NameError in the body survived both an import check and a symtable pass),
+  and pins the ordering: a cache hit must never load the heavy inputs.
 - `test_uploads_listing.py` — the uploads list view reads metadata only. The
   regression it guards is invisible in the response: fetching the bytes again
   returns identical JSON and is simply slow, so the query shape is pinned.

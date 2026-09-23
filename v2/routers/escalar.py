@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import json
 from typing import Any, Callable, Optional, Union
 
@@ -73,6 +74,11 @@ def _parse_days(raw: Optional[str]) -> Union[int, str]:
         return 30
 
 
+# Own logger: this function is called from the endpoint AND from the nightly
+# warm pass, so it must not depend on names defined inside a request handler.
+_abc_log = logging.getLogger("escalar.abc")
+
+
 async def abc_summary_cached(
     pool, user_id: int, days_v: int, project: str = "",
     *, fresh: bool = False, step: Callable[[str], None] = lambda _m: None,
@@ -101,18 +107,6 @@ async def abc_summary_cached(
     stock_full_map = None
     vendas_filenames = None
     publicidade_rows = None
-    if get_settings().storage_mode == "db" and pool is not None:
-        vendas_rows = await db_loader.load_user_vendas(pool, user_id)
-        step(f"after load_user_vendas ({len(vendas_rows)} rows)")
-        storage_map = await db_loader.load_user_armazenagem(pool, user_id)
-        step(f"after load_user_armazenagem ({len(storage_map)} skus)")
-        stock_full_map = await db_loader.load_user_stock_full(pool, user_id)
-        step(f"after load_user_stock_full ({len(stock_full_map)} skus)")
-        vendas_filenames = await db_loader.list_user_vendas_filenames(pool, user_id)
-        step(f"after list_vendas_filenames ({len(vendas_filenames)} files)")
-        publicidade_rows = await db_loader.load_user_publicidade(pool, user_id)
-        step(f"after load_user_publicidade ({len(publicidade_rows)} rows)")
-
     # Pull live listing prices from ml_user_items so abc can compute unit econ
     # at the current selling price (not the historical period average — avg
     # mixes in past discounts and is misleading for "should I take this promo").
@@ -149,7 +143,7 @@ async def abc_summary_cached(
             ).hexdigest()
             step(f"after current_prices load ({len(current_prices_map)} items)")
         except Exception as err:  # noqa: BLE001
-            _log.warning("current_prices load failed: %s", err)
+            _abc_log.warning("current_prices load failed: %s", err)
 
     # ABC compute is the heavy part — wrap only this in the durable cache.
     # Quality/visits/items_meta joins below stay live so item refreshes show up
@@ -187,6 +181,40 @@ async def abc_summary_cached(
         "ml_user_items_prices": current_prices_digest,
         "snoozed_updated_at": snooze_updated_at_iso,
     }
+    # ── Answer from cache BEFORE loading the inputs ────────────────────────
+    #
+    # Those five db_loader calls used to run unconditionally, so a cache HIT
+    # still paid for parsing ~7k vendas rows plus four more queries. Under load
+    # the preamble alone reached 17s, feeding a compute that was never needed.
+    # A read-through cache has to answer before it fetches what it would
+    # compute from.
+    #
+    # The price map stays ahead of the check because it has to: its digest is
+    # part of the fingerprint. That's one indexed query over ~240 rows.
+    fingerprint, _deps = await asyncio.to_thread(
+        finance_cache.compute_fingerprint, user_id, abc_extra_deps,
+    )
+    if not fresh and fingerprint:
+        cached = await asyncio.to_thread(
+            finance_cache._read_cached, user_id, abc_cache_key, fingerprint,  # noqa: SLF001
+        )
+        if cached is not None:
+            step("after abc cache hit (inputs never loaded)")
+            return cached, "hit"
+
+    # Miss — now the inputs are worth loading.
+    if get_settings().storage_mode == "db" and pool is not None:
+        vendas_rows = await db_loader.load_user_vendas(pool, user_id)
+        step(f"after load_user_vendas ({len(vendas_rows)} rows)")
+        storage_map = await db_loader.load_user_armazenagem(pool, user_id)
+        step(f"after load_user_armazenagem ({len(storage_map)} skus)")
+        stock_full_map = await db_loader.load_user_stock_full(pool, user_id)
+        step(f"after load_user_stock_full ({len(stock_full_map)} skus)")
+        vendas_filenames = await db_loader.list_user_vendas_filenames(pool, user_id)
+        step(f"after list_vendas_filenames ({len(vendas_filenames)} files)")
+        publicidade_rows = await db_loader.load_user_publicidade(pool, user_id)
+        step(f"after load_user_publicidade ({len(publicidade_rows)} rows)")
+
     summary, abc_status = await asyncio.to_thread(
         finance_cache.cached_compute,
         user_id, abc_cache_key, _abc_compute,
