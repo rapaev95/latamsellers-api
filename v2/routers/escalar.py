@@ -187,7 +187,7 @@ async def abc_summary_cached(
         "ml_user_items_prices": current_prices_digest,
         "snoozed_updated_at": snooze_updated_at_iso,
     }
-    summary, abc_status = await _asyncio.to_thread(
+    summary, abc_status = await asyncio.to_thread(
         finance_cache.cached_compute,
         user_id, abc_cache_key, _abc_compute,
         force=fresh,
