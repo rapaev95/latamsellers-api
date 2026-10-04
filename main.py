@@ -64,7 +64,6 @@ from v2.services import ml_claims_dispatch as ml_claims_dispatch_svc  # noqa: E4
 from v2.services import daily_summary_dispatch as daily_summary_dispatch_svc  # noqa: E402
 from v2.services import ml_anomalies as ml_anomalies_svc  # noqa: E402
 from v2.services import photo_ab_dispatch as photo_ab_dispatch_svc  # noqa: E402
-from v2.services import positions_refresh as positions_refresh_svc  # noqa: E402
 from v2.services import ml_item_context as ml_item_context_svc  # noqa: E402
 from v2.services import ml_messages_dispatch as ml_messages_dispatch_svc  # noqa: E402
 from v2.services import ml_notices as ml_notices_svc  # noqa: E402
@@ -277,33 +276,6 @@ async def _dispatch_anomalies_job() -> None:
         )
     except Exception as err:  # noqa: BLE001
         _ml_log.exception("Anomalies job failed: %s", err)
-
-
-async def _dispatch_positions_refresh_job() -> None:
-    """Daily walk of every tracked keyword: refresh position + write
-    history. Acts as the heartbeat for ML scraper auth — if the failure
-    rate spikes for a user, ml session probably expired and we send a
-    TG alert with re-login instructions.
-
-    Runs once a day at 12:00 UTC = 09:00 BRT — quiet hour for ML's
-    gateway, plus the seller's morning so action items land at a useful
-    time. Throttling inside the service paces calls so we don't trip
-    bot detection.
-    """
-    try:
-        pool = await get_pool()
-        if pool is None:
-            _ml_log.warning("Positions refresh skipped: no DB pool")
-            return
-        result = await positions_refresh_svc.dispatch_all_users(pool)
-        _ml_log.info(
-            "Positions refresh tick: users=%s tracked=%s ok=%s fail=%s alerts=%s",
-            result.get("users"), result.get("tracked"),
-            result.get("ok"), result.get("fail"),
-            result.get("alerts_sent"),
-        )
-    except Exception as err:  # noqa: BLE001
-        _ml_log.exception("Positions refresh job failed: %s", err)
 
 
 async def _dispatch_messages_to_tg_job() -> None:
@@ -1152,55 +1124,11 @@ async def _v2_startup() -> None:
         coalesce=True,
         replace_existing=True,
     )
-    # Positions refresh — 3 ticks per day so users with 100-200
-    # tracked keywords can rotate through their queue in ~2-3 days
-    # instead of a week. Each tick:
-    #   - picks PER_USER_MAX_KW (default 30) STALEST items
-    #   - skips items checked within MIN_KW_INTERVAL_HOURS (16h)
-    #   - throttles 12s ± 5s between keywords + 3-8s between users
-    # Combined with cron jitter ±25min, no two ticks fire at exactly
-    # the same time of day across deploys.
-    #
-    # Default schedule (env-overridable):
-    #   - tick 1: ~12 UTC (= 09 BRT) — morning
-    #   - tick 2: ~17 UTC (= 14 BRT) — afternoon
-    #   - tick 3: ~22 UTC (= 19 BRT) — evening
-    # Each minute is randomized per deploy → not on round numbers.
-    import random as _rnd
-    _positions_jitter_s = int(os.environ.get(
-        "POSITIONS_REFRESH_JITTER_S", "1500",  # ±25 min
-    ))
-    _positions_default_hours_utc = [12, 17, 22]
-    _positions_hours_env = os.environ.get("POSITIONS_REFRESH_HOURS_UTC", "").strip()
-    if _positions_hours_env:
-        try:
-            _positions_hours = [int(x) for x in _positions_hours_env.split(",") if x.strip()]
-        except ValueError:
-            _positions_hours = _positions_default_hours_utc
-    else:
-        _positions_hours = _positions_default_hours_utc
+    # Positions refresh cron removed 2026-10-04: the ML account behind the
+    # scraper is dead, so the daily walk only produced failed requests and a
+    # "session expired" Telegram alert. The service and its endpoints are
+    # still in the tree; nothing schedules them any more.
 
-    for _idx, _hour in enumerate(_positions_hours):
-        # Per-tick random minute, never on the hour
-        _minute = _rnd.randint(3, 57)
-        _ml_scheduler.add_job(
-            _dispatch_positions_refresh_job,
-            CronTrigger(
-                hour=_hour,
-                minute=_minute,
-                timezone="UTC",
-                jitter=_positions_jitter_s,
-            ),
-            id=f"positions_refresh_tick_{_idx + 1}",
-            max_instances=1,
-            coalesce=True,
-            replace_existing=True,
-        )
-        _ml_log.info(
-            "positions_refresh tick %d scheduled: %02d:%02d UTC ± %ds (≈ %02d:%02d BRT)",
-            _idx + 1, _hour, _minute, _positions_jitter_s,
-            (_hour - 3) % 24, _minute,
-        )
     # Anomalies dispatch — fires 30 minutes after daily-summary so the
     # seller sees the recap first, then the anomaly follow-up.
     _anomalies_hour = int(os.environ.get("ANOMALIES_TG_HOUR_UTC", "23"))

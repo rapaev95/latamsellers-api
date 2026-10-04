@@ -1956,12 +1956,8 @@ async def trigger_cron_admin(
             lambda: photo_ab_dispatch_svc.dispatch_pending_results(pool),
         )
 
-    if do_all or "positions" in requested:
-        from v2.services import positions_refresh as _pr_svc
-        await _run(
-            "positions_refresh",
-            lambda: _pr_svc._refresh_one_user(pool, user.id),
-        )
+    # "positions" removed 2026-10-04 — the ML account behind the scraper is
+    # dead, so running it only burns requests and raises a false alert.
 
     return {"user_id": user.id, "ran": list(results.keys()), "results": results}
 

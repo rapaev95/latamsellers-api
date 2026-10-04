@@ -26,5 +26,8 @@ router.include_router(ads_router.router)
 router.include_router(escalar_router.router)
 router.include_router(finance_router.router)
 router.include_router(ml_oauth_router.router)
-router.include_router(positions_router.router)
+# Positions router unregistered 2026-10-04 — the ML account behind the
+# scraper is dead. Endpoints stay in the tree but are not reachable, so
+# nothing can trigger a scrape by accident.
+# router.include_router(positions_router.router)
 router.include_router(team_router.router)
