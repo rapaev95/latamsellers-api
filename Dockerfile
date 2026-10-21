@@ -35,4 +35,16 @@ EXPOSE 8000
 # UND_ERR_SOCKET and the bundle never reached the durable cache — making every
 # load a fresh, doomed recompute. The raised timeout lets the compute finish,
 # cache, and serve ~50ms thereafter.
-CMD ["sh", "-c", "gunicorn main:app -k uvicorn.workers.UvicornWorker -w 1 --timeout 120 --graceful-timeout 120 --bind [::]:${PORT:-8000}"]
+# Recycle the worker periodically. Threads that a timed-out compute abandoned
+# can never be reclaimed — Python cannot kill a thread — so they accumulate
+# until pthread_create fails and EVERY sync endpoint 500s with
+# "RuntimeError: can't start new thread". That took ~2 weeks of uptime to hit
+# on 2026-10-21. Recycling resets the count; it treats the symptom, not the
+# leak.
+#
+# The number is deliberately high. The APScheduler lives INSIDE this worker,
+# so every recycle restarts all cron jobs and will kill a long one mid-run —
+# the nightly cache warm can run 15 minutes. Rare recycles are the point.
+# /health reports threads and requests served, so tune this from real numbers
+# rather than guessing: pick a value the process reaches about once a day.
+CMD ["sh", "-c", "gunicorn main:app -k uvicorn.workers.UvicornWorker -w 1 --timeout 120 --graceful-timeout 120 --max-requests 5000 --max-requests-jitter 500 --bind [::]:${PORT:-8000}"]

@@ -10,6 +10,8 @@ import io
 import json
 import logging
 import os
+import os as _os_mod
+import time as _time_mod
 import sys
 from datetime import datetime
 
@@ -1719,9 +1721,33 @@ def compute_top_categories(df: pd.DataFrame, source: str) -> list[dict]:
     return cats[:5]
 
 
+_PROCESS_STARTED_AT = _time_mod.time()
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    """Liveness plus the numbers that predict the failure we actually hit.
+
+    On 2026-10-21 every sync endpoint started returning 500 with
+    "RuntimeError: can't start new thread": threads abandoned by timed-out
+    computes can never be reclaimed, so after ~2 weeks of uptime the process
+    could not spawn another one. Nothing surfaced it — it was found by a user
+    reporting the site was down.
+
+    `threads` is the number to watch. A healthy process sits at a stable
+    baseline; a steady climb across days means the leak is active again and
+    the worker will fail once it reaches the container's ceiling.
+    """
+    import threading
+
+    uptime_s = int(_time_mod.time() - _PROCESS_STARTED_AT)
+    return {
+        "status": "ok",
+        "threads": threading.active_count(),
+        "uptime_s": uptime_s,
+        "uptime_h": round(uptime_s / 3600, 1),
+        "pid": _os_mod.getpid(),
+    }
 
 
 def parse_brl(val) -> float:
