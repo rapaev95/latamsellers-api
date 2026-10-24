@@ -4,6 +4,7 @@ Generates OPiU (P&L), DDS (Cash Flow), Balance per project.
 """
 import io
 import re
+import threading
 import pandas as pd
 from pathlib import Path
 from .config import (
@@ -1879,8 +1880,30 @@ def _classify_estado(estado: str) -> str:
     return "in_progress"
 
 
+# ML renames export columns without notice; map new spellings back to the one
+# the rest of the code reads. Applied per file, before the concat — otherwise
+# a new export and an old one land in two different columns and the newest
+# file (which wins the dedupe) loses its dates.
+#   2026-10: «Data da venda» → «Data de venda» — every sale in the newest
+#   90-day export vanished from P&L and the matrix.
+_VENDAS_COLUMN_RENAMES = {
+    "Data de venda": "Data da venda",
+}
+
+
 def _parse_one_vendas_file(filename: str, blob: bytes) -> "pd.DataFrame | None":
     """Parse a single Vendas ML file (XLSX or Brazilian CSV ;-sep skip-5)."""
+    df = _parse_one_vendas_file_raw(filename, blob)
+    if df is None:
+        return None
+    renames = {
+        new: old for new, old in _VENDAS_COLUMN_RENAMES.items()
+        if new in df.columns and old not in df.columns
+    }
+    return df.rename(columns=renames) if renames else df
+
+
+def _parse_one_vendas_file_raw(filename: str, blob: bytes) -> "pd.DataFrame | None":
     import io
     buf = io.BytesIO(blob)
     if filename.lower().endswith(".csv"):
@@ -4163,6 +4186,65 @@ def _parse_armazenagem_rows(rows: list) -> dict | None:
     return {"by_sku": by_sku, "daily_cols": [c for _, c in daily_cols]}
 
 
+# Parsed armazenagem uploads per user, keyed by the set of uploads (id +
+# created_at) — so it changes only when files are added or removed, never
+# because time passed. One report compute calls load_armazenagem_report from
+# compute_pnl, compute_balance and once per month of the P&L matrix; each call
+# used to download every xlsx and re-parse it with openpyxl (~5s apiece),
+# which pushed a cold /finance/reports past the 90s proxy cap → 502.
+#
+# Only the parse is cached: the SKU → project assignment below reads the SKU
+# catalog, which changes independently of the files.
+_ARMAZENAGEM_PARSE_CACHE: dict[int, tuple[str, list[tuple[str, dict]]]] = {}
+_ARMAZENAGEM_PARSE_LOCK = threading.Lock()
+
+
+def _armazenagem_fingerprint_db(user_id: int) -> str | None:
+    """Ids + timestamps of the user's armazenagem uploads, without the bytes."""
+    import os
+    import psycopg2
+    dsn = os.environ.get("DATABASE_URL") or os.environ.get("DATABASE_PUBLIC_URL")
+    if not dsn:
+        return None
+    try:
+        conn = psycopg2.connect(dsn)
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT id, EXTRACT(EPOCH FROM created_at)::bigint FROM uploads
+               WHERE user_id=%s AND source_key='armazenagem_full' AND file_bytes IS NOT NULL
+               ORDER BY id""",
+            (user_id,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+    except Exception:
+        return None
+    return ",".join(f"{i}:{ts}" for i, ts in rows) or "empty"
+
+
+def _armazenagem_parses_db(user_id: int) -> list[tuple[str, dict]]:
+    """[(filename, parsed)] for every armazenagem upload, newest first.
+
+    Callers must treat the parsed dicts as read-only — they are shared.
+    """
+    fp = _armazenagem_fingerprint_db(user_id)
+    # The lock makes the parallel pnl/balance threads wait for one parse
+    # instead of each running their own.
+    with _ARMAZENAGEM_PARSE_LOCK:
+        hit = _ARMAZENAGEM_PARSE_CACHE.get(user_id)
+        if fp is not None and hit is not None and hit[0] == fp:
+            return hit[1]
+        parses: list[tuple[str, dict]] = []
+        for filename, file_bytes in _load_files_from_db_sync(user_id, "armazenagem_full"):
+            parsed = _parse_armazenagem_bytes_daily(file_bytes)
+            if parsed:
+                parses.append((filename, parsed))
+        if fp is not None:
+            _ARMAZENAGEM_PARSE_CACHE[user_id] = (fp, parses)
+        return parses
+
+
 def load_armazenagem_report() -> "pd.DataFrame | None":
     """Загружает ВСЕ Custos_por_servico_armazenamento*.csv из БД (LS_STORAGE_MODE=db,
     per-user) или из `_data/armazenagem/` (FS fallback). Файлы объединяются по
@@ -4178,10 +4260,7 @@ def load_armazenagem_report() -> "pd.DataFrame | None":
         from .db_storage import _current_user_id
         uid = _current_user_id()
         if uid is not None:
-            for filename, file_bytes in _load_files_from_db_sync(uid, "armazenagem_full"):
-                parsed = _parse_armazenagem_bytes_daily(file_bytes)
-                if parsed:
-                    file_parses.append((filename, parsed))
+            file_parses = list(_armazenagem_parses_db(uid))
 
     if not file_parses:
         arm_dir = DATA_DIR / "armazenagem"

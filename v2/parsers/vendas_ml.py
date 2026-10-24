@@ -33,7 +33,7 @@ PT_MONTHS = {
 # First matching column left-to-right wins (important when «Unidades» repeats).
 COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
     "saleId": ("N.º de venda", "Nº de venda", "Número de venda", "Numero de venda"),
-    "date": ("Data da venda",),
+    "date": ("Data da venda", "Data de venda"),  # renamed by ML in 2026-10
     "units": ("Unidades",),
     "receita": ("Receita por produtos (BRL)",),
     "tarifaVenda": ("Tarifa de venda e impostos (BRL)",),
