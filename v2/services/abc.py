@@ -78,6 +78,61 @@ class _Acc:
     shipping_modes: dict[str, int] = field(default_factory=dict)
 
 
+def _reorder(current_stock: float, sales_per_day: float, days_of_stock: float) -> tuple[str, str | None]:
+    """(reorderStatus, orderByDate) for a stock level and sales pace."""
+    if current_stock <= 0:
+        reorder_status = "crit"
+        buffer = 0.0
+    else:
+        buffer = days_of_stock - (LEAD_TIME + LIBERACAO) if sales_per_day > 0 else 999.0
+        if buffer <= 0:
+            reorder_status = "crit"
+        elif buffer <= 7:
+            reorder_status = "warn"
+        else:
+            reorder_status = "ok"
+
+    order_by_date = None
+    if sales_per_day > 0 and buffer < 999:
+        order_by_date = (datetime.now() + timedelta(days=max(0, buffer))).strftime("%Y-%m-%d")
+    return reorder_status, order_by_date
+
+
+def apply_live_stock(products: list[dict[str, Any]], live_by_item: dict[str, int]) -> int:
+    """Overwrite `currentStock` with the listing's live ML quantity.
+
+    The aggregate takes stock from uploaded files (Stock Full xlsx, then
+    armazenagem), which are only as fresh as the last upload — on 2026-10-24
+    the newest Stock Full was from May, before ARTEM-TENIS launched, so every
+    sneaker showed 0 while ML had 34 and 47 on Full. `ml_user_items` is kept
+    current by the ML sync, so it wins wherever the listing is known.
+
+    Runs after the ABC cache on purpose: stock moves with every sale, and
+    keying the cache on it would make it miss on every request.
+    A listing whose variations carry several SKUs is skipped: its quantity is
+    the sum over all of them, and copying it onto each SKU would multiply it.
+    Returns how many products were updated.
+    """
+    live = {_normalize_mlb(k): v for k, v in live_by_item.items()}
+    skus_per_item: dict[str, int] = {}
+    for p in products:
+        key = _normalize_mlb(p.get("itemId"))
+        skus_per_item[key] = skus_per_item.get(key, 0) + 1
+
+    updated = 0
+    for p in products:
+        key = _normalize_mlb(p.get("itemId"))
+        qty = live.get(key) if key and skus_per_item[key] == 1 else None
+        if qty is None:
+            continue
+        updated += 1
+        spd = float(p.get("salesPerDay") or 0.0)
+        p["currentStock"] = qty
+        p["daysOfStock"] = (qty / spd) if spd > 0 else 0.0
+        p["reorderStatus"], p["orderByDate"] = _reorder(qty, spd, p["daysOfStock"])
+    return updated
+
+
 def _is_cancelled(status: str) -> bool:
     s = (status or "").lower()
     return "cancel" in s or "reembols" in s
@@ -385,21 +440,7 @@ def aggregate(
         denom = a.total_orders + a.cancelled_orders
         return_pct = (a.cancelled_orders / denom * 100) if denom > 0 else 0.0
 
-        if current_stock <= 0:
-            reorder_status = "crit"
-            buffer = 0.0
-        else:
-            buffer = days_of_stock - (LEAD_TIME + LIBERACAO) if sales_per_day > 0 else 999.0
-            if buffer <= 0:
-                reorder_status = "crit"
-            elif buffer <= 7:
-                reorder_status = "warn"
-            else:
-                reorder_status = "ok"
-
-        order_by_date = None
-        if sales_per_day > 0 and buffer < 999:
-            order_by_date = (datetime.now() + timedelta(days=max(0, buffer))).strftime("%Y-%m-%d")
+        reorder_status, order_by_date = _reorder(current_stock, sales_per_day, days_of_stock)
 
         full_cycle = LEAD_TIME + (BATCH_SIZE / sales_per_day if sales_per_day > 0 else 0) + LIBERACAO
         turns_per_year = (365 / full_cycle) if full_cycle > 0 else 0.0

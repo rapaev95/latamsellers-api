@@ -363,11 +363,13 @@ async def get_products(
     # firing N × 2 ML API calls on every page load. Includes paused /
     # closed / under_review items that backfill brings into the cache.
     items_meta_map: dict[str, dict[str, Any]] = {}
+    live_stock: dict[str, int] = {}
     if pool is not None:
         try:
             async with pool.acquire() as conn:
                 rows = await conn.fetch(
-                    "SELECT item_id, status, raw FROM ml_user_items WHERE user_id = $1",
+                    "SELECT item_id, status, available_quantity, raw "
+                    "FROM ml_user_items WHERE user_id = $1",
                     effective_id,
                 )
             import json as _json_mod
@@ -385,6 +387,12 @@ async def get_products(
                     "sub_status": raw.get("sub_status") or [],
                     "tags": raw.get("tags") or [],
                 }
+                if r["available_quantity"] is not None:
+                    # A closed listing keeps its last quantity, but nothing
+                    # behind it is for sale any more.
+                    live_stock[r["item_id"]] = (
+                        0 if r["status"] == "closed" else int(r["available_quantity"])
+                    )
             _step(f"after items meta load ({len(items_meta_map)} items)")
         except Exception as err:  # noqa: BLE001
             _log.warning("items meta load failed: %s", err)
@@ -417,6 +425,8 @@ async def get_products(
             return "amber"
         return "ok"
 
+    live_stock_coverage = abc.apply_live_stock(products_out, live_stock)
+
     moderation_coverage = 0
     for p in products_out:
         item_id = p.get("itemId")
@@ -437,6 +447,7 @@ async def get_products(
     meta["visitsFetchedAt"] = visits_latest_fetched_at
     meta["visitsCoverage"] = visits_coverage
     meta["moderationCoverage"] = moderation_coverage
+    meta["liveStockCoverage"] = live_stock_coverage
     # Diagnostic — surfaces whether the DB cache actually has rows and whether
     # keys align with product itemIds. Temporary until visits UI is verified.
     sample_db_keys = list(visits_map.keys())[:3] if visits_map else []
