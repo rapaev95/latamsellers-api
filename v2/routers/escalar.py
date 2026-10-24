@@ -16,6 +16,7 @@ from v2.schemas.escalar import EscalarProductsOut, SnoozeIn, SnoozeOut
 from v2.services import (
     abc,
     finance_cache,
+    ml_access,
     category_benchmarks as category_benchmarks_svc,
     ml_account_health as ml_account_health_svc,
     ml_backfill as ml_backfill_svc,
@@ -224,6 +225,30 @@ async def abc_summary_cached(
     return summary, abc_status
 
 
+def _empty_products_out(days_v: Union[int, str]) -> dict[str, Any]:
+    """Ответ для звонящего, которому в этом кабинете не принадлежит ничего.
+
+    Форма совпадает с обычным ответом: пустой список нельзя спутать с
+    ошибкой доступа, и UI не нужно учить второму формату.
+    """
+    return {
+        "products": [],
+        "hasData": False,
+        "meta": {
+            "files": [],
+            "totalRows": 0,
+            "uniqueSales": 0,
+            "totalRevenue": 0.0,
+            "totalUnits": 0,
+            "storageSkus": 0,
+            "storageFiles": 0,
+            "projects": [],
+            "days": days_v,
+            "snoozedSkus": [],
+        },
+    }
+
+
 @router.get("/products", response_model=EscalarProductsOut)
 async def get_products(
     response: Response,
@@ -241,11 +266,35 @@ async def get_products(
 
     days_v = _parse_days(days)
     _step("after parse_days")
+
+    # Доступ к карточкам кабинета. Данные и кэш лежат в пространстве
+    # владельца, поэтому партнёра приходится считать под `scope.owner_id` —
+    # и именно поэтому фильтр по `scope` обязателен в том же месте: без него
+    # перепривязка отдаёт партнёру весь кабинет.
+    scope = await ml_access.resolve_scope(pool, user, project=project or "")
+    if not scope.is_owner and not scope.projects:
+        _step("scope empty → no listings for this caller")
+        response.headers["X-Cache-Abc"] = "skip"
+        return _empty_products_out(days_v)
+    effective_id = scope.owner_id
+    # Партнёру с одним проектом считаем сразу по нему: та же задача, что у
+    # владельца, тот же ключ кэша. Фильтр ниже всё равно страхует.
+    abc_project = project or ""
+    if not abc_project and not scope.is_owner and len(scope.projects) == 1:
+        abc_project = next(iter(scope.projects))
+
     summary, abc_status = await abc_summary_cached(
-        pool, user.id, days_v, project or "", fresh=fresh, step=_step,
+        pool, effective_id, days_v, abc_project, fresh=fresh, step=_step,
     )
     response.headers["X-Cache-Abc"] = abc_status
     _step(f"after abc.aggregate cache={abc_status} (products={len(summary['products'])})")
+
+    if scope.item_ids is not None:
+        before = len(summary["products"])
+        summary["products"] = ml_access.filter_rows(
+            scope, summary["products"], key="itemId",
+        )
+        _step(f"after scope filter ({before} → {len(summary['products'])})")
 
     # Join cached listing quality (ml_item_quality) — fast dict lookup by itemId.
     quality_map: dict = {}
@@ -254,8 +303,8 @@ async def get_products(
         try:
             await ml_quality_svc.ensure_schema(pool)
             async with pool.acquire() as conn:
-                quality_map = await ml_quality_svc.get_cached_map(conn, user.id)
-                latest_fetched_at = await ml_quality_svc.get_latest_fetched_at(conn, user.id)
+                quality_map = await ml_quality_svc.get_cached_map(conn, effective_id)
+                latest_fetched_at = await ml_quality_svc.get_latest_fetched_at(conn, effective_id)
             _step(f"after quality map load ({len(quality_map)} items)")
         except Exception as err:  # noqa: BLE001
             _log.warning("quality map load failed: %s", err)
@@ -288,8 +337,8 @@ async def get_products(
         try:
             await ml_visits_svc.ensure_schema(pool)
             async with pool.acquire() as conn:
-                visits_map = await ml_visits_svc.get_cached_map(conn, user.id)
-                visits_latest_fetched_at = await ml_visits_svc.get_latest_fetched_at(conn, user.id)
+                visits_map = await ml_visits_svc.get_cached_map(conn, effective_id)
+                visits_latest_fetched_at = await ml_visits_svc.get_latest_fetched_at(conn, effective_id)
             _step(f"after visits map load ({len(visits_map)} items)")
         except Exception as err:  # noqa: BLE001
             _log.warning("visits map load failed: %s", err)
@@ -319,7 +368,7 @@ async def get_products(
             async with pool.acquire() as conn:
                 rows = await conn.fetch(
                     "SELECT item_id, status, raw FROM ml_user_items WHERE user_id = $1",
-                    user.id,
+                    effective_id,
                 )
             import json as _json_mod
             for r in rows:
@@ -422,6 +471,9 @@ async def items_stock_lookup(
     колонок нет — см. v2/services/ml_user_items.py CREATE_SQL)."""
     if pool is None:
         raise HTTPException(status_code=503, detail="db_unavailable")
+    scope = await ml_access.resolve_scope(pool, user)
+    if not scope.is_owner and not scope.projects:
+        return {"query": q, "count": 0, "items": []}
     pat = f"%{q}%"
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -439,8 +491,9 @@ async def items_stock_lookup(
              ORDER BY fetched_at DESC NULLS LAST
              LIMIT 50
             """,
-            user.id, pat,
+            scope.owner_id, pat,
         )
+    rows = [r for r in rows if scope.allows_read(r["item_id"])]
 
     out_items: list[dict[str, Any]] = []
     for r in rows:
@@ -483,6 +536,9 @@ async def items_paused_with_stock(
     Full без trafficа продаж — нужно либо активировать, либо разобраться."""
     if pool is None:
         raise HTTPException(status_code=503, detail="db_unavailable")
+    scope = await ml_access.resolve_scope(pool, user)
+    if not scope.is_owner and not scope.projects:
+        return {"count": 0, "items": []}
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -495,7 +551,7 @@ async def items_paused_with_stock(
                AND available_quantity > 0
              ORDER BY available_quantity DESC, sold_quantity DESC
             """,
-            user.id,
+            scope.owner_id,
         )
 
     out_items: list[dict[str, Any]] = []
@@ -543,6 +599,13 @@ async def items_activate(
     if pool is None:
         raise HTTPException(status_code=503, detail="db_unavailable")
 
+    # Запись проверяется тем же слоем, что и чтение: партнёр меняет только
+    # карточки своих проектов, а 404 вместо 403 не подтверждает, что такая
+    # карточка в кабинете вообще есть.
+    scope = await ml_access.resolve_scope(pool, user)
+    if not scope.allows_write(item_id):
+        raise HTTPException(status_code=404, detail={"error": "item_not_owned"})
+
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -550,7 +613,7 @@ async def items_activate(
               FROM ml_user_items
              WHERE user_id = $1 AND item_id = $2
             """,
-            user.id, item_id,
+            scope.owner_id, item_id,
         )
     if not row:
         raise HTTPException(status_code=404, detail={"error": "item_not_owned"})
@@ -563,7 +626,7 @@ async def items_activate(
         )
 
     try:
-        token, *_ = await ml_oauth_svc.get_valid_access_token(pool, user.id)
+        token, *_ = await ml_oauth_svc.get_valid_access_token(pool, scope.owner_id)
     except ml_oauth_svc.MLRefreshError as err:
         raise HTTPException(status_code=401,
                             detail={"error": "ml_oauth_required", "message": str(err)})
@@ -590,7 +653,7 @@ async def items_activate(
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE ml_user_items SET status = $1 WHERE user_id = $2 AND item_id = $3",
-            new_status, user.id, item_id,
+            new_status, scope.owner_id, item_id,
         )
 
     return {"ok": True, "item_id": item_id, "new_status": new_status, "stock": stock}
@@ -1012,8 +1075,20 @@ async def get_user_items(
 ):
     if pool is None:
         return {"error": "no_db", "items": [], "total": 0}
+    scope = await ml_access.resolve_scope(pool, user)
+    if not scope.is_owner and not scope.projects:
+        return {"items": [], "total": 0}
     await ml_user_items_svc.ensure_schema(pool)
-    return await ml_user_items_svc.get_cached(pool, user.id, status=status, limit=limit, offset=offset)
+    cached = await ml_user_items_svc.get_cached(
+        pool, scope.owner_id, status=status, limit=limit, offset=offset,
+    )
+    if scope.item_ids is None:
+        return cached
+    # Пагинация считалась по кабинету целиком, поэтому после фильтра total
+    # пересобираем из области доступа, а не из ответа кэша: иначе партнёр
+    # видит чужое число страниц.
+    items = ml_access.filter_rows(scope, cached.get("items") or [])
+    return {**cached, "items": items, "total": len(scope.item_ids)}
 
 
 @router.post("/user-items/refresh")
@@ -1024,6 +1099,11 @@ async def refresh_user_items(
 ):
     if pool is None:
         return {"error": "no_db"}
+    # Refresh тянет весь кабинет токеном владельца — партнёру такой вызов
+    # дать нельзя, он затрагивает и чужие карточки.
+    scope = await ml_access.resolve_scope(pool, user)
+    if not scope.is_owner:
+        raise HTTPException(status_code=403, detail={"error": "cabinet_owner_only"})
     await ml_user_items_svc.ensure_schema(pool)
     return await ml_user_items_svc.refresh_user_items(pool, user.id, status=status)
 

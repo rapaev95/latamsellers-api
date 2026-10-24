@@ -46,12 +46,38 @@ CREATE TABLE IF NOT EXISTS ml_user_items (
 );
 CREATE INDEX IF NOT EXISTS idx_ml_user_items_user ON ml_user_items(user_id);
 CREATE INDEX IF NOT EXISTS idx_ml_user_items_status ON ml_user_items(user_id, status);
+
+-- Кабинет, из которого пришла карточка. Один селлер может арендовать
+-- Бразилию, другой — Бразилию, Мексику и Чили сразу, поэтому `user_id`
+-- (владелец в нашей системе) кабинет не определяет. NULL = единственный
+-- исторический кабинет, подключённый через ml_user_tokens; бэкфилл ниже.
+ALTER TABLE ml_user_items ADD COLUMN IF NOT EXISTS ml_account_id BIGINT;
+ALTER TABLE ml_user_items ADD COLUMN IF NOT EXISTS site_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_ml_user_items_account
+  ON ml_user_items(user_id, ml_account_id);
+"""
+
+# Разметка исторических строк по единственному кабинету пользователя. Запрос
+# идемпотентен и затрагивает только строки без кабинета, поэтому его можно
+# держать в ensure_schema: после первого прохода он не обновляет ничего.
+BACKFILL_SQL = """
+UPDATE ml_user_items i
+   SET ml_account_id = t.ml_user_id,
+       site_id = COALESCE(i.site_id, 'MLB')
+  FROM ml_user_tokens t
+ WHERE t.user_id = i.user_id
+   AND i.ml_account_id IS NULL
 """
 
 
 async def ensure_schema(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
         await conn.execute(CREATE_SQL)
+        try:
+            await conn.execute(BACKFILL_SQL)
+        except Exception as err:  # noqa: BLE001
+            # Отсутствие ml_user_tokens не должно ломать схему карточек.
+            log.warning("ml_user_items backfill skipped: %s", err)
 
 
 # ── ML API ────────────────────────────────────────────────────────────────────
@@ -144,7 +170,7 @@ async def refresh_user_items(
             for item in details:
                 try:
                     async with pool.acquire() as conn:
-                        await _upsert(conn, user_id, item)
+                        await _upsert(conn, user_id, item, int(ml_user_id))
                     saved += 1
                 except Exception as err:  # noqa: BLE001
                     log.warning("upsert item %s failed: %s", item.get("id"), err)
@@ -162,15 +188,21 @@ async def refresh_user_items(
     return {"fetched": len(item_ids), "saved": saved, "failed": failed}
 
 
-async def _upsert(conn: asyncpg.Connection, user_id: int, item: dict) -> None:
+async def _upsert(
+    conn: asyncpg.Connection, user_id: int, item: dict, ml_account_id: int | None = None,
+) -> None:
     shipping = item.get("shipping") or {}
+    # site_id приходит внутри item_id: MLB..., MLM..., MLC... — отдельного
+    # поля в ответе /items нет.
+    item_id = str(item.get("id") or "")
+    site_id = item_id[:3] if item_id[:3].isalpha() else None
     await conn.execute(
         """
         INSERT INTO ml_user_items
           (user_id, item_id, title, price, currency_id, status, thumbnail, permalink,
            sold_quantity, available_quantity, listing_type_id, category_id, health,
-           shipping_json, raw, fetched_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15::jsonb, NOW())
+           shipping_json, raw, fetched_at, ml_account_id, site_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15::jsonb, NOW(), $16, $17)
         ON CONFLICT (user_id, item_id) DO UPDATE SET
           title = EXCLUDED.title,
           price = EXCLUDED.price,
@@ -185,10 +217,12 @@ async def _upsert(conn: asyncpg.Connection, user_id: int, item: dict) -> None:
           health = EXCLUDED.health,
           shipping_json = EXCLUDED.shipping_json,
           raw = EXCLUDED.raw,
-          fetched_at = NOW()
+          fetched_at = NOW(),
+          ml_account_id = COALESCE(EXCLUDED.ml_account_id, ml_user_items.ml_account_id),
+          site_id = COALESCE(EXCLUDED.site_id, ml_user_items.site_id)
         """,
         user_id,
-        str(item.get("id") or ""),
+        item_id,
         item.get("title"),
         float(item.get("price")) if item.get("price") is not None else None,
         item.get("currency_id"),
@@ -202,6 +236,8 @@ async def _upsert(conn: asyncpg.Connection, user_id: int, item: dict) -> None:
         float(item.get("health")) if item.get("health") is not None else None,
         json.dumps(shipping, default=str),
         json.dumps(item, default=str),
+        ml_account_id,
+        site_id,
     )
 
 

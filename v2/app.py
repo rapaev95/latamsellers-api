@@ -12,6 +12,7 @@ from v2.routers import auth as auth_router
 from v2.routers import escalar as escalar_router
 from v2.routers import finance as finance_router
 from v2.routers import health as health_router
+from v2.routers import mcp as mcp_router
 from v2.routers import migrations as migrations_router
 from v2.routers import ml_oauth as ml_oauth_router
 from v2.routers import positions as positions_router
@@ -31,3 +32,4 @@ router.include_router(ml_oauth_router.router)
 # nothing can trigger a scrape by accident.
 # router.include_router(positions_router.router)
 router.include_router(team_router.router)
+router.include_router(mcp_router.router)

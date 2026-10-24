@@ -529,6 +529,15 @@ def invalidate_mlb_to_sku_from_ml_items():
     _build_mlb_to_sku_from_ml_items_cached.cache_clear()
 
 
+def mlb_to_seller_sku() -> dict:
+    """item_id (MLB) → seller_sku для текущего пользователя.
+
+    Публичная точка входа в кэшированный индекс: на нём стоит граница доступа
+    в v2.services.ml_access, и она не должна зависеть от приватного имени.
+    """
+    return _build_mlb_to_sku_from_ml_items()
+
+
 def get_project_by_sku(sku: str, mlb: str = "") -> str:
     """Determine project from SKU or MLB code.
     Priority:
