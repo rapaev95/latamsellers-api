@@ -100,6 +100,26 @@ async def maybe_current_user(
         return None
 
 
+INTERNAL_TOKEN_HEADER = "x-internal-token"
+
+
+async def require_internal(request: Request) -> None:
+    """Gate for server-to-server endpoints that act on a `user_id` from the body.
+
+    These are called by the Next.js Telegram and ML webhooks, which carry no
+    user cookie. Without this check anyone could reach them through the
+    public `/api/v2-proxy/*` and act with another seller's ML token. Fails
+    closed: an unset `LS_INTERNAL_API_TOKEN` rejects every call.
+    """
+    import hmac
+    import os
+
+    expected = os.environ.get("LS_INTERNAL_API_TOKEN") or ""
+    given = request.headers.get(INTERNAL_TOKEN_HEADER) or ""
+    if not expected or not hmac.compare_digest(given, expected):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="internal_only")
+
+
 def _is_admin(user: CurrentUser) -> bool:
     return user.role in ("admin", "superadmin")
 

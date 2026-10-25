@@ -37,6 +37,11 @@ MEMBERSHIPS = {
     7: [{"project_name": "ARTHUR", "owner_id": 6, "role": "admin", "synced": True}],
     8: [{"project_name": "ARTEM-TENIS", "owner_id": 6, "role": "viewer", "synced": True}],
     9: [],  # a logged-in user with no membership anywhere
+    # editor in one project, viewer in another: write rights are per project
+    10: [
+        {"project_name": "ARTHUR", "owner_id": 6, "role": "editor", "synced": True},
+        {"project_name": "ARTEM-TENIS", "owner_id": 6, "role": "viewer", "synced": True},
+    ],
 }
 
 ml_access._attribute_items = lambda owner_id: dict(ATTRIBUTION)
@@ -94,6 +99,12 @@ check("B projects", set(b.projects), {"ARTEM-TENIS"})
 check("B reads only own", readable(b), {"MLB3"})
 check("B cannot read A", b.allows_read("MLB1"), False)
 check("B viewer cannot write own", b.allows_write("MLB3"), False)
+
+# --- mixed roles: editor in ARTHUR, viewer in ARTEM-TENIS -----------------
+m = scope(10)
+check("mixed reads both", readable(m), {"MLB1", "MLB2", "MLB3"})
+check("mixed writes editor project", m.allows_write("MLB1"), True)
+check("mixed cannot write viewer project", m.allows_write("MLB3"), False)
 
 # --- the two partners never overlap ---------------------------------------
 check("A and B disjoint", readable(a) & readable(b), set())

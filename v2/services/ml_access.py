@@ -48,6 +48,10 @@ class MlScope:
     projects: frozenset[str]
     item_ids: frozenset[str] | None
     may_write: bool
+    # Карточки, которые можно менять, когда права различаются по проектам:
+    # партнёр может быть editor в одном проекте и viewer в другом. None —
+    # право записи одно на всю область, и решает `may_write`.
+    write_item_ids: frozenset[str] | None = None
 
     def allows_read(self, item_id: str) -> bool:
         if self.item_ids is None:
@@ -55,7 +59,11 @@ class MlScope:
         return (item_id or "").strip() in self.item_ids
 
     def allows_write(self, item_id: str) -> bool:
-        return self.may_write and self.allows_read(item_id)
+        if not self.may_write or not self.allows_read(item_id):
+            return False
+        if self.write_item_ids is None:
+            return True
+        return (item_id or "").strip() in self.write_item_ids
 
 
 # --- загрузчики, вынесенные ради тестируемости ------------------------------
@@ -209,13 +217,15 @@ async def resolve_scope(pool, user, *, project: str = "") -> MlScope:
     mine = {
         name: role for name, (o, role) in member_roles.items() if o == owner_id
     }
+    writable = [name for name, role in mine.items() if role in _WRITE_ROLES]
     return MlScope(
         caller_id=caller_id,
         owner_id=owner_id,
         is_owner=False,
         projects=frozenset(mine),
         item_ids=_items_for_projects(owner_id, mine),
-        may_write=any(r in _WRITE_ROLES for r in mine.values()),
+        may_write=bool(writable),
+        write_item_ids=_items_for_projects(owner_id, writable),
     )
 
 

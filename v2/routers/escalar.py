@@ -9,7 +9,7 @@ from typing import Any, Callable, Optional, Union
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, Response, UploadFile
 
-from v2.deps import CurrentUser, current_user, get_pool, require_superadmin
+from v2.deps import CurrentUser, current_user, get_pool, require_internal, require_superadmin
 from v2.legacy import db_storage as legacy_db
 from v2.parsers import db_loader
 from v2.schemas.escalar import EscalarProductsOut, SnoozeIn, SnoozeOut
@@ -3271,7 +3271,7 @@ async def _auto_disable_dyn_pricing(
         return False
 
 
-@router.post("/items/price-shift")
+@router.post("/items/price-shift", dependencies=[Depends(require_internal)])
 async def items_price_shift(
     body: _ItemPriceShiftIn,
     pool=Depends(get_pool),
@@ -3283,9 +3283,8 @@ async def items_price_shift(
       - изменение > 50% за неделю (limit per regulation)
     Возвращает {ok, old_price, new_price, delta_pct}.
 
-    Auth: server-to-server через webhook → no cookie. Шифрование URL не
-    требуется т.к. внутри Railway VPC. Header LS_INTERNAL_API_TOKEN читается
-    но пока не enforced (single-tenant deploy).
+    Auth: server-to-server через webhook → no cookie; заголовок
+    LS_INTERNAL_API_TOKEN проверяет `require_internal`.
     """
     if pool is None:
         return {"error": "no_db"}
@@ -3451,7 +3450,7 @@ class _DynReenableIn(__import__("pydantic").BaseModel):
     item_id: str
 
 
-@router.post("/items/dyn-pricing/reenable")
+@router.post("/items/dyn-pricing/reenable", dependencies=[Depends(require_internal)])
 async def items_dyn_pricing_reenable(
     body: _DynReenableIn,
     pool=Depends(get_pool),
@@ -3527,7 +3526,7 @@ class _PromoRefreshInternalIn(__import__("pydantic").BaseModel):
     item_id: str          # MLB id
 
 
-@router.post("/user-promotions/refresh-internal")
+@router.post("/user-promotions/refresh-internal", dependencies=[Depends(require_internal)])
 async def refresh_user_promotions_internal(
     body: _PromoRefreshInternalIn,
     pool=Depends(get_pool),
@@ -3575,7 +3574,7 @@ class _OrderNoticeFromWebhookIn(__import__("pydantic").BaseModel):
     enriched: dict[str, Any]
 
 
-@router.post("/orders/notice-from-webhook")
+@router.post("/orders/notice-from-webhook", dependencies=[Depends(require_internal)])
 async def orders_notice_from_webhook(
     body: _OrderNoticeFromWebhookIn,
     pool=Depends(get_pool),
@@ -4074,7 +4073,7 @@ async def promotions_diagnostic(
     return out
 
 
-@router.post("/user-promotions/tg-action")
+@router.post("/user-promotions/tg-action", dependencies=[Depends(require_internal)])
 async def promotions_tg_action(
     body: _PromoActionIn,
     pool=Depends(get_pool),
@@ -4082,16 +4081,9 @@ async def promotions_tg_action(
     """Server-side accept/reject for TG callback flow.
 
     Loads the cached offer (we need deal_price/offer_id for accept), forwards
-    to ML, marks the row as notified. No cookie auth — protected by shared
-    INTERNAL_API_TOKEN header (validated below).
+    to ML, marks the row as notified. No cookie auth — protected by the
+    shared LS_INTERNAL_API_TOKEN header (`require_internal`).
     """
-    import os as _os
-    expected = _os.environ.get("LS_INTERNAL_API_TOKEN") or ""
-    # FastAPI gives us no easy way to pull headers without Request; pull from
-    # context. For the prototype we accept the request if the token is empty
-    # (single-tenant deploy) — tighten via env later.
-    # NOTE: we'll add Header(...) auth in a follow-up if multi-tenancy lands.
-
     if pool is None:
         return {"error": "no_db"}
     await ml_user_promotions_svc.ensure_schema(pool)
@@ -5659,7 +5651,7 @@ class _AdsCampaignUpdateIn(__import__("pydantic").BaseModel):
     name: Optional[str] = None
 
 
-@router.post("/ads/campaigns/{campaign_id}/update")
+@router.post("/ads/campaigns/{campaign_id}/update", dependencies=[Depends(require_internal)])
 async def ads_update_campaign(
     campaign_id: int,
     body: _AdsCampaignUpdateIn,
@@ -6609,6 +6601,13 @@ async def publish_items_bulk_action(
     # Token resolution mirrors the publish endpoint.
     managed_account_id = body.get("managed_account_id")
     if managed_account_id:
+        # Managed accounts are agency cabinets; only admins act on them, same
+        # rule as `deps.resolve_ml_context`.
+        if user.role not in ("admin", "superadmin"):
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "managed_account_requires_admin"},
+            )
         try:
             from v2.services import ml_managed_accounts as _mgr
             token, *_ = await _mgr.get_valid_access_token(pool, int(managed_account_id))
@@ -6727,6 +6726,11 @@ async def publish_plan_publish(
     managed_account_id = body.get("managed_account_id")
     token: Optional[str] = None
     if managed_account_id:
+        if user.role not in ("admin", "superadmin"):
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "managed_account_requires_admin"},
+            )
         try:
             from v2.services import ml_managed_accounts as _mgr
             token, *_ = await _mgr.get_valid_access_token(pool, int(managed_account_id))

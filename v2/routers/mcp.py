@@ -355,7 +355,7 @@ async def _call_tool(
         scope = await ml_access.resolve_scope(pool, user)
         if not scope.allows_read(item_id):
             return {"error": "not_found", "item_id": item_id}
-        if not scope.may_write:
+        if not scope.allows_write(item_id):
             return {
                 "error": "read_only",
                 "detail": "у вашей роли в этом проекте нет права изменять карточки",

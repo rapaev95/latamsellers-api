@@ -50,6 +50,26 @@ for node in ast.walk(tree):
             f"{', '.join(foreign)}, но не вызывает {SCOPE_CALL}"
         )
 
+# Эндпоинт, который берёт пользователя из тела запроса, а не из cookie,
+# действует от чужого имени по определению. Такие зовут только наши вебхуки,
+# и FastAPI должен требовать от них общий секрет — иначе любой достаёт до них
+# через публичный /api/v2-proxy/* с любым user_id.
+for node in ast.walk(tree):
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        continue
+    decorators = [ast.get_source_segment(src, d) or "" for d in node.decorator_list]
+    if not any(d.startswith("router.") for d in decorators):
+        continue
+    body = ast.get_source_segment(src, node) or ""
+    if "body.user_id" not in body:
+        continue
+    checked += 1
+    if not any("require_internal" in d for d in decorators):
+        offenders.append(
+            f"{node.name} (строка {node.lineno}): действует от body.user_id, "
+            "но не требует require_internal"
+        )
+
 print(f"функций, работающих с карточками кабинета: {checked}")
 if offenders:
     print("\nНАРУШЕНИЯ ИНВАРИАНТА:")
