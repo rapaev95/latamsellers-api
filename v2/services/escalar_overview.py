@@ -491,6 +491,7 @@ def vendas_funnel_sync(owner_id: int, projects: Optional[set[str]], start: date,
 
     out = {k: {"count": 0, "units": 0, "revenue": 0.0}
            for k in ("ordered", "cancelled", "returned", "inTransit", "delivered")}
+    states: dict[str, int] = {}
     for _, row in df.iterrows():
         if projects is not None and row.get("__project") not in projects:
             continue
@@ -518,6 +519,11 @@ def vendas_funnel_sync(owner_id: int, projects: Optional[set[str]], start: date,
             out[k]["count"] += 1
             out[k]["units"] += units
             out[k]["revenue"] += rev
+        if key == "inTransit":
+            st = str(row.get("Estado") or "").strip()[:80]
+            states[st] = states.get(st, 0) + 1
     for v in out.values():
         v["revenue"] = round(v["revenue"], 2)
+    # Статусы ML у незавершённых — чтобы было видно, что именно «в пути».
+    out["inTransit"]["states"] = sorted(states.items(), key=lambda kv: -kv[1])[:5]
     return out
