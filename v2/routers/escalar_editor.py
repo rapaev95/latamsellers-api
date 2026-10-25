@@ -720,3 +720,65 @@ async def update_campaign(
         )
     fresh = await ads_storage.get_campaign(pool, owner, campaign_id)
     return {"ok": True, "campaign": _campaign_out(fresh or row), "ml": resp}
+
+
+# ── Atendimento: questions and claims ────────────────────────────────────────
+
+@router.get("/atendimento")
+async def get_atendimento(
+    days: int = Query(30, ge=1, le=90),
+    project: Optional[str] = Query(None),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Questions grouped by listing, claims/returns/mediations and the
+    summary counters of the Atendimento screen, scoped to the project."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    from v2.services import escalar_atendimento as atendimento_svc
+
+    scope = await ml_access.resolve_scope(pool, user, project=project or "")
+    if not scope.is_owner and not scope.projects:
+        raise HTTPException(status_code=404, detail="project_not_found")
+    return await atendimento_svc.load_atendimento(pool, scope, days=days)
+
+
+class _AnswerIn(BaseModel):
+    text: str
+
+
+@router.post("/questions/{question_id}/answer")
+async def answer_question(
+    question_id: int,
+    body: _AnswerIn,
+    project: Optional[str] = Query(None),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Answer a buyer's question on a listing the caller may write."""
+    from v2.services import ml_user_questions as questions_svc
+
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="empty_answer")
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    scope = await ml_access.resolve_scope(pool, user, project=project or "")
+    async with pool.acquire() as conn:
+        item_id = await conn.fetchval(
+            "SELECT item_id FROM ml_user_questions WHERE user_id = $1 AND question_id = $2",
+            scope.owner_id, question_id,
+        )
+    mlb = quality_svc.normalize_item_id(item_id or "")
+    if not mlb or not scope.allows_read(mlb):
+        raise HTTPException(status_code=404, detail="question_not_found")
+    if not scope.allows_write(mlb):
+        raise HTTPException(status_code=403, detail="read_only")
+    token = await _token(pool, scope)
+    async with httpx.AsyncClient() as http:
+        st, resp = await _ml(http, "POST", "/answers", token,
+                             json={"question_id": question_id, "text": text})
+    if st not in (200, 201):
+        raise HTTPException(status_code=422, detail=_ml_error(st, resp))
+    await questions_svc.upsert_one_answered(pool, scope.owner_id, question_id, text)
+    return {"ok": True}
