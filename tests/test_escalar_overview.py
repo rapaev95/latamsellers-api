@@ -124,6 +124,7 @@ def test_vendas_funnel_adds_up_and_splits_cancellations(monkeypatch):
         ("8 de janeiro de 2026 10:00 hs.", "A caminho", "in_progress", "ARTHUR", 30, 2),
         ("9 de janeiro de 2026 10:00 hs.", "Entregue", "delivered", "GANZA", 999, 1),
         ("9 de fevereiro de 2026 10:00 hs.", "Entregue", "delivered", "ARTHUR", 70, 1),
+        ("10 de janeiro de 2026 10:00 hs.", "Pacote de 2 produtos", "in_progress", "ARTHUR", 0, 0),
     ]
     df = pd.DataFrame(
         [{"Data da venda": d, "Estado": e, "__bucket": b, "__project": p,

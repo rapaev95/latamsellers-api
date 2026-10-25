@@ -499,6 +499,11 @@ def vendas_funnel_sync(owner_id: int, projects: Optional[set[str]], start: date,
             continue
         rev = num(row.get("Receita por produtos (BRL)"))
         units = int(num(row.get("Unidades")))
+        # Заказ из нескольких товаров ML выгружает строкой-заголовком пакета
+        # без суммы и без штук, а товары — строками под ним. Заголовок — не
+        # заказ: иначе он висит «в пути» с R$ 0 и сбивает счёт.
+        if rev == 0 and units == 0:
+            continue
         bucket = row.get("__bucket")
         estado = str(row.get("Estado") or "").lower()
         if bucket == "delivered":
