@@ -280,6 +280,8 @@ def build_overview(
 # ── loading ──────────────────────────────────────────────────────────────────
 
 _refreshing: set[int] = set()
+# The loop keeps only weak references to tasks; hold them until they finish.
+_tasks: set[asyncio.Task] = set()
 
 
 async def _refresh_orders_bg(pool, owner_id: int, days_back: int) -> None:
@@ -339,7 +341,9 @@ async def load_overview(pool, scope, *, days: int) -> dict[str, Any]:
     )
     if stale and owner not in _refreshing:
         _refreshing.add(owner)
-        asyncio.create_task(_refresh_orders_bg(pool, owner, min(60, 2 * days)))
+        task = asyncio.create_task(_refresh_orders_bg(pool, owner, min(60, 2 * days)))
+        _tasks.add(task)
+        task.add_done_callback(_tasks.discard)
 
     out = build_overview(
         orders=[dict(r) for r in orders],

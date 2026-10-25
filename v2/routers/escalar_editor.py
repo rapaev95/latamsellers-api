@@ -642,6 +642,8 @@ async def update_campaign(
         raise HTTPException(status_code=404, detail="campaign_not_found")
     if not scope.may_write or not all(scope.allows_write(i) for i in items):
         raise HTTPException(status_code=403, detail="read_only")
+    if (row.get("product_id") or "PADS") != "PADS":
+        raise HTTPException(status_code=400, detail="only_product_ads_campaigns")
 
     payload: dict[str, Any] = {}
     if body.budget is not None:
