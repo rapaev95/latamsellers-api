@@ -373,6 +373,9 @@ async def load_overview(
         last_order_fetch = await conn.fetchval(
             "SELECT max(fetched_at) FROM ml_user_orders WHERE user_id = $1", owner,
         )
+        orders_from = await conn.fetchval(
+            "SELECT min(date_created) FROM ml_user_orders WHERE user_id = $1", owner,
+        )
         claims = await conn.fetch(
             """
             SELECT claim_id, resource_id, type, date_created, enriched
@@ -412,6 +415,18 @@ async def load_overview(
         days=days,
         visits_today=real_today,
     )
+    # Живой кэш заказов держит ~60 дней. Если период начинается раньше —
+    # заказы за него есть только в отчёте Vendas: считаем цепочку по нему.
+    period_start = date.fromisoformat(out["period"]["from"])
+    covered_from = _brt_day(orders_from) if orders_from else None
+    out["funnel"] = None
+    if covered_from is None or period_start < covered_from:
+        projects = None if scope.item_ids is None else {p for p in scope.projects}
+        out["funnel"] = await asyncio.to_thread(
+            vendas_funnel_sync, owner, projects, period_start, today,
+        )
+        if out["funnel"] is not None:
+            out["funnel"]["source"] = "vendas"
     health = await health_svc.get_cached(pool, owner)
     out["reputation"] = (health or {}).get("reputation")
     out["projects"] = sorted(scope.projects)
@@ -423,5 +438,81 @@ async def load_overview(
             default=None,
         ),
         "reputationFetchedAt": (health or {}).get("fetchedAt"),
+        "ordersCoveredFrom": covered_from.isoformat() if covered_from else None,
     }
+    return out
+
+
+# ── funnel from the Vendas report (periods older than the live cache) ──────
+
+_PT_MONTHS = {
+    "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3, "abril": 4,
+    "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
+    "outubro": 10, "novembro": 11, "dezembro": 12,
+}
+
+
+def _vendas_date(s: Any) -> Optional[date]:
+    import re
+
+    g = re.search(r"(\d+)\s+de\s+(\w+)\s+de\s+(\d{4})", str(s))
+    if not g or g.group(2).lower() not in _PT_MONTHS:
+        return None
+    try:
+        return date(int(g.group(3)), _PT_MONTHS[g.group(2).lower()], int(g.group(1)))
+    except ValueError:
+        return None
+
+
+def vendas_funnel_sync(owner_id: int, projects: Optional[set[str]], start: date, end: date) -> Optional[dict]:
+    """Ordered − cancelled − returned − in transit = delivered, from the same
+    Vendas rows the P&L reads, so «Продано» here equals P&L revenue_delivered.
+
+    The live orders cache keeps about 60 days; for older periods this is the
+    only source of orders. `projects` None = the whole cabinet.
+    """
+    import pandas as pd
+
+    from v2.legacy import db_storage as legacy_db
+    from v2.legacy.reports import load_vendas_ml_report
+
+    before = legacy_db._current_user_id()
+    try:
+        legacy_db.set_current_user_id(owner_id)
+        df = load_vendas_ml_report()
+    finally:
+        legacy_db.set_current_user_id(before)
+    if df is None or df.empty:
+        return None
+
+    def num(v: Any) -> float:
+        x = pd.to_numeric(v, errors="coerce")
+        return 0.0 if pd.isna(x) else float(x)
+
+    out = {k: {"count": 0, "units": 0, "revenue": 0.0}
+           for k in ("ordered", "cancelled", "returned", "inTransit", "delivered")}
+    for _, row in df.iterrows():
+        if projects is not None and row.get("__project") not in projects:
+            continue
+        d = _vendas_date(row.get("Data da venda"))
+        if d is None or d < start or d > end:
+            continue
+        rev = num(row.get("Receita por produtos (BRL)"))
+        units = int(num(row.get("Unidades")))
+        bucket = row.get("__bucket")
+        estado = str(row.get("Estado") or "").lower()
+        if bucket == "delivered":
+            key = "delivered"
+        elif bucket == "returned":
+            key = "returned"
+        elif "cancel" in estado:
+            key = "cancelled"
+        else:
+            key = "inTransit"
+        for k in ("ordered", key):
+            out[k]["count"] += 1
+            out[k]["units"] += units
+            out[k]["revenue"] += rev
+    for v in out.values():
+        v["revenue"] = round(v["revenue"], 2)
     return out

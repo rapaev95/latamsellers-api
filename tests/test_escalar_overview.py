@@ -109,3 +109,32 @@ def test_past_period_keeps_visits_inside_mls_30_days():
     assert o["period"] == {"from": "2026-10-15", "to": "2026-10-21", "days": 7}
     assert o["kpis"]["visits"] == 20        # only 2026-10-19 falls inside
     assert o["kpis"]["ordersGross"] == 3    # orders 2 and 3 (cancelled), 5
+
+
+def test_vendas_funnel_adds_up_and_splits_cancellations(monkeypatch):
+    import pandas as pd
+    from v2.services import escalar_overview as ov
+    from v2.legacy import reports
+
+    rows = [
+        # (date, estado, bucket, project, revenue, units)
+        ("5 de janeiro de 2026 10:00 hs.", "Entregue", "delivered", "ARTHUR", 100, 1),
+        ("6 de janeiro de 2026 10:00 hs.", "Venda cancelada", "in_progress", "ARTHUR", 50, 1),
+        ("7 de janeiro de 2026 10:00 hs.", "Devolução finalizada", "returned", "ARTHUR", 80, 1),
+        ("8 de janeiro de 2026 10:00 hs.", "A caminho", "in_progress", "ARTHUR", 30, 2),
+        ("9 de janeiro de 2026 10:00 hs.", "Entregue", "delivered", "GANZA", 999, 1),
+        ("9 de fevereiro de 2026 10:00 hs.", "Entregue", "delivered", "ARTHUR", 70, 1),
+    ]
+    df = pd.DataFrame(
+        [{"Data da venda": d, "Estado": e, "__bucket": b, "__project": p,
+          "Receita por produtos (BRL)": r, "Unidades": u} for d, e, b, p, r, u in rows]
+    )
+    monkeypatch.setattr(reports, "load_vendas_ml_report", lambda: df)
+    f = ov.vendas_funnel_sync(6, {"ARTHUR"}, date(2026, 1, 1), date(2026, 1, 31))
+    assert f["ordered"] == {"count": 4, "units": 5, "revenue": 260.0}
+    assert f["cancelled"]["revenue"] == 50.0
+    assert f["returned"]["revenue"] == 80.0
+    assert f["inTransit"] == {"count": 1, "units": 2, "revenue": 30.0}
+    assert f["delivered"]["revenue"] == 100.0
+    o = f["ordered"]["revenue"] - f["cancelled"]["revenue"] - f["returned"]["revenue"] - f["inTransit"]["revenue"]
+    assert o == f["delivered"]["revenue"]
