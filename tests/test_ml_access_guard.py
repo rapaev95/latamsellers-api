@@ -18,9 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ast
 import pathlib
 
-ROUTER = pathlib.Path(__file__).resolve().parent.parent / "v2" / "routers" / "escalar.py"
+ROUTERS = pathlib.Path(__file__).resolve().parent.parent / "v2" / "routers"
+ROUTER = ROUTERS / "escalar.py"
 src = ROUTER.read_text()
 tree = ast.parse(src)
+EDITOR = ROUTERS / "escalar_editor.py"
 
 # Обращения, через которые утекают карточки кабинета.
 SENSITIVE = ("ml_user_items", "get_valid_access_token")
@@ -69,6 +71,25 @@ for node in ast.walk(tree):
             f"{node.name} (строка {node.lineno}): действует от body.user_id, "
             "но не требует require_internal"
         )
+
+# Редактор карточек — та же граница, отдельный файл. Помощник, который
+# получает уже разрешённую `ml_access.MlScope`, проверку не повторяет.
+editor_src = EDITOR.read_text()
+for node in ast.walk(ast.parse(editor_src)):
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        continue
+    body = ast.get_source_segment(editor_src, node) or ""
+    if not any(marker in body for marker in SENSITIVE):
+        continue
+    checked += 1
+    if SCOPE_CALL in body or "_scope_for_item(" in body:
+        continue
+    if "ml_access.MlScope" in ast.unparse(node.args):
+        continue
+    offenders.append(
+        f"escalar_editor.{node.name} (строка {node.lineno}): токен или карточки "
+        f"без {SCOPE_CALL}"
+    )
 
 print(f"функций, работающих с карточками кабинета: {checked}")
 if offenders:
