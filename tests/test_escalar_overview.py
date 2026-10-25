@@ -125,6 +125,7 @@ def test_vendas_funnel_adds_up_and_splits_cancellations(monkeypatch):
         ("9 de janeiro de 2026 10:00 hs.", "Entregue", "delivered", "GANZA", 999, 1),
         ("9 de fevereiro de 2026 10:00 hs.", "Entregue", "delivered", "ARTHUR", 70, 1),
         ("10 de janeiro de 2026 10:00 hs.", "Pacote de 2 produtos", "in_progress", "ARTHUR", 0, 0),
+        ("11 de janeiro de 2026 10:00 hs.", "Troca não entregue", "in_progress", "ARTHUR", 0, 1),
     ]
     df = pd.DataFrame(
         [{"Data da venda": d, "Estado": e, "__bucket": b, "__project": p,
@@ -135,7 +136,8 @@ def test_vendas_funnel_adds_up_and_splits_cancellations(monkeypatch):
     assert f["ordered"] == {"count": 4, "units": 5, "revenue": 260.0}
     assert f["cancelled"]["revenue"] == 50.0
     assert f["returned"]["revenue"] == 80.0
-    assert f["inTransit"] == {"count": 1, "units": 2, "revenue": 30.0}
+    assert {k: f["inTransit"][k] for k in ("count", "units", "revenue")} == {"count": 1, "units": 2, "revenue": 30.0}
+    assert f["inTransit"]["states"] == [("A caminho", 1)]
     assert f["delivered"]["revenue"] == 100.0
     o = f["ordered"]["revenue"] - f["cancelled"]["revenue"] - f["returned"]["revenue"] - f["inTransit"]["revenue"]
     assert o == f["delivered"]["revenue"]
