@@ -117,9 +117,10 @@ def _flatten_me(me: dict | None) -> dict[str, Any]:
     rep = me.get("seller_reputation") or {}
     tx = rep.get("transactions") or {}
     ratings = tx.get("ratings") or {}
-    total = tx.get("total") or 0
-    positive = ratings.get("positive") or 0
-    positive_rate = int(round((positive / total) * 100)) if total > 0 else None
+    # ML gives ratings as shares (positive 0.89, neutral 0.05, negative 0.06),
+    # not counts — dividing by the transaction total always rounded to 0.
+    positive = ratings.get("positive")
+    positive_rate = int(round(float(positive) * 100)) if positive is not None else None
     return {
         "nickname": me.get("nickname"),
         "site_id": me.get("site_id"),
