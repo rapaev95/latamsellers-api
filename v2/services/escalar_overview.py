@@ -125,75 +125,111 @@ def build_overview(
     def ok(item_id: str) -> bool:
         return allowed is None or item_id in allowed
 
-    zero = lambda: {"revenue": 0.0, "orders": 0, "units": 0, "cancelled": 0, "returns": 0}  # noqa: E731
-    tot = {"cur": zero(), "prev": zero()}
-    daily: dict[date, dict[str, float]] = {
-        d: {"revenue": 0.0, "orders": 0, "units": 0} for d in cur.days()
-    }
-    per_item: dict[str, dict[str, Any]] = {}
-    order_items: dict[str, set[str]] = {}
-
+    # Сначала заказы проекта (только его строки), потом возвраты по ним.
+    # Возврат относится к периоду своего заказа, а не к дате обращения —
+    # иначе «заказы − отмены − возвраты = продано» не сходится в одном окне.
+    scoped: list[dict[str, Any]] = []
     for o in orders:
         day = _brt_day(o.get("date_created"))
         if day is None:
             continue
         bucket = "cur" if cur.has(day) else "prev" if prev.has(day) else None
-        lines = [
-            (_norm(it.get("mlb")), it) for it in _as_list(o.get("items"))
-        ]
-        lines = [(iid, it) for iid, it in lines if iid and ok(iid)]
-        if not lines:
-            continue
-        order_items[str(o.get("order_id"))] = {iid for iid, _ in lines}
         if bucket is None:
             continue
-        t = tot[bucket]
-        if (o.get("status") or "") == "cancelled":
+        lines = []
+        for it in _as_list(o.get("items")):
+            iid = _norm(it.get("mlb"))
+            if not iid or not ok(iid):
+                continue
+            qty = int(float(it.get("quantity") or 0))
+            lines.append({
+                "iid": iid, "qty": qty, "rev": float(it.get("unit_price") or 0) * qty,
+                "title": it.get("title"), "sku": it.get("seller_sku"),
+            })
+        if lines:
+            scoped.append({
+                "id": str(o.get("order_id")), "day": day, "bucket": bucket,
+                "cancelled": (o.get("status") or "") == "cancelled", "lines": lines,
+            })
+
+    # order_id → returned units per listing (None = whole order, ML gave no detail)
+    returned: dict[str, Optional[dict[str, int]]] = {}
+    for c in claims:
+        if (c.get("type") or "") != "returns":
+            continue
+        enriched = _as_dict(c.get("enriched"))
+        detail: dict[str, int] = {}
+        order_ids: set[str] = set()
+        for r in _as_list(enriched.get("returns")):
+            for ro in _as_list(_as_dict(r).get("orders")):
+                iid = _norm(ro.get("item_id"))
+                if ro.get("order_id"):
+                    order_ids.add(str(ro.get("order_id")))
+                if iid:
+                    q = ro.get("return_quantity") or ro.get("total_quantity")
+                    detail[iid] = detail.get(iid, 0) + int(float(q or 1))
+        if c.get("resource_id"):
+            order_ids.add(str(c.get("resource_id")))
+        for oid in order_ids:
+            returned[oid] = detail or None
+
+    zero = lambda: {  # noqa: E731
+        "ordersGross": 0, "unitsGross": 0, "revenueGross": 0.0,
+        "cancelled": 0, "returns": 0, "returnedUnits": 0, "returnedRevenue": 0.0,
+        "orders": 0, "units": 0, "revenue": 0.0,
+    }
+    tot = {"cur": zero(), "prev": zero()}
+    daily: dict[date, dict[str, float]] = {
+        d: {"revenue": 0.0, "orders": 0, "units": 0} for d in cur.days()
+    }
+    per_item: dict[str, dict[str, Any]] = {}
+
+    for o in scoped:
+        t = tot[o["bucket"]]
+        t["ordersGross"] += 1
+        for ln in o["lines"]:
+            t["unitsGross"] += ln["qty"]
+            t["revenueGross"] += ln["rev"]
+        if o["cancelled"]:
             t["cancelled"] += 1
             continue
-        t["orders"] += 1
-        for iid, it in lines:
-            qty = int(float(it.get("quantity") or 0))
-            rev = float(it.get("unit_price") or 0) * qty
+        ret = returned.get(o["id"], False)
+        if ret is not False:
+            t["returns"] += 1
+        sold_any = False
+        for ln in o["lines"]:
+            qty, rev = ln["qty"], ln["rev"]
+            if ret is not False:
+                back = qty if ret is None else min(qty, ret.get(ln["iid"], 0))
+                share = back / qty if qty else 0
+                t["returnedUnits"] += back
+                t["returnedRevenue"] += rev * share
+                qty, rev = qty - back, rev * (1 - share)
+                if o["bucket"] == "cur" and back:
+                    pi = per_item.setdefault(ln["iid"], {
+                        "itemId": ln["iid"], "title": ln["title"], "sku": ln["sku"],
+                        "revenue": 0.0, "units": 0, "orders": 0,
+                    })
+                    pi["returns"] = pi.get("returns", 0) + 1
+            if qty <= 0:
+                continue
+            sold_any = True
             t["units"] += qty
             t["revenue"] += rev
-            if bucket == "cur":
-                daily[day]["units"] += qty
-                daily[day]["revenue"] += rev
-                pi = per_item.setdefault(iid, {
-                    "itemId": iid, "title": it.get("title"), "sku": it.get("seller_sku"),
+            if o["bucket"] == "cur":
+                daily[o["day"]]["units"] += qty
+                daily[o["day"]]["revenue"] += rev
+                pi = per_item.setdefault(ln["iid"], {
+                    "itemId": ln["iid"], "title": ln["title"], "sku": ln["sku"],
                     "revenue": 0.0, "units": 0, "orders": 0,
                 })
                 pi["revenue"] += rev
                 pi["units"] += qty
                 pi["orders"] += 1
-        if bucket == "cur":
-            daily[day]["orders"] += 1
-
-    for c in claims:
-        if (c.get("type") or "") != "returns":
-            continue
-        day = _brt_day(c.get("date_created"))
-        if day is None:
-            continue
-        bucket = "cur" if cur.has(day) else "prev" if prev.has(day) else None
-        if bucket is None:
-            continue
-        enriched = _as_dict(c.get("enriched"))
-        ids = {
-            _norm(o.get("item_id"))
-            for r in _as_list(enriched.get("returns"))
-            for o in _as_list(_as_dict(r).get("orders"))
-        }
-        ids.discard("")
-        if not ids:
-            ids = order_items.get(str(c.get("resource_id") or ""), set())
-        if any(ok(i) for i in ids) and ids:
-            tot[bucket]["returns"] += 1
-            if bucket == "cur":
-                for i in ids:
-                    if i in per_item:
-                        per_item[i]["returns"] = per_item[i].get("returns", 0) + 1
+        if sold_any and ret is False:
+            t["orders"] += 1
+            if o["bucket"] == "cur":
+                daily[o["day"]]["orders"] += 1
 
     # Visits: ML keeps 30 days. A window that reaches further back is unknown.
     history_start = today - timedelta(days=VISITS_HISTORY_DAYS - 1)
@@ -226,24 +262,30 @@ def build_overview(
                         per_item[iid]["visits"] = per_item[iid].get("visits", 0) + int(r.get("total") or 0)
 
     def kpis(t: dict, v: Optional[int]) -> dict[str, Any]:
-        gross = t["orders"] + t["cancelled"]
+        """orders = ordersGross − cancelled − returns; units and revenue are
+        what stayed sold. Conversion is the buyer's act: gross orders ÷ visits."""
         return {
-            "revenue": round(t["revenue"], 2),
+            "ordersGross": t["ordersGross"],
+            "unitsGross": t["unitsGross"],
+            "revenueGross": round(t["revenueGross"], 2),
+            "cancelled": t["cancelled"],
+            "cancelledPct": _pct(t["cancelled"], t["ordersGross"]),
+            "returns": t["returns"],
+            "returnsPct": _pct(t["returns"], t["ordersGross"]),
+            "returnedUnits": t["returnedUnits"],
+            "returnedRevenue": round(t["returnedRevenue"], 2),
             "orders": t["orders"],
             "units": t["units"],
+            "revenue": round(t["revenue"], 2),
             "avgTicket": round(t["revenue"] / t["orders"], 2) if t["orders"] else None,
-            "cancelled": t["cancelled"],
-            "cancelledPct": _pct(t["cancelled"], gross),
-            "returns": t["returns"],
-            "returnsPct": _pct(t["returns"], t["orders"]),
             "visits": v,
-            "conversionPct": _pct(t["orders"], v),
+            "conversionPct": _pct(t["ordersGross"], v),
         }
 
     k_cur, k_prev = kpis(tot["cur"], v_cur), kpis(tot["prev"], v_prev)
     change = {
         k: _delta(k_cur[k], k_prev[k])
-        for k in ("revenue", "orders", "units", "visits", "conversionPct", "avgTicket")
+        for k in ("revenue", "orders", "units", "ordersGross", "visits", "conversionPct", "avgTicket")
     }
 
     top = sorted(per_item.values(), key=lambda p: p["revenue"], reverse=True)[:top_n]
@@ -256,6 +298,7 @@ def build_overview(
         p.setdefault("returns", 0)
         p["visits"] = p.get("visits") if have_visits else None
         p["conversionPct"] = _pct(p["orders"], p["visits"])
+        p["units"] = int(p["units"])
 
     return {
         "period": {"from": cur.start.isoformat(), "to": cur.end.isoformat(), "days": days},
@@ -295,7 +338,11 @@ async def _refresh_orders_bg(pool, owner_id: int, days_back: int) -> None:
         _refreshing.discard(owner_id)
 
 
-async def load_overview(pool, scope, *, days: int) -> dict[str, Any]:
+async def load_overview(
+    pool, scope, *, days: int, only_items: Optional[Iterable[str]] = None,
+) -> dict[str, Any]:
+    """`only_items` narrows the scope further — the promotions screen asks for
+    the numbers of the listings that are in a promotion."""
     from v2.services import ml_account_health as health_svc
     from v2.services import ml_orders as ml_orders_svc
     from v2.services import ml_user_claims as claims_svc
@@ -350,7 +397,10 @@ async def load_overview(pool, scope, *, days: int) -> dict[str, Any]:
         claims=[dict(r) for r in claims],
         visits={k: v.get("daily") or [] for k, v in visits_map.items()},
         items_meta={_norm(r["item_id"]): dict(r) for r in items},
-        allowed=scope.item_ids,
+        allowed=(
+            scope.item_ids if only_items is None
+            else frozenset(_norm(i) for i in only_items if scope.allows_read(_norm(i)))
+        ),
         today=today,
         days=days,
     )

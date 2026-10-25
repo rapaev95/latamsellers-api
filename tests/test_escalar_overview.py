@@ -51,25 +51,29 @@ def _run(allowed, days=7):
     )
 
 
-def test_project_counts_only_its_lines():
+def test_sold_is_orders_minus_cancelled_and_returns():
     o = _run(frozenset({"MLB1"}))
     k = o["kpis"]
-    assert k["orders"] == 2            # order 2 counts, but only its MLB1 line
-    assert k["units"] == 3
-    assert k["revenue"] == 150.0
+    assert k["ordersGross"] == 3       # orders 1, 2 (its MLB1 line) and cancelled 3
     assert k["cancelled"] == 1
-    assert k["returns"] == 1           # claim on order 6 belongs to MLB9
+    assert k["returns"] == 1           # order 1; the claim on order 6 is MLB9's
+    assert k["orders"] == 1            # 3 − 1 − 1
+    assert k["orders"] == k["ordersGross"] - k["cancelled"] - k["returns"]
+    assert k["returnedUnits"] == 1     # one of the two units of order 1 came back
+    assert k["units"] == 2             # order 2's unit + the kept unit of order 1
+    assert k["revenue"] == 100.0
+    assert k["revenueGross"] == 200.0  # 100 + 50 + cancelled 50
     assert k["visits"] == 50
-    assert k["conversionPct"] == 4.0   # 2 orders / 50 visits
+    assert k["conversionPct"] == 6.0   # gross orders ÷ visits
     assert o["previous"]["orders"] == 1
     assert o["previous"]["visits"] == 25
-    assert o["change"]["orders"] == 100.0
 
 
 def test_whole_cabinet_when_unscoped():
     k = _run(None)["kpis"]
-    assert k["orders"] == 3
+    assert k["ordersGross"] == 4
     assert k["returns"] == 2
+    assert k["orders"] == 1
 
 
 def test_visits_older_than_ml_keeps_are_unknown():
@@ -90,7 +94,7 @@ def test_no_visits_means_no_conversion_not_zero():
 def test_daily_series_and_top():
     o = _run(frozenset({"MLB1"}))
     assert len(o["daily"]) == 7
-    assert o["daily"][-1] == {"date": "2026-10-24", "revenue": 100.0, "orders": 1,
-                              "units": 2, "visits": 30}
+    assert o["daily"][-1] == {"date": "2026-10-24", "revenue": 50.0, "orders": 0,
+                              "units": 1, "visits": 30}
     assert [t["itemId"] for t in o["top"]] == ["MLB1"]
     assert o["top"][0]["returns"] == 1

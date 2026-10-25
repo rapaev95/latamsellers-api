@@ -396,6 +396,26 @@ class _PromoJoinIn(BaseModel):
     deal_price: Optional[float] = None
     top_deal_price: Optional[float] = None
     offer_id: Optional[str] = None
+    stock: Optional[int] = None          # LIGHTNING: units committed to the deal
+
+
+@router.get("/promotions")
+async def list_promotions(
+    days: int = Query(30, ge=1, le=30),
+    project: Optional[str] = Query(None),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """The Promoções screen: performance of promoted listings, tasks,
+    calendar and per-listing offers with final price and net after fee."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    from v2.services import escalar_promotions as promotions_svc
+
+    scope = await ml_access.resolve_scope(pool, user, project=project or "")
+    if not scope.is_owner and not scope.projects:
+        raise HTTPException(status_code=404, detail="project_not_found")
+    return await promotions_svc.load_promotions(pool, scope, days=days)
 
 
 @router.post("/items/{item_id}/promotions")
