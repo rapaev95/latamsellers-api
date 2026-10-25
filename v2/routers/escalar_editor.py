@@ -808,3 +808,28 @@ async def get_project_finance(
     if not scope.projects:
         raise HTTPException(status_code=404, detail="project_not_found")
     return await finance_svc.load_project_finance(pool, scope, days=days)
+
+
+@router.get("/ads-period")
+async def get_ads_period(
+    date_from: str = Query(..., alias="from"),
+    date_to: str = Query(..., alias="to"),
+    project: Optional[str] = Query(None),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Ads spend and ads-attributed sales for a period — ACOS for the
+    financial summary. Scoped like everything else; the owner without a
+    project gets the whole cabinet."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    from v2.services import project_finance as finance_svc
+
+    try:
+        start, end = date.fromisoformat(date_from), date.fromisoformat(date_to)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bad_dates")
+    scope = await ml_access.resolve_scope(pool, user, project=project or "")
+    if not scope.is_owner and not scope.projects:
+        raise HTTPException(status_code=404, detail="project_not_found")
+    return await finance_svc.ads_period(pool, scope, start, end)

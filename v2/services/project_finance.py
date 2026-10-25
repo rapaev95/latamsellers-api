@@ -314,3 +314,58 @@ async def load_project_finance(pool, scope, *, days: int = 30) -> dict[str, Any]
         ],
         "entries": entries[:500],
     }
+
+
+async def ads_period(pool, scope, start: date, end: date) -> dict[str, Any]:
+    """Product Ads spend and the sales ML attributes to ads, for [start, end].
+
+    Same project share as above: each campaign's daily numbers times the
+    share of its ad spend that went to the scope's listings. ACOS =
+    spend ÷ ads sales; TACOS needs total revenue, which the caller has.
+    """
+    owner = scope.owner_id
+    allowed = scope.item_ids
+    async with pool.acquire() as conn:
+        ad_rows = await conn.fetch(
+            "SELECT campaign_id, upper(item_id) AS item_id, metrics FROM ml_ad_ads WHERE user_id = $1",
+            owner,
+        )
+        daily_rows = await conn.fetch(
+            """
+            SELECT campaign_id, metrics FROM ml_ad_campaign_metrics_daily
+             WHERE user_id = $1 AND date >= $2 AND date <= $3
+            """,
+            owner, start, end,
+        )
+    total: dict[int, float] = {}
+    mine: dict[int, float] = {}
+    for a in ad_rows:
+        m = a["metrics"]
+        m = json.loads(m) if isinstance(m, str) else (m or {})
+        cid = int(a["campaign_id"] or 0)
+        cost = float(m.get("cost") or 0)
+        total[cid] = total.get(cid, 0.0) + cost
+        if allowed is None or a["item_id"] in allowed:
+            mine[cid] = mine.get(cid, 0.0) + cost
+    cost = sales = units = clicks = 0.0
+    for r in daily_rows:
+        cid = int(r["campaign_id"])
+        share = 1.0 if allowed is None else (mine.get(cid, 0.0) / total[cid] if total.get(cid) else 0.0)
+        if not share:
+            continue
+        m = r["metrics"]
+        m = json.loads(m) if isinstance(m, str) else (m or {})
+        cost += float(m.get("cost") or 0) * share
+        sales += float(m.get("total_amount") or 0) * share
+        units += float(m.get("units_quantity") or 0) * share
+        clicks += float(m.get("clicks") or 0) * share
+    return {
+        "from": start.isoformat(), "to": end.isoformat(),
+        "cost": round(cost, 2),
+        "adsSales": round(sales, 2),
+        "adsUnits": round(units),
+        "clicks": round(clicks),
+        "acosPct": round(cost / sales * 100, 2) if sales else None,
+        "roas": round(sales / cost, 2) if cost else None,
+        "hasData": bool(daily_rows),
+    }
