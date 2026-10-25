@@ -98,3 +98,14 @@ def test_daily_series_and_top():
                               "units": 1, "visits": 30}
     assert [t["itemId"] for t in o["top"]] == ["MLB1"]
     assert o["top"][0]["returns"] == 1
+
+
+def test_past_period_keeps_visits_inside_mls_30_days():
+    # A 7-day period ending 2026-10-21, seen on 2026-10-24: still inside the
+    # 30 days ML keeps, so visits are known, counted only inside the period.
+    o = build_overview(orders=ORDERS, claims=CLAIMS, visits=VISITS, items_meta={},
+                       allowed=frozenset({"MLB1"}), today=date(2026, 10, 21), days=7,
+                       visits_today=TODAY)
+    assert o["period"] == {"from": "2026-10-15", "to": "2026-10-21", "days": 7}
+    assert o["kpis"]["visits"] == 20        # only 2026-10-19 falls inside
+    assert o["kpis"]["ordersGross"] == 3    # orders 2 and 3 (cancelled), 5

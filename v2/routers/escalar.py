@@ -251,7 +251,9 @@ def _empty_products_out(days_v: Union[int, str]) -> dict[str, Any]:
 
 @router.get("/overview")
 async def get_overview(
-    days: int = Query(30, ge=1, le=30),
+    days: int = Query(30, ge=1, le=60),
+    date_from: Optional[str] = Query(None, alias="from"),
+    date_to: Optional[str] = Query(None, alias="to"),
     project: Optional[str] = Query(None),
     user: CurrentUser = Depends(current_user),
     pool=Depends(get_pool),
@@ -269,7 +271,21 @@ async def get_overview(
     scope = await ml_access.resolve_scope(pool, user, project=project or "")
     if not scope.is_owner and not scope.projects:
         raise HTTPException(status_code=404, detail="project_not_found")
-    return await overview_svc.load_overview(pool, scope, days=days)
+    # Свой период: from/to (включительно). Предыдущий — такой же длины перед
+    # ним. Визиты ML есть только за последние 30 дней — дальше они null.
+    end = None
+    if date_from and date_to:
+        from datetime import date as _date
+        try:
+            start, end = _date.fromisoformat(date_from), _date.fromisoformat(date_to)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="bad_dates")
+        if end < start:
+            raise HTTPException(status_code=400, detail="bad_dates")
+        days = (end - start).days + 1
+        if days > 60:
+            raise HTTPException(status_code=400, detail="period_too_long")
+    return await overview_svc.load_overview(pool, scope, days=days, end=end)
 
 
 @router.get("/listings")

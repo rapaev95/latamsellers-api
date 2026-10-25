@@ -113,11 +113,14 @@ def build_overview(
     today: date,
     days: int,
     top_n: int = 10,
+    visits_today: Optional[date] = None,
 ) -> dict[str, Any]:
     """Pure aggregation, so it can be tested without a database.
 
     `allowed` is the scope's item set; None means the whole cabinet.
     `visits` maps item_id → [{date: 'YYYY-MM-DD', total: n}, ...].
+    `today` is the last day of the period; `visits_today` the real today,
+    which is where ML's 30 days of visits end (defaults to `today`).
     """
     cur = _Window(today - timedelta(days=days - 1), today)
     prev = _Window(cur.start - timedelta(days=days), cur.start - timedelta(days=1))
@@ -232,7 +235,7 @@ def build_overview(
                 daily[o["day"]]["orders"] += 1
 
     # Visits: ML keeps 30 days. A window that reaches further back is unknown.
-    history_start = today - timedelta(days=VISITS_HISTORY_DAYS - 1)
+    history_start = (visits_today or today) - timedelta(days=VISITS_HISTORY_DAYS - 1)
     have_visits = any(ok(i) for i in visits)
 
     def visits_in(w: _Window) -> Optional[int]:
@@ -340,6 +343,7 @@ async def _refresh_orders_bg(pool, owner_id: int, days_back: int) -> None:
 
 async def load_overview(
     pool, scope, *, days: int, only_items: Optional[Iterable[str]] = None,
+    end: Optional[date] = None,
 ) -> dict[str, Any]:
     """`only_items` narrows the scope further — the promotions screen asks for
     the numbers of the listings that are in a promotion."""
@@ -349,7 +353,9 @@ async def load_overview(
     from v2.services import ml_visits as visits_svc
 
     owner = scope.owner_id
-    today = datetime.now(BRT).date()
+    real_today = datetime.now(BRT).date()
+    # `end` — последний день выбранного периода; по умолчанию сегодня.
+    today = min(end or real_today, real_today)
     since = datetime.combine(today - timedelta(days=2 * days), datetime.min.time(), tzinfo=BRT)
 
     await ml_orders_svc.ensure_schema(pool)
@@ -388,7 +394,8 @@ async def load_overview(
     )
     if stale and owner not in _refreshing:
         _refreshing.add(owner)
-        task = asyncio.create_task(_refresh_orders_bg(pool, owner, min(60, 2 * days)))
+        reach = (real_today - today).days + 2 * days
+        task = asyncio.create_task(_refresh_orders_bg(pool, owner, min(60, reach)))
         _tasks.add(task)
         task.add_done_callback(_tasks.discard)
 
@@ -403,6 +410,7 @@ async def load_overview(
         ),
         today=today,
         days=days,
+        visits_today=real_today,
     )
     health = await health_svc.get_cached(pool, owner)
     out["reputation"] = (health or {}).get("reputation")
