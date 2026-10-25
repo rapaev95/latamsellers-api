@@ -282,7 +282,7 @@ async def load_project_finance(pool, scope, *, days: int = 30) -> dict[str, Any]
     def chg(c: float, p: float) -> Optional[float]:
         return round((c - p) / p * 100, 1) if p else None
 
-    entries.sort(key=lambda e: (e["date"], e["kind"] != "sale"), reverse=True)
+    entries.sort(key=lambda e: (e["date"], e["kind"] == "sale"), reverse=True)
     r2 = lambda v: round(v, 2)  # noqa: E731
     return {
         "period": {"from": cur_start.isoformat(), "to": today.isoformat(), "days": days},
