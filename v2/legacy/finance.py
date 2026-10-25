@@ -105,6 +105,15 @@ class PnLReport:
     # См. compute_retirada_cost. Pydantic schema (PnLReportOut) должна
     # явно объявить это поле, иначе extra="ignore" вырежет его в ответе.
     retirada_summary: dict | None = None
+    # Разбор bruto − NET по статьям ML, для сводки «куда ушли деньги»:
+    #   revenue_delivered − fee_sale − fee_shipping − returns_cost = revenue_net,
+    # а returns_refunded — выручка вернувшихся продаж (деньги вернулись
+    # покупателю, это отмена продажи, а не расход).
+    revenue_delivered: float = 0.0   # bruto доставленных
+    fee_sale: float = 0.0            # Tarifa de venda e impostos (доставленные)
+    fee_shipping: float = 0.0        # доставка, удержанная ML (доставленные)
+    returns_cost: float = 0.0        # возвраты: оплаченная логистика и комиссия
+    returns_refunded: float = 0.0    # выручка вернувшихся продаж
 
 
 @dataclass
@@ -827,6 +836,12 @@ def compute_pnl(
             if retirada_data and retirada_data.get("rows_count", 0) > 0
             else None
         ),
+        revenue_delivered=round(d_gross, 2),
+        fee_sale=round(abs(d_tv), 2),
+        fee_shipping=round(envios_dif, 2),
+        # Без клампа к нулю: так статьи в сумме ровно дают bruto − NET.
+        returns_cost=round(abs(r_cnc) + abs(r_tv) - r_gross, 2),
+        returns_refunded=round(r_gross, 2),
     )
 
 

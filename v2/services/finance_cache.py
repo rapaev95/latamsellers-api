@@ -40,7 +40,7 @@ log = logging.getLogger(__name__)
 # Bump when compute_pnl / compute_cashflow / compute_balance / abc.aggregate
 # change shape (added / removed / renamed fields). Bumping invalidates every
 # cached payload at once — no manual `invalidate_*` calls needed.
-COMPUTE_VERSION = "v12"  # v12: vendas «Data de venda» (ML rename 2026-10) read as «Data da venda» — bundles cached before it lost every sale of the newest export. v11: services OPiU dedups bank «ВЫПИСКА» vs invoice by amount (cross-month) — no double-count. v10: ESTONIA DAS rate from declared RBT12 (whole-entity) config
+COMPUTE_VERSION = "v13"  # v13: P&L splits bruto − NET into sale fee, shipping, returns (logistics + commission) and refunded revenue. v12: vendas «Data de venda» (ML rename 2026-10) read as «Data da venda» — bundles cached before it lost every sale of the newest export. v11: services OPiU dedups bank «ВЫПИСКА» vs invoice by amount (cross-month) — no double-count. v10: ESTONIA DAS rate from declared RBT12 (whole-entity) config
 
 # Upload source_keys that influence any finance/abc compute. MAX(created_at)
 # per source feeds the fingerprint.

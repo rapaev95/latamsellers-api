@@ -59,6 +59,13 @@ class PnLReportOut(BaseModel):
     # POST /finance/retirada-overrides,
     # rows_count, source_files}.
     retirada_summary: Optional[dict[str, Any]] = None
+    # bruto − NET по статьям: revenue_delivered − fee_sale − fee_shipping −
+    # returns_cost = revenue_net; returns_refunded — выручка вернувшихся продаж.
+    revenue_delivered: float = 0
+    fee_sale: float = 0
+    fee_shipping: float = 0
+    returns_cost: float = 0
+    returns_refunded: float = 0
 
 
 # ── ДДС ─────────────────────────────────────────────────────────────────────
