@@ -229,6 +229,25 @@ async def resolve_scope(pool, user, *, project: str = "") -> MlScope:
     )
 
 
+def attribution(owner_id: int) -> dict[str, str]:
+    """item_id → проект в кабинете владельца — для подписи карточек в UI.
+
+    Та же атрибуция, на которой стоит граница доступа, чтобы проект в
+    таблице и проект в проверке доступа не могли разойтись.
+    """
+    return _attribute_items(owner_id)
+
+
+def item_skus(owner_id: int) -> dict[str, str]:
+    """item_id → seller_sku в кабинете владельца."""
+    caller_before = legacy_db._current_user_id()
+    try:
+        _bind(owner_id)
+        return dict(legacy_config.mlb_to_seller_sku())
+    finally:
+        legacy_db.set_current_user_id(caller_before)
+
+
 def filter_rows(
     scope: MlScope, rows: Sequence[dict[str, Any]], key: str = "item_id",
 ) -> list[dict[str, Any]]:

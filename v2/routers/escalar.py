@@ -249,6 +249,47 @@ def _empty_products_out(days_v: Union[int, str]) -> dict[str, Any]:
     }
 
 
+@router.get("/overview")
+async def get_overview(
+    days: int = Query(30, ge=1, le=30),
+    project: Optional[str] = Query(None),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Escalar home: revenue, orders, units, cancellations, returns, visits
+    and conversion for the caller's project, vs the previous period.
+
+    Live ML caches under the cabinet owner, filtered to the caller's scope.
+    `days` stops at 30 because ML keeps 30 days of visits.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    from v2.services import escalar_overview as overview_svc
+
+    scope = await ml_access.resolve_scope(pool, user, project=project or "")
+    if not scope.is_owner and not scope.projects:
+        raise HTTPException(status_code=404, detail="project_not_found")
+    return await overview_svc.load_overview(pool, scope, days=days)
+
+
+@router.get("/listings")
+async def get_listings(
+    project: Optional[str] = Query(None),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Every listing of the caller's project with sales, visits, quality,
+    Product Ads and promotions joined — the "Meus anúncios" table."""
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    from v2.services import escalar_listings as listings_svc
+
+    scope = await ml_access.resolve_scope(pool, user, project=project or "")
+    if not scope.is_owner and not scope.projects:
+        raise HTTPException(status_code=404, detail="project_not_found")
+    return await listings_svc.load_listings(pool, scope)
+
+
 @router.get("/products", response_model=EscalarProductsOut)
 async def get_products(
     response: Response,
