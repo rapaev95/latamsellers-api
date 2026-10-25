@@ -782,3 +782,29 @@ async def answer_question(
         raise HTTPException(status_code=422, detail=_ml_error(st, resp))
     await questions_svc.upsert_one_answered(pool, scope.owner_id, question_id, text)
     return {"ok": True}
+
+
+# ── Project finance ──────────────────────────────────────────────────────────
+
+@router.get("/project-finance")
+async def get_project_finance(
+    project: str = Query(..., min_length=1),
+    days: int = Query(30, ge=7, le=90),
+    user: CurrentUser = Depends(current_user),
+    pool=Depends(get_pool),
+):
+    """Money of ONE project: sales, ML fees, Ads share, fixed costs, released
+    and to-receive Mercado Pago payments of its orders.
+
+    A project is required. The cabinet's Mercado Pago account holds every
+    partner's money (docs/BUSINESS-MODEL.md), so there is no "all projects"
+    view of it here.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    from v2.services import project_finance as finance_svc
+
+    scope = await ml_access.resolve_scope(pool, user, project=project)
+    if not scope.projects:
+        raise HTTPException(status_code=404, detail="project_not_found")
+    return await finance_svc.load_project_finance(pool, scope, days=days)
