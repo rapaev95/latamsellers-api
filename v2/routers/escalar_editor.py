@@ -578,7 +578,10 @@ async def get_campaign(
     if not row:
         raise HTTPException(status_code=404, detail="campaign_not_found")
     items = await _campaign_items(pool, owner, campaign_id)
-    if scope.item_ids is not None and not any(scope.allows_read(i) for i in items):
+    # The cabinet owner sees every campaign of their cabinet even with a
+    # project picked — the campaign list is not filtered by project, and a
+    # click must not land on "not found". Ads outside the project stay hidden.
+    if not scope.is_owner and not any(scope.allows_read(i) for i in items):
         raise HTTPException(status_code=404, detail="campaign_not_found")
 
     dt_to = date.today()
@@ -605,7 +608,7 @@ async def get_campaign(
     out["daily"] = daily
     out["ads"] = ads_out
     out["adsHidden"] = len(items) - len(ads_out)
-    out["canEdit"] = scope.may_write and all(scope.allows_write(i) for i in items)
+    out["canEdit"] = scope.is_owner or (scope.may_write and all(scope.allows_write(i) for i in items))
     return out
 
 
@@ -638,9 +641,11 @@ async def update_campaign(
     if not row:
         raise HTTPException(status_code=404, detail="campaign_not_found")
     items = await _campaign_items(pool, owner, campaign_id)
-    if scope.item_ids is not None and not any(scope.allows_read(i) for i in items):
+    if not scope.is_owner and not any(scope.allows_read(i) for i in items):
         raise HTTPException(status_code=404, detail="campaign_not_found")
-    if not scope.may_write or not all(scope.allows_write(i) for i in items):
+    if not scope.is_owner and (
+        not scope.may_write or not all(scope.allows_write(i) for i in items)
+    ):
         raise HTTPException(status_code=403, detail="read_only")
     if (row.get("product_id") or "PADS") != "PADS":
         raise HTTPException(status_code=400, detail="only_product_ads_campaigns")
